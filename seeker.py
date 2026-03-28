@@ -1,5 +1,7 @@
+import collections
 import cv2
 import numpy as np
+import time
 
 
 # ── Pink HSV ranges (OpenCV hue 0-179) ───────────────────────────────────────
@@ -95,34 +97,38 @@ class Seeker:
         Returns (annotated_frame, cx, cy) where cx/cy is the tracked centre,
         or (annotated_frame, None, None) when no target is locked.
         """
+        h_frame, w_frame = frame.shape[:2]
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = _pink_mask(hsv)
         out  = frame.copy()
 
-        # ── Acquire / re-acquire target ───────────────────────────────────────
-        if self._roi_hist is None or self._track_win is None:
-            rect = _largest_blob_rect(mask)
-            if rect is None:
-                cv2.putText(out, "Searching for pink ...", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (203, 192, 255), 2)
-                return out, None, None
+        # ── Always re-init from largest blob when one is visible ──────────────
+        rect = _largest_blob_rect(mask)
+        if rect is not None:
             self._init_camshift(frame, rect)
+
+        if self._roi_hist is None or self._track_win is None:
+            cv2.putText(out, "Searching for pink ...", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (203, 192, 255), 2)
+            self._draw_center_cross(out, w_frame, h_frame)
+            return out, None, None
 
         # ── CamShift step ─────────────────────────────────────────────────────
         back_proj = cv2.calcBackProject(
             [hsv], [0], self._roi_hist, [0, 180], 1
         )
-        back_proj &= mask  # restrict to pink pixels only
+        back_proj &= mask
 
         ret, self._track_win = cv2.CamShift(
             back_proj, self._track_win, self._term_crit
         )
 
         # ── Validate: drop lock if window collapsed ───────────────────────────
-        x, y, w, h = self._track_win
+        _, _, w, h = self._track_win
         if w < 5 or h < 5:
             self._roi_hist  = None
             self._track_win = None
+            self._draw_center_cross(out, w_frame, h_frame)
             return out, None, None
 
         # ── Draw rotated bounding box ─────────────────────────────────────────
@@ -131,9 +137,32 @@ class Seeker:
 
         cx = int(ret[0][0])
         cy = int(ret[0][1])
-        cv2.circle(out, (cx, cy), 5, (0, 0, 255), -1)
 
+        # centroid crosshair
+        cv2.line(out, (0, cy), (w_frame, cy), (0, 255, 255), 1)
+        cv2.line(out, (cx, 0), (cx, h_frame), (0, 255, 255), 1)
+        cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
+
+        self._draw_center_cross(out, w_frame, h_frame)
         return out, cx, cy
+
+    @staticmethod
+    def _draw_center_cross(frame, w, h, box=80, arm=16, color=(255, 255, 255), thickness=2):
+        """Draw a corner-bracket crosshair (L-shapes at 4 corners of a box) with a small center cross."""
+        cx, cy = w // 2, h // 2
+        corners = [
+            (cx - box, cy - box, +1, +1),
+            (cx + box, cy - box, -1, +1),
+            (cx + box, cy + box, -1, -1),
+            (cx - box, cy + box, +1, -1),
+        ]
+        for x, y, dx, dy in corners:
+            cv2.line(frame, (x, y), (x + arm * dx, y), color, thickness)
+            cv2.line(frame, (x, y), (x, y + arm * dy), color, thickness)
+        # small cross at center
+        cs = 10
+        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), color, 1)
+        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), color, 1)
 
     # ── Error computation ─────────────────────────────────────────────────────
 
@@ -161,8 +190,15 @@ class Seeker:
         """Open source, run CamShift tracking loop; press 'q' to quit,
         'r' to reset the tracker."""
         self.open()
+        prev_time = time.time()
+        frame_times = collections.deque(maxlen=30)
         try:
             while True:
+                curr_time = time.time()
+                frame_times.append(curr_time - prev_time)
+                prev_time = curr_time
+                fps = 1.0 / (sum(frame_times) / len(frame_times))
+
                 ok, frame = self.read_frame()
                 if not ok:
                     print("[Seeker] End of stream.")
@@ -173,8 +209,11 @@ class Seeker:
 
                 if errorx is not None:
                     label = f"ex={errorx:+.3f}  ey={errory:+.3f}"
-                    cv2.putText(annotated, label, (10, 30),
+                    cv2.putText(annotated, label, (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                 cv2.imshow(self.window_name, annotated)
 

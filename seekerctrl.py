@@ -15,7 +15,7 @@ _TRACKING_MSG_ID    = 230
 _TRACKING_CRC_EXTRA = 250
 
 # RC channel 6 PWM threshold to consider the switch "active"
-_CH6_ACTIVE_PWM = 1700
+_CH6_ACTIVE_PWM = 1400
 
 # ArduPlane custom mode numbers
 _TRACKING_MODE = 27
@@ -185,8 +185,11 @@ class SeekerCtrl:
                     self.set_mode_tracking()
                     self._in_tracking = True
 
-                elif (not ch6_on or not target_locked) and self._in_tracking:
+                elif not ch6_on and self._in_tracking:
                     self.set_mode_loiter()
+                    self._in_tracking = False
+
+                elif not target_locked and self._in_tracking:
                     self._in_tracking = False
 
                 # ── 4. Feed TRACKING error while active ───────────────────────
@@ -224,6 +227,4 @@ class SeekerCtrl:
                     print("[Ctrl] Tracker reset.")
 
         finally:
-            if self._in_tracking:
-                self.set_mode_loiter()
             self.seeker.close()
