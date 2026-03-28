@@ -7,28 +7,19 @@ When RC channel 6 is armed and a pink target is locked, the system switches the 
 
 ## How It Works
 
-```
-Camera / Video
-      │
-      ▼
-  Seeker.track()          ← CamShift on pink HSV blob
-      │
-      ├─ cx, cy           ← pixel centre of target
-      │
-      ▼
-  error_xy()              ← normalise to [-1, 1] relative to frame centre
-      │
-      ▼
-  SeekerCtrl.run()
-      │
-      ├─ poll RC ch6      ← non-blocking MAVLink RC_CHANNELS read
-      │
-      ├─ ch6 HIGH + target locked?
-      │       YES → set_mode_tracking()   (ArduPlane custom mode 27)
-      │              send_tracking(ex, ey) every frame
-      │       NO  → set_mode_loiter()     (mode 5, fallback)
-      │
-      └─ cv2.imshow()     ← annotated frame with HUD overlay
+```mermaid
+flowchart TD
+    A([Camera]) --> B[Detect\npink blob]
+    B --> C{Locked?}
+    C -- No --> B
+    C -- Yes --> D[CamShift\ntrack]
+    D --> E{Window\ncollapsed?}
+    E -- Yes --> B
+    E -- No --> F[Normalise\nerror ±1]
+    F --> G{CH6 armed?}
+    G -- No --> H[Loiter]
+    G -- Yes --> I[MAVLink\nID 230]
+    I --> J[FC: roll/pitch\nvia TRACKING_MAX_DEG]
 ```
 
 ### Pink Detection & CamShift Tracking
