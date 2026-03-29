@@ -39,6 +39,35 @@ def parse_args():
         default=50,
         help="Joystick send rate in Hz (default: 50)",
     )
+    parser.add_argument(
+        "--res",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("W", "H"),
+        help="Request this capture resolution from the camera (e.g. --capture-res 1280 720)",
+    )
+    parser.add_argument(
+        "--histogram",
+        action="store_true",
+        default=False,
+        help="Show calibration histogram in a separate window (default: disabled)",
+    )
+    parser.add_argument(
+        "--mask",
+        action="store_true",
+        default=False,
+        help="Show detection mask in a separate window (default: disabled)",
+    )
+    parser.add_argument(
+        "--crop",
+        type=str,
+        nargs=4,
+        default=None,
+        metavar=("X", "Y", "W", "H"),
+        help="Crop each frame to this ROI (e.g. --crop 320 180 640 360). "
+             "Use - for W or H to mean 'rest of dimension after offset'.",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +90,11 @@ def main():
         joystick_enabled=args.joystick,
         joystick_index=args.joy_index,
         joystick_rate=args.joy_rate,
+        capture_width=args.res[0] if args.res else None,
+        capture_height=args.res[1] if args.res else None,
+        crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,
+        show_histogram=args.histogram,
+        show_mask=args.mask,
     )
     ctrl.connect()
 

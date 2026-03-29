@@ -2,15 +2,16 @@
 joystick_handler.py — Joystick input → RC PWM channel values.
 
 Wraps pygame joystick reads and exposes the latest channel values
-as a dict {ch1..ch5: pwm_int}.  Intended to be polled by a background
+as a dict {ch1..ch6: pwm_int}.  Intended to be polled by a background
 thread in SeekerCtrl.
 
 Axis mapping (matches test_joystick.py defaults):
   Axis 0 → CH1 aileron   (centred)
-  Axis 1 → CH2 elevator  (centred, auto-inverted)
+  Axis 1 → CH2 elevator  (centred)
   Axis 2 → CH3 throttle  (full-range 1000-2000)
   Axis 3 → CH4 rudder    (centred)
   Axis 4 → CH5 mode      (snapped to ArduPilot flight-mode bands)
+  Axis 5 → CH6 tracking arm (full-range 1000-2000; ≥1400 = armed)
 """
 
 try:
@@ -47,15 +48,15 @@ class JoystickHandler:
     def __init__(
         self,
         joy_index: int = 0,
-        axes: tuple[int, int, int, int, int] = (0, 1, 2, 3, 4),
+        axes: tuple[int, int, int, int, int, int] = (0, 1, 2, 3, 4, 5),
         invert_axes: set[int] | None = None,
-        thr_invert: bool = True,
+        thr_invert: bool = False,
     ):
         if not _PYGAME:
             raise RuntimeError("pygame is not installed — run: pip3 install pygame")
 
         self.joy_index   = joy_index
-        self.roll_ax, self.pitch_ax, self.thr_ax, self.yaw_ax, self.mode_ax = axes
+        self.roll_ax, self.pitch_ax, self.thr_ax, self.yaw_ax, self.mode_ax, self.ch6_ax = axes
         self.invert_axes = invert_axes or set()
         self.thr_invert  = thr_invert
 
@@ -86,17 +87,20 @@ class JoystickHandler:
         pygame.joystick.quit()
         pygame.quit()
 
+    def pump(self):
+        """Pump pygame events — must be called from the main thread on macOS."""
+        pygame.event.pump()
+
     def read_channels(self) -> dict[str, int]:
-        """Pump pygame events and return the current {ch1..ch5: pwm} dict."""
+        """Return the current {ch1..ch6: pwm} dict.
+        Caller must ensure pump() has been called from the main thread first."""
         if self._joy is None:
             raise RuntimeError("JoystickHandler not opened — call open() first")
-
-        pygame.event.pump()
 
         ch1 = _axis_pwm(self._joy.get_axis(self.roll_ax),
                         self.roll_ax in self.invert_axes)
         ch2 = _axis_pwm(self._joy.get_axis(self.pitch_ax),
-                        self.pitch_ax in self.invert_axes or True)  # always inverted
+                        self.pitch_ax in self.invert_axes)
         ch3 = _thr_pwm(self._joy.get_axis(self.thr_ax),
                        self.thr_ax in self.invert_axes or self.thr_invert)
         ch4 = _axis_pwm(self._joy.get_axis(self.yaw_ax),
@@ -105,5 +109,7 @@ class JoystickHandler:
         n_axes = self._joy.get_numaxes()
         ch5 = (_fltmode_pwm(self._joy.get_axis(self.mode_ax))
                if self.mode_ax < n_axes else 1165)
+        ch6 = (_thr_pwm(self._joy.get_axis(self.ch6_ax))
+               if self.ch6_ax < n_axes else UINT16_MAX)
 
-        return {"ch1": ch1, "ch2": ch2, "ch3": ch3, "ch4": ch4, "ch5": ch5}
+        return {"ch1": ch1, "ch2": ch2, "ch3": ch3, "ch4": ch4, "ch5": ch5, "ch6": ch6}
