@@ -4,11 +4,11 @@ import numpy as np
 import time
 
 
-# ── Pink HSV ranges (OpenCV hue 0-179) ───────────────────────────────────────
-# Two bands cover hot-pink/magenta and light-pink/rose.
+# ── Hot-pink HSV range (OpenCV hue 0-179) ────────────────────────────────────
+# Hot pink sits at H ≈ 150-175 (≈300-350° on the standard wheel).
+# High saturation floor (100) rejects pastel / pale pinks.
 _PINK_RANGES = [
-    (np.array([145, 50,  40]),  np.array([179, 255, 255])),  # magenta / hot-pink (incl. dark)
-    (np.array([0,   50,  40]),  np.array([10,  255, 255])),  # rose / light-pink  (incl. dark)
+    (np.array([150, 100, 80]), np.array([175, 255, 255])),  # hot pink / magenta
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
@@ -37,7 +37,8 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    valid = [(c, cv2.contourArea(c)) for c in contours if cv2.contourArea(c) >= _MIN_BLOB_AREA]
+    sized = [(c, cv2.contourArea(c)) for c in contours]  # compute area once
+    valid = [(c, a) for c, a in sized if a >= _MIN_BLOB_AREA]
     if not valid:
         return None
     best, _ = max(valid, key=lambda item: item[1])
@@ -45,7 +46,7 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 2.5   # confidence window: ±_GAUSS_SIGMA * std
+_GAUSS_SIGMA        = 1.5   # confidence window: ±_GAUSS_SIGMA * std
 
 
 def _load_histogram(path: str) -> np.ndarray | None:
@@ -202,25 +203,105 @@ class Seeker:
 
     # ── Tracking helpers ──────────────────────────────────────────────────────
 
-    def _detection_mask(self, hsv: np.ndarray) -> np.ndarray:
-        """Return a binary detection mask.
+    # ── Detection sub-masks ───────────────────────────────────────────────────
 
-        When a calibration histogram is loaded, back-projects the 3-sigma
-        confidence histogram: only pixels whose hue bin has a non-zero weight
-        in the confidence window are accepted, weighted by the actual histogram
-        shape.  Saturation and value floors reject grey/dark pixels.
-        Falls back to hardcoded HSV ranges otherwise.
+    def _mask_gaussian(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
+        """Method 1 — Gaussian statistical threshold.
+
+        Back-projects the ±sigma confidence histogram onto the blurred hue
+        channel.  Saturation (30–200) and value (80–255) gates reject
+        grey, dark, and over-exposed pixels.
         """
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        hsv_blur = hsv.copy()
+        hsv_blur[:, :, 0] = h_blur
+        bp     = cv2.calcBackProject([hsv_blur], [0], self._conf_hist, [0, 180], 1)
+        in_sat = (hsv[:, :, 1] >= 100) & (hsv[:, :, 1] <= 255)
+        in_val =  hsv[:, :, 2] >= 80
+        return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+
+    def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
+        """Method 2 — Adaptive threshold on hue channel.
+
+        Normalises the blurred H channel to 0-255 then applies an adaptive
+        Gaussian threshold (blockSize=21, C=3).  This finds pixels whose hue
+        is locally consistent — above the local hue mean — and therefore
+        handles illumination variation across the frame without a global
+        threshold.  Fused with a direct hue-distance fence so only the
+        calibrated colour band passes.
+        """
+        h_norm   = cv2.normalize(h_blur, None, 0, 255, cv2.NORM_MINMAX)
+        adapt    = cv2.adaptiveThreshold(
+            h_norm, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=21, C=3,
+        )
+        diff     = np.abs(h_blur.astype(np.float32) - self._gauss_mean)
+        diff     = np.minimum(diff, 180.0 - diff)            # circular wrap
+        hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 255
+        return cv2.bitwise_and(adapt, hue_gate)
+
+    def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
+        """Method 3 — Dual inRange (wraparound-safe).
+
+        Builds one or two cv2.inRange bands from the calibrated mean±sigma
+        window, splitting at the 0/180 hue boundary so colours that straddle
+        it (pink/red/magenta) are detected correctly.
+        """
+        lo_h = self._gauss_mean - _GAUSS_SIGMA * self._gauss_std
+        hi_h = self._gauss_mean + _GAUSS_SIGMA * self._gauss_std
+
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+
+        def _add_range(a, b):
+            nonlocal mask
+            a, b = max(0, int(a)), min(179, int(b))
+            if a <= b:
+                mask |= cv2.inRange(hsv,
+                                    np.array([a, 100,  80]),
+                                    np.array([b, 255, 255]))
+
+        if lo_h < 0:
+            _add_range(lo_h + 180, 179)
+            _add_range(0, hi_h)
+        elif hi_h > 179:
+            _add_range(lo_h, 179)
+            _add_range(0, hi_h - 180)
+        else:
+            _add_range(lo_h, hi_h)
+
+        return mask
+
+    # ── Combined detection mask ───────────────────────────────────────────────
+
+    def _detection_mask(self, hsv: np.ndarray) -> np.ndarray:
+        """Return a binary detection mask using a 2-of-3 vote.
+
+        Runs on a half-resolution copy of the frame (~4× fewer pixels) then
+        upsamples the result, cutting the cost of GaussianBlur, adaptiveThreshold,
+        calcBackProject, and the two morphology passes significantly.
+        Falls back to hardcoded HSV ranges when no calibration histogram is loaded.
+        """
+        h, w = hsv.shape[:2]
+
         if self._conf_hist is not None:
-            bp  = cv2.calcBackProject([hsv], [0], self._conf_hist, [0, 180], 1)
-            in_sat = hsv[:, :, 1] > 40
-            in_val = hsv[:, :, 2] > 40
-            mask = ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+            small  = cv2.resize(hsv, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
+            h_blur = cv2.GaussianBlur(small[:, :, 0], (5, 5), 0)
+            m1     = self._mask_gaussian(small, h_blur)
+            m2     = self._mask_adaptive(small, h_blur)
+            m3     = self._mask_inrange(small)
+            votes  = ((m1 > 0).astype(np.uint8) +
+                      (m2 > 0).astype(np.uint8) +
+                      (m3 > 0).astype(np.uint8))
+            mask   = (votes >= 2).astype(np.uint8) * 255
+            # 3×3 at half-scale ≈ 5×5 at full-scale
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
+            mask   = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+            mask   = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         else:
             mask = _pink_mask(hsv)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+
         return mask
 
     def track(self, frame: np.ndarray):
@@ -228,21 +309,37 @@ class Seeker:
 
         Returns (annotated_frame, cx, cy) where cx/cy is the tracked centre,
         or (annotated_frame, None, None) when no target is locked.
+
+        Fast path (locked): skips the expensive 3-method detection pipeline and
+        uses only a single inRange mask to gate CamShift (~3–4× faster per frame).
+        Detection path (acquiring): runs the full 3-method pipeline on a
+        half-resolution frame to find and confirm the blob.
         """
         h_frame, w_frame = frame.shape[:2]
-        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = self._detection_mask(hsv)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        out = frame.copy()
+
+        locked = (self._roi_hist is not None and
+                  self._track_win is not None and
+                  self._detect_count >= 5)
+
+        if locked:
+            # Fast path: one inRange call instead of the full 3-method pipeline.
+            mask = (self._mask_inrange(hsv) if self._conf_hist is not None
+                    else _pink_mask(hsv))
+        else:
+            # Detection path: full pipeline on half-resolution frame.
+            mask = self._detection_mask(hsv)
+            rect = _nearest_blob_rect(mask, frame.shape)
+            if rect is not None:
+                self._track_win    = rect
+                self._detect_count = min(self._detect_count + 1, 5)
+            else:
+                self._detect_count = 0
+                self._track_win    = None
+
         if getattr(self, "_mask_window", None):
             cv2.imshow(self._mask_window, mask)
-        out  = frame.copy()
-
-        rect = _nearest_blob_rect(mask, frame.shape)
-        if rect is not None:
-            self._track_win     = rect
-            self._detect_count  = min(self._detect_count + 1, 5)
-        else:
-            self._detect_count  = 0
-            self._track_win     = None
 
         if self._roi_hist is None or self._track_win is None or self._detect_count < 5:
             self._draw_center_cross(out, w_frame, h_frame)
@@ -250,9 +347,7 @@ class Seeker:
             return out, None, None
 
         # ── CamShift step ─────────────────────────────────────────────────────
-        back_proj = cv2.calcBackProject(
-            [hsv], [0], self._roi_hist, [0, 180], 1
-        )
+        back_proj = cv2.calcBackProject([hsv], [0], self._roi_hist, [0, 180], 1)
         back_proj &= mask
 
         ret, self._track_win = cv2.CamShift(

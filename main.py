@@ -60,6 +60,12 @@ def parse_args():
         help="Show detection mask in a separate window (default: disabled)",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Log tracking telemetry to tracking.csv while in TRACKING mode",
+    )
+    parser.add_argument(
         "--crop",
         type=str,
         nargs=4,
@@ -95,6 +101,7 @@ def main():
         crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,
         show_histogram=args.histogram,
         show_mask=args.mask,
+        debug_log=args.debug,
     )
     ctrl.connect()
 
