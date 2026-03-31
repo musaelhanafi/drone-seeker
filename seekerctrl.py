@@ -17,6 +17,10 @@ from seeker import Seeker
 # RC channel 6 PWM threshold to consider the switch "active"
 _CH6_ACTIVE_PWM = 1400
 
+# ── Tracking control tuning ───────────────────────────────────────────────────
+_TRK_MAX_DEG = 30.0    # must match ArduPlane TRK_MAX_DEG
+_LATENCY_S   = 0.08    # pipeline latency to compensate (s)
+
 # ArduPlane custom mode numbers
 _TRACKING_MODE = 27
 _LOITER_MODE   = 5   # fallback mode when ch6 goes low
@@ -35,13 +39,6 @@ _PLANE_MODES: dict[int, str] = {
 
 
 UINT16_MAX = 65535
-
-# ── Fixed target position ─────────────────────────────────────────────────────
-# WGS-84 coordinates of the hot-pink ground target.
-# Edit these before each flight to match the actual target placement.
-TARGET_LAT     =  -6.897344909   # decimal degrees  (+N / -S)
-TARGET_LON     = 107.566439439   # decimal degrees  (+E / -W)
-TARGET_ALT_MSL = 744.1      # metres above mean sea level
 
 
 class SeekerCtrl:
@@ -71,13 +68,31 @@ class SeekerCtrl:
         self._prev_ch6_on   = False   # previous ch6 armed state for edge detection
 
         # ── MAVLink telemetry state ───────────────────────────────────────────
-        self._srv1_raw   = 0          # SERVO_OUTPUT_RAW servo1 (µs)
-        self._srv2_raw   = 0          # SERVO_OUTPUT_RAW servo2 (µs)
-        self._pitch_deg  = 0.0        # ATTITUDE pitch (deg)
+        self._srv1_raw      = 0        # SERVO_OUTPUT_RAW servo1 (µs)
+        self._srv2_raw      = 0        # SERVO_OUTPUT_RAW servo2 (µs)
+        self._roll_deg      = 0.0      # ATTITUDE roll (deg)
+        self._pitch_deg     = 0.0      # ATTITUDE pitch (deg)
+        self._roll_rate_dps = 0.0      # ATTITUDE rollspeed (deg/s)
+        self._pitch_rate_dps= 0.0      # ATTITUDE pitchspeed (deg/s)
+        # PID_TUNING — ArduPlane actual PID term outputs (axis 1=roll, 2=pitch)
+        self._pid_roll_P    = 0.0      # roll  P term (cd)
+        self._pid_roll_I    = 0.0      # roll  I term (cd)
+        self._pid_roll_D    = 0.0      # roll  D term (cd)
+        self._pid_roll_des  = 0.0      # roll  desired (deg)
+        self._pid_pitch_P   = 0.0      # pitch P term (cd)
+        self._pid_pitch_I   = 0.0      # pitch I term (cd)
+        self._pid_pitch_D   = 0.0      # pitch D term (cd)
+        self._pid_pitch_des = 0.0      # pitch desired (deg)
         self._rel_alt_m  = 0.0        # GLOBAL_POSITION_INT relative_alt (m, AGL)
-        self._alt_msl_m  = 0.0        # GLOBAL_POSITION_INT alt (m, MSL)
-        self._lat        = 0          # GLOBAL_POSITION_INT lat (1e7 deg)
-        self._lon        = 0          # GLOBAL_POSITION_INT lon (1e7 deg)
+
+        # ── Lock-loss hold state ──────────────────────────────────────────────
+        self._last_errorx = 0.0   # last valid errorx (re-sent while lock is lost)
+        self._last_errory = 0.0   # last valid errory (re-sent while lock is lost)
+
+        # ── Latency prediction state ──────────────────────────────────────────
+        self._prev_errorx_v  = 0.0   # raw errorx from previous frame
+        self._prev_errory_v  = 0.0   # raw errory from previous frame
+        self._prev_err_t     = 0.0   # monotonic time of previous error sample
 
         # ── CSV logger ────────────────────────────────────────────────────────
         self._debug_log  = debug_log
@@ -119,12 +134,13 @@ class SeekerCtrl:
 
     def _request_data_streams(self):
         """Ask ArduPlane to stream the telemetry messages we log."""
-        # MAVLink message IDs we want
         streams = [
             (30,  25),   # ATTITUDE            @ 25 Hz
             (36,  25),   # SERVO_OUTPUT_RAW    @ 25 Hz
             (33,   5),   # GLOBAL_POSITION_INT @  5 Hz
         ]
+        if self._debug_log:
+            streams.append((98, 25))   # PID_TUNING @ 25 Hz — debug only
         for msg_id, rate_hz in streams:
             self.master.mav.command_long_send(
                 self.master.target_system,
@@ -147,49 +163,31 @@ class SeekerCtrl:
 
         msg = self.master.messages.get("ATTITUDE")
         if msg:
-            self._pitch_deg = math.degrees(msg.pitch)
+            self._roll_deg       = math.degrees(msg.roll)
+            self._pitch_deg      = math.degrees(msg.pitch)
+            self._roll_rate_dps  = math.degrees(msg.rollspeed)
+            self._pitch_rate_dps = math.degrees(msg.pitchspeed)
+
+        # PID_TUNING is only streamed in debug mode; skip the queue drain otherwise.
+        if self._debug_log:
+            while True:
+                pid_msg = self.master.recv_match(type="PID_TUNING", blocking=False)
+                if pid_msg is None:
+                    break
+                if pid_msg.axis == 1:   # roll
+                    self._pid_roll_P   = pid_msg.P
+                    self._pid_roll_I   = pid_msg.I
+                    self._pid_roll_D   = pid_msg.D
+                    self._pid_roll_des = pid_msg.desired
+                elif pid_msg.axis == 2: # pitch
+                    self._pid_pitch_P   = pid_msg.P
+                    self._pid_pitch_I   = pid_msg.I
+                    self._pid_pitch_D   = pid_msg.D
+                    self._pid_pitch_des = pid_msg.desired
 
         msg = self.master.messages.get("GLOBAL_POSITION_INT")
         if msg:
             self._rel_alt_m = msg.relative_alt * 1e-3   # mm → m (AGL)
-            self._alt_msl_m = msg.alt          * 1e-3   # mm → m (MSL)
-            self._lat = msg.lat
-            self._lon = msg.lon
-            #print(f"[GPS] lat={self._lat*1e-7:.7f}  lon={self._lon*1e-7:.7f}"
-            #      f"  alt_msl={self._alt_msl_m:.1f}m  alt_agl={self._rel_alt_m:.1f}m")
-
-    # ── Distance / altitude relative to target ────────────────────────────────
-
-    def _dist_to_target_m(self) -> float | None:
-        """Horizontal haversine distance (m) from current position to TARGET."""
-        if self._lat == 0:
-            return None
-        lat1 = math.radians(self._lat  * 1e-7)
-        lon1 = math.radians(self._lon  * 1e-7)
-        lat2 = math.radians(TARGET_LAT)
-        lon2 = math.radians(TARGET_LON)
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-        return 6371000.0 * 2 * math.asin(math.sqrt(a))
-
-    def _alt_rel_to_target_m(self) -> float:
-        """Altitude of the aircraft above the target (m).  Positive = above target."""
-        return self._alt_msl_m - TARGET_ALT_MSL
-
-    def _geo_pitch_deg(self) -> float | None:
-        """Geometric pitch angle (deg) required to point the nose at the target.
-
-        Uses horizontal distance and altitude above target:
-            pitch = atan2(-alt_above_target, dist_to_target)
-
-        Negative = nose down (aircraft is above target and must dive).
-        Returns None when position data is not yet available.
-        """
-        dist = self._dist_to_target_m()
-        if dist is None:
-            return None
-        return math.degrees(math.atan2(-self._alt_rel_to_target_m(), max(dist, 1.0)))
 
     # ── CSV logger ────────────────────────────────────────────────────────────
 
@@ -199,7 +197,10 @@ class SeekerCtrl:
         self._csv_writer.writerow([
             "timestamp_s", "errorx", "errory",
             "aileron", "elevator",
-            "pitch_deg", "alt_above_target_m", "dist_to_target_m", "geo_pitch_deg",
+            "roll_deg", "pitch_deg", "roll_rate_dps", "pitch_rate_dps",
+            "pid_roll_desired", "pid_roll_P", "pid_roll_I", "pid_roll_D",
+            "pid_pitch_desired", "pid_pitch_P", "pid_pitch_I", "pid_pitch_D",
+            "alt_agl_m",
         ])
         print("[LOG] tracking.csv opened")
 
@@ -211,23 +212,31 @@ class SeekerCtrl:
             self._csv_writer = None
             print("[LOG] tracking.csv closed")
 
-    def _log_row(self, timestamp: float, errorx, errory, geo_pitch):
+    def _log_row(self, timestamp: float, errorx, errory):
         if self._csv_writer is None:
             return
         # Elevon demix: srv1/srv2 centred at 1500 µs
-        aileron  = (self._srv1_raw - self._srv2_raw)/700
-        elevator = (self._srv1_raw + self._srv2_raw-2700)/700
-        dist = self._dist_to_target_m()
+        aileron  = (self._srv1_raw - self._srv2_raw) / 700
+        elevator = (self._srv1_raw + self._srv2_raw - 2700) / 700
         self._csv_writer.writerow([
             f"{timestamp:.3f}",
-            f"{errorx:+.4f}"    if errorx    is not None else "",
-            f"{errory:+.4f}"    if errory    is not None else "",
-            f"{aileron:.1f}",
-            f"{elevator:.1f}",
-            f"{self._pitch_deg:.2f}",
-            f"{self._alt_rel_to_target_m():.2f}",
-            f"{dist:.1f}"       if dist      is not None else "",
-            f"{geo_pitch:.2f}"  if geo_pitch is not None else "",
+            f"{errorx:+.4f}" if errorx is not None else "",
+            f"{errory:+.4f}" if errory is not None else "",
+            f"{aileron:.4f}",
+            f"{elevator:.4f}",
+            f"{self._roll_deg:.3f}",
+            f"{self._pitch_deg:.3f}",
+            f"{self._roll_rate_dps:.3f}",
+            f"{self._pitch_rate_dps:.3f}",
+            f"{self._pid_roll_des:.4f}",
+            f"{self._pid_roll_P:.4f}",
+            f"{self._pid_roll_I:.4f}",
+            f"{self._pid_roll_D:.4f}",
+            f"{self._pid_pitch_des:.4f}",
+            f"{self._pid_pitch_P:.4f}",
+            f"{self._pid_pitch_I:.4f}",
+            f"{self._pid_pitch_D:.4f}",
+            f"{self._rel_alt_m:.2f}",
         ])
 
     # ── Joystick thread ───────────────────────────────────────────────────────
@@ -440,12 +449,33 @@ class SeekerCtrl:
                 prev_in_tracking = self._in_tracking
 
                 # ── 5. Feed TRACKING error while active ───────────────────────
-                geo_pitch = self._geo_pitch_deg()
+                if self._in_tracking and self._flight_mode == "TRACKING":
+                    if target_locked:
+                        # Latency prediction: shift errorx/errory forward by the
+                        # estimated pipeline delay to reduce lag-induced overshoot.
+                        raw_ex, raw_ey = errorx, errory
+                        dt_err = now - self._prev_err_t if self._prev_err_t > 0.0 else 0.0
+                        if 0.0 < dt_err < 0.5:
+                            dx_dt  = (raw_ex - self._prev_errorx_v) / dt_err
+                            dy_dt  = (raw_ey - self._prev_errory_v) / dt_err
+                            errorx = max(-1.0, min(1.0, raw_ex + dx_dt * _LATENCY_S))
+                            errory = max(-1.0, min(1.0, raw_ey + dy_dt * _LATENCY_S))
+                        self._prev_errorx_v = raw_ex
+                        self._prev_errory_v = raw_ey
+                        self._prev_err_t    = now
 
-                if self._in_tracking and target_locked:
-                    if self._flight_mode == "TRACKING":
+                        self._last_errorx = errorx
+                        self._last_errory = errory
                         self.send_tracking(errorx, errory)
-                        self._log_row(now, errorx, errory, geo_pitch)
+                        self._log_row(now, errorx, errory)
+
+                    else:
+                        # Lock lost: zero errorx so the aircraft levels its wings
+                        # and flies straight.  Keep last errory so pitch/dive toward
+                        # the target altitude is maintained.  ArduPlane never times
+                        # out, so tracking resumes immediately when lock returns.
+                        self.send_tracking(0.0, self._last_errory)
+                        self._log_row(now, 0.0, self._last_errory)
 
                 # ── 6. Annotate HUD ───────────────────────────────────────────
                 status  = "ON" if self._in_tracking else (

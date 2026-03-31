@@ -6,7 +6,7 @@ Usage:
 Produces three side-by-side subplots:
     1. errorx  vs aileron
     2. errory  vs elevator
-    3. pitch_deg vs geo_pitch_deg
+    3. pitch_deg vs alt_agl_m
 """
 
 import sys
@@ -18,7 +18,7 @@ def load_csv(path: str) -> dict[str, list[float]]:
     cols = {
         "timestamp_s": [], "errorx": [], "errory": [],
         "aileron": [], "elevator": [],
-        "pitch_deg": [], "geo_pitch_deg": [],
+        "pitch_deg": [], "alt_agl_m": [],
     }
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
@@ -62,16 +62,19 @@ def main():
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 
-    # ── 3. pitch_deg vs geo_pitch_deg ─────────────────────────────────────────
+    # ── 3. pitch_deg vs alt_agl_m ─────────────────────────────────────────────
     ax = axes[2]
-    ax.plot(t, d["pitch_deg"],     label="pitch (actual)",   color="tab:blue")
-    ax.plot(t, d["geo_pitch_deg"], label="geo pitch (target)", color="tab:red",
-            linestyle="--")
+    ax2 = ax.twinx()
+    ax.plot(t, d["pitch_deg"], label="pitch (deg)", color="tab:blue")
+    ax2.plot(t, d["alt_agl_m"], label="alt AGL (m)", color="tab:green", linestyle="--")
     ax.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    ax.set_ylabel("degrees")
+    ax.set_ylabel("pitch (deg)")
+    ax2.set_ylabel("altitude AGL (m)")
     ax.set_xlabel("time (s)")
-    ax.set_title("pitch_deg vs geo_pitch_deg")
-    ax.legend(loc="upper right")
+    ax.set_title("pitch_deg vs alt_agl_m")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()

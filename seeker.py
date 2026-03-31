@@ -12,7 +12,7 @@ _PINK_RANGES = [
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
-_MIN_BLOB_AREA = 50
+_MIN_BLOB_AREA = 20
 
 # Normalised error threshold (±) within which the target is considered centred
 _CENTER_THRESHOLD = 0.1
@@ -46,7 +46,7 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 1.5   # confidence window: ±_GAUSS_SIGMA * std
+_GAUSS_SIGMA        = 2.5   # confidence window: ±_GAUSS_SIGMA * std
 
 
 def _load_histogram(path: str) -> np.ndarray | None:
@@ -277,28 +277,20 @@ class Seeker:
     def _detection_mask(self, hsv: np.ndarray) -> np.ndarray:
         """Return a binary detection mask using a 2-of-3 vote.
 
-        Runs on a half-resolution copy of the frame (~4× fewer pixels) then
-        upsamples the result, cutting the cost of GaussianBlur, adaptiveThreshold,
-        calcBackProject, and the two morphology passes significantly.
         Falls back to hardcoded HSV ranges when no calibration histogram is loaded.
         """
-        h, w = hsv.shape[:2]
-
         if self._conf_hist is not None:
-            small  = cv2.resize(hsv, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
-            h_blur = cv2.GaussianBlur(small[:, :, 0], (5, 5), 0)
-            m1     = self._mask_gaussian(small, h_blur)
-            m2     = self._mask_adaptive(small, h_blur)
-            m3     = self._mask_inrange(small)
+            h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
+            m1     = self._mask_gaussian(hsv, h_blur)
+            m2     = self._mask_adaptive(hsv, h_blur)
+            m3     = self._mask_inrange(hsv)
             votes  = ((m1 > 0).astype(np.uint8) +
                       (m2 > 0).astype(np.uint8) +
                       (m3 > 0).astype(np.uint8))
             mask   = (votes >= 2).astype(np.uint8) * 255
-            # 3×3 at half-scale ≈ 5×5 at full-scale
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
             mask   = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
-            mask   = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         else:
             mask = _pink_mask(hsv)
 
