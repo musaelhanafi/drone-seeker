@@ -1,60 +1,45 @@
-# Color Detection
+# Deteksi Warna
 
-## Overview
+## Gambaran Umum
 
-The drone-seeker system detects a hot-pink target using a multi-stage computer vision pipeline in `seeker.py`. Detection is calibration-driven: a hue histogram saved by `calibrate_color.py` defines the target color model. Without a calibration file the system falls back to hardcoded hot-pink HSV ranges.
-
----
-
-## 1. Calibration (`calibrate_color.py`)
-
-Before flight, run `calibrate_color.py` to build a color model for the specific target under actual lighting conditions.
-
-### Workflow
-
-1. Point the camera at the hot-pink target.
-2. The tool detects blobs using either the saved confidence histogram or the hardcoded HSV fallback.
-3. A 180-bin hue histogram is accumulated over the detected blob region.
-4. Press **S** to save the raw normalised histogram to `color_histogram.txt`.
-5. Press **R** to reset to the HSV fallback.
-
-```mermaid
-flowchart TD
-    A[Start calibrate_color.py] --> B{color_histogram.txt\nexists?}
-    B -- yes --> C[Load saved histogram\nfit Gaussian μ σ]
-    B -- no --> D[Hardcoded HSV fallback\nH 150–175 S 100–255 V 80–255]
-    C --> E[Detect blob in frame]
-    D --> E
-    E --> F{Blob found?}
-    F -- yes --> G[Accumulate hue histogram\nover blob region]
-    F -- no --> E
-    G --> H{Key pressed?}
-    H -- S --> I[Save histogram to\ncolor_histogram.txt]
-    H -- R --> D
-    H -- other --> E
-    I --> E
-```
-
-### Saved file format
-
-Plain ASCII, 180 lines — one normalised floating-point weight per hue bin (OpenCV hue 0–179).
+Sistem drone-seeker mendeteksi target berwarna merah-muda terang (hot-pink) menggunakan pipeline computer vision bertingkat di `seeker.py`. Deteksi berbasis kalibrasi: histogram hue yang disimpan oleh `calibrate_color.py` mendefinisikan model warna target. Tanpa file kalibrasi, sistem menggunakan rentang HSV hot-pink yang dikodekan langsung sebagai fallback.
 
 ---
 
-## 2. Color Model Fitting (`seeker.py`)
+## 1. Kalibrasi (`calibrate_color.py`)
 
-At startup, `Seeker` loads the calibration histogram and fits a statistical model to it.
+Sebelum terbang, jalankan `calibrate_color.py` untuk membangun model warna target sesuai kondisi pencahayaan nyata.
 
-### 2.1 Circular Gaussian fit (`_fit_gaussian`)
+### Alur Kerja
 
-Hot pink straddles the 0/179 hue boundary, so a standard arithmetic mean is meaningless. Instead:
+1. Arahkan kamera ke target hot-pink.
+2. Alat mendeteksi blob menggunakan histogram kepercayaan yang tersimpan atau fallback HSV yang dikodekan.
+3. Histogram hue 180-bin diakumulasi dari region blob yang terdeteksi.
+4. Tekan **S** untuk menyimpan histogram yang telah dinormalisasi ke `color_histogram.txt`.
+5. Tekan **R** untuk mereset ke fallback HSV.
 
-1. Convert each bin index to an angle on the unit circle:
+![Alur kalibrasi warna](chart_01_calibration.png)
+
+### Format file yang disimpan
+
+ASCII biasa, 180 baris — satu bobot floating-point yang dinormalisasi per bin hue (OpenCV hue 0–179).
+
+---
+
+## 2. Fitting Model Warna (`seeker.py`)
+
+Saat startup, `Seeker` memuat histogram kalibrasi dan memasang model statistik pada histogram tersebut.
+
+### 2.1 Fitting Gaussian Sirkular (`_fit_gaussian`)
+
+Hot pink melintasi batas hue 0/179, sehingga rata-rata aritmatika biasa tidak bermakna. Sebagai gantinya:
+
+1. Ubah setiap indeks bin menjadi sudut pada lingkaran satuan:
    `θ_i = i × 2π / 180`
-2. Compute the weighted unit-vector sum over all 180 bins:
+2. Hitung jumlah vektor satuan berbobot dari semua 180 bin:
    `(cx, cy) = Σ p_i (cos θ_i, sin θ_i)`
-3. Circular mean: `μ = atan2(cy, cx)` mapped back to [0, 179].
-4. Circular standard deviation: wrap bin distances to [−90, 90] relative to μ, then compute the weighted variance → `σ`.
+3. Rata-rata sirkular: `μ = atan2(cy, cx)` dipetakan kembali ke [0, 179].
+4. Standar deviasi sirkular: bungkus jarak bin ke [−90, 90] relatif terhadap μ, lalu hitung varians berbobot → `σ`.
 
 ```python
 def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
@@ -66,7 +51,7 @@ def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
 
     prob = h / total
 
-    # Circular mean via unit-vector averaging
+    # Rata-rata sirkular via rata-rata vektor satuan
     angles = bins * (2.0 * np.pi / 180.0)
     cx = float(np.sum(np.cos(angles) * prob))
     cy = float(np.sum(np.sin(angles) * prob))
@@ -75,50 +60,50 @@ def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
         mean_rad += 2.0 * np.pi
     mean_hue = float(mean_rad * 180.0 / (2.0 * np.pi))
 
-    # Circular std: wrap bins to [-90, 90] relative to mean, then compute variance
+    # Std sirkular: bungkus bin ke [-90, 90] relatif terhadap mean, lalu hitung varians
     diff = bins - mean_hue
-    diff = ((diff + 90.0) % 180.0) - 90.0   # wrap to [-90, 90]
+    diff = ((diff + 90.0) % 180.0) - 90.0   # bungkus ke [-90, 90]
     var  = float(np.sum(diff ** 2 * prob))
     return mean_hue, float(np.sqrt(max(var, 1.0)))
 ```
 
-### 2.2 Confidence histogram (`_confidence_hist`)
+### 2.2 Histogram Kepercayaan (`_confidence_hist`)
 
-Zero every bin whose circular distance from μ exceeds **2.5 σ**:
+Nolkan setiap bin yang jarak sirkularnya dari μ melebihi **2.5 σ**:
 
 ```python
 def _confidence_hist(hist: np.ndarray, mean: float, std: float) -> np.ndarray:
     bins = np.arange(180, dtype=np.float32)
     diff = np.abs(bins - mean)
-    diff = np.minimum(diff, 180.0 - diff)          # circular wrap
+    diff = np.minimum(diff, 180.0 - diff)          # pembungkusan sirkular
     conf = hist.flatten().copy().astype(np.float32)
     conf[diff >= _GAUSS_SIGMA * std] = 0.0
     return conf.reshape(hist.shape)
 ```
 
-Only hue values genuinely belonging to the target (within 2.5 standard deviations) contribute to detection. This histogram is used for all downstream back-projection.
+Hanya nilai hue yang benar-benar milik target (dalam 2.5 standar deviasi) yang berkontribusi pada deteksi. Histogram ini digunakan untuk semua back-projection di tahap selanjutnya.
 
 ---
 
-## 3. Detection Pipeline (`_detection_mask`)
+## 3. Pipeline Deteksi (`_detection_mask`)
 
-Each frame runs the following steps:
+Setiap frame menjalankan langkah-langkah berikut:
 
-### Step 1 — Hue blur
+### Langkah 1 — Blur Hue
 
-A 5×5 Gaussian blur on the H channel suppresses per-pixel hue noise from JPEG artefacts, demosaicing, and specular highlights:
+Gaussian blur 5×5 pada kanal H menekan noise hue per-piksel dari artefak JPEG, demosaicing, dan sorotan spekuler:
 
 ```python
 h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
 ```
 
-### Step 2 — Three independent masks
+### Langkah 2 — Tiga Mask Independen
 
-Three methods each produce a binary mask independently. A pixel is **accepted when at least 2 of 3 methods agree** (majority vote).
+Tiga metode masing-masing menghasilkan mask biner secara independen. Piksel **diterima bila minimal 2 dari 3 metode setuju** (voting mayoritas).
 
-#### Method 1 — Gaussian back-projection (`_mask_gaussian`)
+#### Metode 1 — Back-projection Gaussian (`_mask_gaussian`)
 
-Back-projects the confidence histogram onto the blurred hue channel. Bins closer to μ carry higher weights, so the confidence histogram encodes the full learned distribution, not just a gate:
+Memproyeksikan histogram kepercayaan kembali ke kanal hue yang diblur. Bin yang lebih dekat ke μ memiliki bobot lebih tinggi, sehingga histogram kepercayaan mengkodekan distribusi yang telah dipelajari, bukan hanya gerbang:
 
 ```python
 def _mask_gaussian(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
@@ -130,16 +115,16 @@ def _mask_gaussian(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
     return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
 ```
 
-- **S ≥ 100**: rejects pastel / pale pinks — hot pink is a vivid, saturated colour.
-- **V ≥ 80**: rejects dark pixels.
+- **S ≥ 100**: menolak warna pink pucat/pastel — hot pink adalah warna yang cerah dan jenuh.
+- **V ≥ 80**: menolak piksel gelap.
 
-#### Method 2 — Adaptive hue threshold (`_mask_adaptive`)
+#### Metode 2 — Threshold Hue Adaptif (`_mask_adaptive`)
 
-Finds pixels whose hue is locally consistent, handling uneven illumination across the frame:
+Menemukan piksel yang hue-nya konsisten secara lokal, menangani iluminasi tidak merata di seluruh frame:
 
-1. Normalise `h_blur` to 0–255.
-2. Apply `adaptiveThreshold` (blockSize=21, C=3) — each pixel is compared to the Gaussian-weighted mean of its 21×21 neighbourhood.
-3. Gate with a circular hue-distance fence: `|circular_distance(H, μ)| < 2.5 σ`.
+1. Normalisasi `h_blur` ke 0–255.
+2. Terapkan `adaptiveThreshold` (blockSize=21, C=3) — setiap piksel dibandingkan dengan rata-rata berbobot Gaussian dari lingkungan 21×21-nya.
+3. Gate dengan batas jarak hue sirkular: `|jarak_sirkular(H, μ)| < 2.5 σ`.
 
 ```python
 def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
@@ -151,16 +136,16 @@ def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
         blockSize=21, C=3,
     )
     diff     = np.abs(h_blur.astype(np.float32) - self._gauss_mean)
-    diff     = np.minimum(diff, 180.0 - diff)            # circular wrap
+    diff     = np.minimum(diff, 180.0 - diff)            # pembungkusan sirkular
     hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 255
     return cv2.bitwise_and(adapt, hue_gate)
 ```
 
-Robust to scenes where one side of the target is brighter than the other.
+Robust terhadap scene di mana satu sisi target lebih terang dari sisi lainnya.
 
-#### Method 3 — Dual inRange (`_mask_inrange`)
+#### Metode 3 — Dual inRange (`_mask_inrange`)
 
-Builds one or two `cv2.inRange` HSV bands from `[μ − 2.5σ,  μ + 2.5σ]`. When the range crosses the 0/180 hue wrap boundary it is split automatically:
+Membangun satu atau dua band HSV `cv2.inRange` dari `[μ − 2.5σ,  μ + 2.5σ]`. Ketika rentang melewati batas wrap hue 0/180, rentang tersebut dibagi otomatis:
 
 ```python
 def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
@@ -188,9 +173,9 @@ def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
     return mask
 ```
 
-Primary safeguard for wraparound colours such as hot pink and magenta.
+Pengaman utama untuk warna yang melewati batas seperti hot pink dan magenta.
 
-### Step 3 — Majority vote
+### Langkah 3 — Voting Mayoritas
 
 ```python
 votes = ((m1 > 0).astype(np.uint8) +
@@ -199,27 +184,27 @@ votes = ((m1 > 0).astype(np.uint8) +
 mask  = (votes >= 2).astype(np.uint8) * 255
 ```
 
-### Step 4 — Morphological cleanup
+### Langkah 4 — Pembersihan Morfologis
 
 ```python
 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)  # remove isolated noise specks
-mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)  # fill gaps within the blob
+mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)  # hapus noise terisolasi
+mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)  # isi celah dalam blob
 ```
 
-### Fallback (no calibration file)
+### Fallback (tanpa file kalibrasi)
 
-If no histogram file is found, detection uses a single hardcoded hot-pink band:
+Jika tidak ada file histogram, deteksi menggunakan satu band hot-pink yang dikodekan langsung:
 
-| H | S | V | Description |
+| H | S | V | Keterangan |
 |---|---|---|---|
 | 150–175 | 100–255 | 80–255 | Hot pink / magenta |
 
 ---
 
-## 4. Blob Selection (`_nearest_blob_rect`)
+## 4. Seleksi Blob (`_nearest_blob_rect`)
 
-`cv2.findContours` extracts all external contours from the mask. The **largest contour by area** is selected provided it meets the minimum threshold:
+`cv2.findContours` mengekstrak semua kontur eksternal dari mask. **Kontur terbesar berdasarkan area** dipilih asalkan memenuhi ambang minimum:
 
 ```python
 _MIN_BLOB_AREA = 50  # px²
@@ -235,28 +220,10 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
     return cv2.boundingRect(best)
 ```
 
-Returns the axis-aligned bounding rectangle `(x, y, w, h)`, or `None` if no valid blob is found.
+Mengembalikan bounding rectangle berorientasi sumbu `(x, y, w, h)`, atau `None` jika tidak ada blob valid yang ditemukan.
 
 ---
 
-## Summary Diagram
+## Diagram Ringkasan
 
-```mermaid
-flowchart TD
-    A[Camera Frame] --> B[BGR → HSV]
-    B --> C[GaussianBlur H channel 5×5]
-    B --> D3
-
-    C --> D1[mask1\nGaussian Back-projection\ncalcBackProject on conf_hist]
-    C --> D2[mask2\nAdaptive Hue Threshold\nadaptiveThreshold + hue gate]
-    B --> D3[mask3\nDual inRange\nμ ± 2.5σ with wrap handling]
-
-    D1 --> V{Majority Vote\n≥ 2 of 3}
-    D2 --> V
-    D3 --> V
-
-    V --> MO[MORPH_OPEN 5×5 ellipse\nremove noise specks]
-    MO --> MD[MORPH_DILATE 5×5 ellipse\nfill intra-blob gaps]
-    MD --> BL[findContours → largest blob by area]
-    BL --> OUT[Bounding Rect\nx  y  w  h]
-```
+![Pipeline deteksi warna](chart_01_detection.png)

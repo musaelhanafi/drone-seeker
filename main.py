@@ -60,10 +60,58 @@ def parse_args():
         help="Show detection mask in a separate window (default: disabled)",
     )
     parser.add_argument(
+        "--no-camshift",
+        action="store_true",
+        default=False,
+        help="Disable CamShift; use blob centroid directly each frame",
+    )
+    parser.add_argument(
+        "--no-box-filter",
+        action="store_true",
+        default=False,
+        help="Disable box-like shape filter; accept any blob regardless of shape",
+    )
+    parser.add_argument(
+        "--no-hud-pitch",
+        action="store_true",
+        default=False,
+        help="Disable pitch ladder in HUD",
+    )
+    parser.add_argument(
+        "--no-hud-yaw",
+        action="store_true",
+        default=False,
+        help="Disable yaw compass in HUD",
+    )
+    parser.add_argument(
+        "--no-prediction",
+        action="store_true",
+        default=False,
+        help="Disable latency + PN lead input prediction (default: enabled)",
+    )
+    parser.add_argument(
+        "--mask-algo",
+        default="all",
+        choices=["gaussian", "adaptive", "inrange", "all"],
+        help="Detection mask algorithm: gaussian, adaptive, inrange, or all (2-of-3 vote, default)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=False,
         help="Log tracking telemetry to tracking.csv while in TRACKING mode",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        default=False,
+        help="Record annotated video to tracking_<timestamp>.avi while in TRACKING mode",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help="Auto mode: enter TRACKING when within 1 km of target; ch6 keeps FC in AUTO otherwise",
     )
     parser.add_argument(
         "--crop",
@@ -102,6 +150,14 @@ def main():
         show_histogram=args.histogram,
         show_mask=args.mask,
         debug_log=args.debug,
+        record=args.record,
+        input_prediction=not args.no_prediction,
+        mask_algo=args.mask_algo,
+        use_camshift=not args.no_camshift,
+        box_filter=not args.no_box_filter,
+        hud_pitch=not args.no_hud_pitch,
+        hud_yaw=not args.no_hud_yaw,
+        auto_mode=args.auto,
     )
     ctrl.connect()
 

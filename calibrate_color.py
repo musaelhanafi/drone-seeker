@@ -10,6 +10,8 @@ Detection strategy:
 Controls:
   S      — save histogram of current detection
   R      — reset / clear saved histogram
+  D      — draw / select region manually (overrides auto-detection)
+  C      — clear manual region selection
   Q/Esc  — quit
 """
 
@@ -20,7 +22,10 @@ import cv2
 import numpy as np
 
 # Import shared detection helpers from seeker so behavior is identical
-from seeker import _fit_gaussian, _load_histogram, _pink_mask, _nearest_blob_rect, _confidence_hist
+from seeker import (
+    _fit_gaussian, _load_histogram, _pink_mask, _nearest_blob_rect,
+    _confidence_hist, _GAUSS_SIGMA,
+)
 
 WINDOW      = "Calibrate Color"
 HIST_WINDOW = "Histogram"
@@ -29,16 +34,83 @@ OUT_FILE    = "color_histogram.txt"
 
 
 
-def _conf_mask(hsv: np.ndarray, conf_hist: np.ndarray) -> np.ndarray:
-    """Back-project the confidence histogram onto an HSV frame.
-    Accepts pixels whose hue bin has non-zero weight (i.e. within 3*std of mean)
-    and also pass saturation/value floors.
-    Dilate is applied before open to fill gaps left by sparse histogram bins."""
-    bp  = cv2.calcBackProject([hsv], [0], conf_hist, [0, 180], 1)
-    in_sat = hsv[:, :, 1] > 40
-    in_val = hsv[:, :, 2] > 40
-    mask = ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+def _mask_gaussian(hsv: np.ndarray, h_blur: np.ndarray, conf_hist: np.ndarray) -> np.ndarray:
+    """Method 1 — Gaussian back-projection (sat floor 40, val floor 40)."""
+    hsv_blur = hsv.copy()
+    hsv_blur[:, :, 0] = h_blur
+    bp     = cv2.calcBackProject([hsv_blur], [0], conf_hist, [0, 180], 1)
+    in_sat = hsv[:, :, 1] >= 40
+    in_val = hsv[:, :, 2] >= 40
+    return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+
+
+def _mask_adaptive(hsv: np.ndarray, h_blur: np.ndarray,
+                   gauss_mean: float, gauss_std: float) -> np.ndarray:
+    """Method 2 — Adaptive hue threshold + ±3σ hue-distance gate."""
+    h_norm = cv2.normalize(h_blur, None, 0, 255, cv2.NORM_MINMAX)
+    adapt  = cv2.adaptiveThreshold(
+        h_norm, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=21, C=3,
+    )
+    diff     = np.abs(h_blur.astype(np.float32) - gauss_mean)
+    diff     = np.minimum(diff, 180.0 - diff)
+    hue_gate = (diff < _GAUSS_SIGMA * gauss_std).astype(np.uint8) * 255
+    return cv2.bitwise_and(adapt, hue_gate)
+
+
+def _mask_inrange(hsv: np.ndarray, gauss_mean: float, gauss_std: float) -> np.ndarray:
+    """Method 3 — Dual inRange with wraparound-safe hue band."""
+    lo_h = gauss_mean - _GAUSS_SIGMA * gauss_std
+    hi_h = gauss_mean + _GAUSS_SIGMA * gauss_std
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+
+    def _add_range(a, b):
+        nonlocal mask
+        a, b = max(0, int(a)), min(179, int(b))
+        if a <= b:
+            mask |= cv2.inRange(hsv,
+                                np.array([a, 40, 40]),
+                                np.array([b, 255, 255]))
+
+    if lo_h < 0:
+        _add_range(lo_h + 180, 179)
+        _add_range(0, hi_h)
+    elif hi_h > 179:
+        _add_range(lo_h, 179)
+        _add_range(0, hi_h - 180)
+    else:
+        _add_range(lo_h, hi_h)
+    return mask
+
+
+def _detection_mask(hsv: np.ndarray, conf_hist, gauss_mean, gauss_std,
+                    algo: str = "all") -> np.ndarray:
+    """Build detection mask using the selected algorithm.
+
+    algo: "gaussian" | "adaptive" | "inrange" | "all" (2-of-3 majority vote)
+    Falls back to hardcoded pink ranges when conf_hist is None.
+    """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    if conf_hist is not None:
+        h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
+        if algo == "gaussian":
+            mask = _mask_gaussian(hsv, h_blur, conf_hist)
+        elif algo == "adaptive":
+            mask = _mask_adaptive(hsv, h_blur, gauss_mean, gauss_std)
+        elif algo == "inrange":
+            mask = _mask_inrange(hsv, gauss_mean, gauss_std)
+        else:  # "all" — 2-of-3 vote
+            m1    = _mask_gaussian(hsv, h_blur, conf_hist)
+            m2    = _mask_adaptive(hsv, h_blur, gauss_mean, gauss_std)
+            m3    = _mask_inrange(hsv, gauss_mean, gauss_std)
+            votes = ((m1 > 0).astype(np.uint8) +
+                     (m2 > 0).astype(np.uint8) +
+                     (m3 > 0).astype(np.uint8))
+            mask  = (votes >= 2).astype(np.uint8) * 255
+    else:
+        mask = _pink_mask(hsv)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
     return mask
@@ -94,6 +166,9 @@ def main():
                     help=f"Output histogram file (default: {OUT_FILE})")
     ap.add_argument("--mask", action="store_true", default=False,
                     help="Show detection mask in a separate window (default: disabled)")
+    ap.add_argument("--mask-algo", default="all",
+                    choices=["gaussian", "adaptive", "inrange", "all"],
+                    help="Detection algorithm: gaussian, adaptive, inrange, or all (2-of-3 vote, default)")
     ap.add_argument("--crop", type=str, nargs=4, default=None,
                     metavar=("X", "Y", "W", "H"),
                     help="Crop each frame to this ROI (e.g. --crop 320 180 640 360). "
@@ -135,11 +210,13 @@ def main():
         gauss_mean = gauss_std = conf_hist = None
         print("[Cal] No histogram file found — using hardcoded pink ranges.")
 
-    hist  = None   # histogram of current detection
-    saved = saved_hist is not None
+    hist          = None   # histogram of current detection
+    saved         = saved_hist is not None
+    manual_rect   = None   # user-drawn ROI (overrides auto-detected blob when set)
+    detect_count  = 0      # consecutive frames blob was detected (lock after 3)
 
     print("[Cal] Point camera at target.")
-    print("[Cal]  S — save   R — reset   Q/Esc — quit")
+    print("[Cal]  S — save   R — reset   D — draw region   C — clear region   Q/Esc — quit")
 
     while True:
         ok, frame = cap.read()
@@ -157,38 +234,56 @@ def main():
             frame = frame[cy:cy + ch, cx:cx + cw]
 
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        if conf_hist is not None:
-            mask = _conf_mask(hsv, conf_hist)
-        else:
-            mask = _pink_mask(hsv)
+        mask = _detection_mask(hsv, conf_hist, gauss_mean, gauss_std, args.mask_algo)
         rect    = _nearest_blob_rect(mask, frame.shape)
         display = frame.copy()
         if args.mask:
             cv2.imshow(MASK_WINDOW, mask)
 
-        if rect is not None:
-            x, y, w, h = rect
-            hist = _compute_histogram(frame, rect, mask)
-            # bounding box: green if histogram already saved, yellow otherwise
-            colour = (0, 255, 0) if saved else (0, 255, 255)
+        # Update confirmation counter (manual ROI bypasses the counter)
+        if manual_rect is None:
+            if rect is not None:
+                detect_count = min(detect_count + 1, 3)
+            else:
+                detect_count = 0
+        confirmed = (manual_rect is not None) or (detect_count >= 3)
+
+        active_rect = manual_rect if manual_rect is not None else (rect if confirmed else None)
+        if active_rect is not None:
+            x, y, w, h = active_rect
+            hist = _compute_histogram(frame, active_rect, mask)
+            # bounding box: cyan for manual, green if saved, yellow otherwise
+            if manual_rect is not None:
+                colour = (255, 255, 0)
+            else:
+                colour = (0, 255, 0) if saved else (0, 255, 255)
             cv2.rectangle(display, (x, y), (x + w, y + h), colour, 2)
-            cv2.putText(display, f"{w}x{h}px", (x, y - 6),
+            label = f"{w}x{h}px" + (" [manual]" if manual_rect is not None else "")
+            cv2.putText(display, label, (x, y - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1)
             cv2.imshow(HIST_WINDOW, _draw_histogram(hist))
         else:
             hist = None
 
         # detection mode label
-        mode_label = (f"Confidence 3*delta  mean={gauss_mean:.0f}  std={gauss_std:.1f}"
-                      if conf_hist is not None else "Fallback: pink HSV ranges")
+        if conf_hist is not None:
+            mode_label = (f"algo={args.mask_algo}  mean={gauss_mean:.0f}"
+                          f"  std={gauss_std:.1f}  3σ={_GAUSS_SIGMA*gauss_std:.1f}")
+        else:
+            mode_label = "Fallback: pink HSV ranges"
+        if manual_rect is not None:
+            mode_label += "  [manual ROI]"
 
         # status line
         if saved:
             status = f"Saved: {args.output}"
             s_col  = (0, 255, 0)
-        elif rect is not None:
+        elif active_rect is not None:
             status = "Press S to save"
             s_col  = (0, 255, 255)
+        elif rect is not None:
+            status = f"Confirming... {detect_count}/3"
+            s_col  = (0, 165, 255)
         else:
             status = "No target detected"
             s_col  = (0, 0, 255)
@@ -196,7 +291,7 @@ def main():
         cv2.putText(display, mode_label,
                     (10, display.shape[0] - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
-        cv2.putText(display, f"S=save  R=reset  Q=quit   {status}",
+        cv2.putText(display, f"S=save  R=reset  D=draw  C=clear  Q=quit   {status}",
                     (10, display.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, s_col, 1)
 
@@ -205,6 +300,16 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
             break
+        elif key == ord('d'):
+            roi = cv2.selectROI(WINDOW, display, fromCenter=False, showCrosshair=True)
+            if roi[2] > 0 and roi[3] > 0:
+                manual_rect = (int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
+                print(f"[Cal] Manual ROI set: {manual_rect}")
+            else:
+                print("[Cal] ROI selection cancelled.")
+        elif key == ord('c'):
+            manual_rect = None
+            print("[Cal] Manual ROI cleared — back to auto-detection.")
         elif key == ord('s'):
             if hist is not None:
                 np.savetxt(args.output, hist.flatten(), fmt="%.4f")
@@ -217,9 +322,11 @@ def main():
             else:
                 print("[Cal] No target detected — nothing to save.")
         elif key == ord('r'):
-            hist       = None
-            saved      = False
-            gauss_mean = gauss_std = conf_hist = None
+            hist         = None
+            saved        = False
+            manual_rect  = None
+            detect_count = 0
+            gauss_mean   = gauss_std = conf_hist = None
             print("[Cal] Reset — reverted to pink HSV ranges.")
 
     cap.release()

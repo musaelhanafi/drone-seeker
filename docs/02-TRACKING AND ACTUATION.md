@@ -1,22 +1,22 @@
-# Tracking and MAVLink Actuation
+# Tracking dan Aktuasi MAVLink
 
-## Overview
+## Gambaran Umum
 
-This document covers two layers:
+Dokumen ini mencakup dua lapisan:
 
-1. **Visual tracking** (`seeker.py`) — state machine and CamShift tracker that converts a detection mask into a stable target centroid.
-2. **MAVLink actuation** (`seekerctrl.py`) — flight mode management and error delivery to the ArduPlane flight controller.
+1. **Visual tracking** (`seeker.py`) — state machine dan tracker CamShift yang mengubah mask deteksi menjadi centroid target yang stabil.
+2. **Aktuasi MAVLink** (`seekerctrl.py`) — manajemen mode penerbangan dan pengiriman error ke flight controller ArduPlane.
 
 ---
 
-## Part A — Visual Tracking (`seeker.py`)
+## Bagian A — Visual Tracking (`seeker.py`)
 
-### A1. Detection State Machine
+### A1. State Machine Deteksi
 
-Detection alone is noisy. A consecutive-detection counter gates entry into CamShift tracking:
+Deteksi saja bersifat noisy. Pencacah deteksi berurutan mengatur masuk ke tracking CamShift:
 
 ```
-if blob detected this frame:
+if blob terdeteksi frame ini:
     _detect_count = min(_detect_count + 1, 5)
     _track_win    = blob_rect
 else:
@@ -24,105 +24,79 @@ else:
     _track_win    = None
 
 if _detect_count < 5:
-    return no-lock     # require 5 consecutive hits before engaging tracker
+    return no-lock     # butuh 5 hit berurutan sebelum mengaktifkan tracker
 ```
 
-Five consecutive detections must succeed before the tracker activates. A single false-positive cannot engage the tracker.
+Lima deteksi berurutan harus berhasil sebelum tracker diaktifkan. Satu false-positive tidak dapat mengaktifkan tracker.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Searching
+![State machine deteksi blob](chart_02_detection_state.png)
 
-    Searching --> Searching : no blob detected\n_detect_count = 0
-    Searching --> Counting  : blob detected\n_detect_count = 1
+### A2. Tracking CamShift
 
-    Counting --> Counting   : blob detected\n_detect_count < 5
-    Counting --> Tracking   : blob detected\n_detect_count == 5
-    Counting --> Searching  : no blob detected\n_detect_count = 0
+Setelah `_detect_count >= 5`, CamShift berjalan setiap frame:
 
-    Tracking --> Tracking   : CamShift succeeds\ncentroid updated
-    Tracking --> Searching  : window collapses w<2 or h<2\n_detect_count = 0
-```
-
-### A2. CamShift Tracking
-
-Once `_detect_count >= 5`, CamShift runs every frame:
-
-1. Back-project the confidence histogram (`_roi_hist = _conf_hist`) onto the full HSV frame.
-2. AND the back-projection with the current detection mask to suppress background.
-3. Run `cv2.CamShift` from the last known window.
-4. If the window collapses below 2×2 px, drop the lock and reset the counter.
+1. Back-project histogram kepercayaan (`_roi_hist = _conf_hist`) ke seluruh frame HSV.
+2. AND hasil back-projection dengan mask deteksi saat ini untuk menekan background.
+3. Jalankan `cv2.CamShift` dari window terakhir yang diketahui.
+4. Jika window menyusut di bawah 2×2 px, lepaskan lock dan reset counter.
 
 ```
 back_proj = calcBackProject(hsv, roi_hist) AND detection_mask
 _, track_win = CamShift(back_proj, track_win, term_criteria)
 ```
 
-CamShift iteratively shifts and resizes the window to maximise the back-projection probability within it, producing sub-pixel centroid estimates and a rotation-aware bounding box.
+CamShift secara iteratif menggeser dan mengubah ukuran window untuk memaksimalkan probabilitas back-projection di dalamnya, menghasilkan estimasi centroid sub-piksel dan bounding box yang sadar rotasi.
 
-| Collapse guard | Action |
+| Penjaga collapse | Aksi |
 |---|---|
-| `w < 2 or h < 2` | Clear `_track_win`, reset `_detect_count = 0` |
+| `w < 2 or h < 2` | Hapus `_track_win`, reset `_detect_count = 0` |
 
-### A3. Error Calculation (`error_xy`)
+### A3. Perhitungan Error (`error_xy`)
 
-The tracked centroid `(cx, cy)` is normalised to `[-1, 1]`:
+Centroid yang dilacak `(cx, cy)` dinormalisasi ke `[-1, 1]`:
 
 ```
-errorx = (cx - W/2) / (W/2)    positive = target right of centre
-errory = (cy - H/2) / (H/2)    positive = target below centre (image Y axis down)
+errorx =  (cx - W/2) / (W/2)    positif = target di kanan tengah
+errory = -(cy - H/2) / (H/2)    positif = target di atas tengah
 ```
 
-`W`, `H` are the frame width and height. These values are sent directly to the flight controller with no clamping.
+`W`, `H` adalah lebar dan tinggi frame. **Negasi pada errory** mengkonversi dari koordinat gambar (sumbu Y mengarah ke bawah) ke konvensi penerbangan (positif = atas). Target di atas crosshair menghasilkan `errory` positif, yang ditafsirkan ArduPlane sebagai "pitch naik untuk mendapatkan target". Nilai-nilai ini dikirim ke flight controller tanpa pemotongan di tahap ini; pemotongan terjadi di prediktor latensi.
 
 ---
 
-## Part B — MAVLink Actuation (`seekerctrl.py`)
+## Bagian B — Aktuasi MAVLink (`seekerctrl.py`)
 
 ---
 
-## 1. Architecture
+## 1. Arsitektur
 
-```mermaid
-flowchart TD
-    CAM[Camera\nOpenCV] -->|frames| SK[Seeker\ndetect / track]
-    SK -->|cx cy| EXY[error_xy\nerrorx errory ∈ -1..1]
-
-    EXY -->|errors| SM[Mode State Machine\nch6 edge detection]
-    FC[Flight Controller\npymavlink] -->|RC_CHANNELS| SM
-    FC -->|HEARTBEAT\nflight mode| SM
-
-    SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / RTL| FC
-    SM -->|DEBUG_VECT x y\nwhen tracking + locked| FC
-
-    JOY[Joystick Thread\noptional] -->|RC_CHANNELS_OVERRIDE\nat joystick_rate Hz| FC
-```
+![Arsitektur sistem drone-seeker](chart_02_architecture.png)
 
 ---
 
-## 2. MAVLink Connection
+## 2. Koneksi MAVLink
 
 ```
 master = mavutil.mavlink_connection(connection_string, baud=baud)
 master.wait_heartbeat()
 ```
 
-The connection string can be a serial port (`/dev/ttyUSB0`) or a UDP endpoint (`udp:127.0.0.1:14550`). The call blocks until the first HEARTBEAT is received, confirming the flight controller is alive and the target system/component IDs are set.
+Connection string dapat berupa port serial (`/dev/ttyUSB0`) atau endpoint UDP (`udp:127.0.0.1:14550`). Panggilan ini memblokir hingga HEARTBEAT pertama diterima, mengkonfirmasi bahwa flight controller aktif dan ID sistem/komponen target sudah diset.
 
 ---
 
-## 3. RC Channel Monitoring
+## 3. Pemantauan Kanal RC
 
 ### `_poll_rc()`
 
-Non-blocking drain of all pending `RC_CHANNELS` messages each frame:
+Drain non-blocking dari semua pesan `RC_CHANNELS` yang tertunda setiap frame:
 
 ```
 while recv_match(type="RC_CHANNELS", blocking=False) is not None:
     update rc_channels dict
 ```
 
-Stores the latest PWM value for each channel in `self.rc_channels`.
+Menyimpan nilai PWM terbaru untuk setiap kanal di `self.rc_channels`.
 
 ### `_ch6_active()`
 
@@ -130,13 +104,13 @@ Stores the latest PWM value for each channel in `self.rc_channels`.
 ch6_active = rc_channels["ch6"] >= 1400 pwm
 ```
 
-Channel 6 is the lock switch for the tracking mode. PWM >= 1400 = locked.
+Kanal 6 adalah saklar kunci untuk mode tracking. PWM >= 1400 = terkunci.
 
 ### `_poll_heartbeat()`
 
-Reads the last `HEARTBEAT` stored by pymavlink and maps `custom_mode` to a human-readable name:
+Membaca HEARTBEAT terakhir yang disimpan oleh pymavlink dan memetakan `custom_mode` ke nama yang mudah dibaca:
 
-| custom_mode | name |
+| custom_mode | nama |
 |---|---|
 | 5 | LOITER |
 | 11 | RTL |
@@ -145,83 +119,67 @@ Reads the last `HEARTBEAT` stored by pymavlink and maps `custom_mode` to a human
 
 ---
 
-## 4. Flight Mode State Machine
+## 4. State Machine Mode Penerbangan
 
-The state machine runs once per frame after RC and HEARTBEAT are polled. It enforces five rules:
+State machine berjalan sekali per frame setelah RC dan HEARTBEAT di-polling. Ini menerapkan lima aturan:
 
-| ch6 | Target detected | Action |
+| ch6 | Target terdeteksi | Aksi |
 |---|---|---|
-| off (fell) | either | Clear `_in_tracking`, command **RTL** |
-| on | yes, first time | Command **TRACKING**, set `_in_tracking = True` |
-| on | yes, already tracking | No change |
-| on | no | No change (stays in TRACKING) |
-| off (already) | either | No repeated command |
+| off (turun) | keduanya | Hapus `_in_tracking`, perintahkan **AUTO** |
+| on | ya, pertama kali | Perintahkan **TRACKING**, set `_in_tracking = True` |
+| on | ya, sudah tracking | Tidak ada perubahan |
+| on | tidak | Tidak ada perubahan (tetap di TRACKING, ArduPlane dead-reckons) |
+| off (sudah) | keduanya | Tidak ada perintah berulang |
 
-### Edge detection
+### Deteksi tepi
 
-RTL is only sent **once on the falling edge** of ch6, not on every frame while ch6 is low:
+AUTO hanya dikirim **sekali pada tepi turun** ch6, bukan setiap frame saat ch6 rendah:
 
 ```python
 ch6_fell = prev_ch6_on and not ch6_on
 
 if ch6_fell:
     _in_tracking = False
-    set_mode_rtl()
+    set_mode_auto()          # custom_mode = 10
 
 elif ch6_on and target_locked and not _in_tracking:
-    set_mode_tracking()
+    set_mode_tracking()      # custom_mode = 27
     _in_tracking = True
 
 prev_ch6_on = ch6_on
 ```
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle : ch6 LOW at startup
+![State machine mode penerbangan](chart_02_mode_state.png)
 
-    Idle --> Locked : ch6 goes HIGH
+### Perintah mode
 
-    Locked --> Locked      : no target detected
-    Locked --> Tracking    : target locked\n(first time)\ncommand TRACKING mode
-
-    Tracking --> Tracking  : target locked\nsending DEBUG_VECT
-    Tracking --> Tracking  : target lost\n(hold TRACKING mode\nno command sent)
-
-    Tracking --> RTL       : ch6 HIGH→LOW edge\n_in_tracking = False\ncommand RTL
-    Locked --> RTL         : ch6 HIGH→LOW edge\ncommand RTL
-
-    RTL --> Idle           : ch6 LOW steady
-```
-
-### Mode commands
-
-Both mode changes use `MAV_CMD_DO_SET_MODE` with `MAV_MODE_FLAG_CUSTOM_MODE_ENABLED`:
+Kedua perubahan mode menggunakan `MAV_CMD_DO_SET_MODE` dengan `MAV_MODE_FLAG_CUSTOM_MODE_ENABLED`:
 
 ```python
 master.mav.command_long_send(
     target_system, target_component,
     MAV_CMD_DO_SET_MODE, 0,
     MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-    custom_mode,          # 27 = TRACKING, 11 = RTL
+    custom_mode,          # 27 = TRACKING, 10 = AUTO
     0, 0, 0, 0, 0,
 )
 ```
 
 ---
 
-## 5. Sending Tracking Errors
+## 5. Pengiriman Error Tracking
 
-### Message format
+### Format pesan
 
-Tracking errors are sent as the standard MAVLink `DEBUG_VECT` message (ID 250, CRC extra 49), which is present in ArduPlane's compiled `MAVLINK_MESSAGE_CRCS` table:
+Error tracking dikirim sebagai pesan MAVLink standar `DEBUG_VECT` (ID 250, CRC extra 49), yang ada di tabel `MAVLINK_MESSAGE_CRCS` yang dikompilasi ArduPlane:
 
-| Field | Content |
+| Field | Isi |
 |---|---|
-| `name` | `"tracking\x00\x00"` (10-byte padded string) |
+| `name` | `"tracking\x00\x00"` (string 10-byte dipadded) |
 | `time_usec` | `monotonic() * 1e6` |
-| `x` | `errorx` — normalised horizontal error [-1, 1] |
-| `y` | `errory` — normalised vertical error [-1, 1] |
-| `z` | `0.0` (unused) |
+| `x` | `errorx` — error horizontal yang dinormalisasi [-1, 1] |
+| `y` | `errory` — error vertikal yang dinormalisasi [-1, 1] |
+| `z` | `0.0` (tidak digunakan) |
 
 ```python
 master.mav.debug_vect_send(
@@ -231,110 +189,135 @@ master.mav.debug_vect_send(
 )
 ```
 
-`DEBUG_VECT` was chosen because custom message IDs outside ArduPlane's compiled message table are silently dropped by the MAVLink parser before reaching the application layer.
+`DEBUG_VECT` dipilih karena ID pesan kustom di luar tabel pesan yang dikompilasi ArduPlane secara diam-diam dibuang oleh parser MAVLink sebelum mencapai lapisan aplikasi.
 
-### Error normalisation
+### Normalisasi error
 
 ```
-errorx = (cx - W/2) / (W/2)    positive = target right of centre
-errory = (cy - H/2) / (H/2)    positive = target below centre
+errorx = (cx - W/2) / (W/2)    positif = target di kanan tengah
+errory = (cy - H/2) / (H/2)    positif = target di bawah tengah
 ```
 
-### Send condition
+### Kondisi pengiriman
 
-Errors are sent only when `_in_tracking` is True and a target is currently locked:
+Error hanya dikirim saat `_in_tracking` True dan target saat ini terkunci. Saat lock hilang, **tidak ada yang dikirim** — ArduPlane mendeteksi timeout dan beralih ke dead-reckoning onboard (estimasi LOS yang diintegrasikan gyro):
 
 ```python
-if _in_tracking and target_locked:
-    send_tracking(errorx, errory)
+if _in_tracking and flight_mode == "TRACKING":
+    if target_locked:
+        # terapkan prediksi latensi + PN lead (lihat Bagian 11)
+        errorx, errory = predict(raw_ex, raw_ey, dt, _LATENCY_S + _PN_LEAD_S)
+        send_tracking(errorx, errory)
+        log_row(...)
+    else:
+        # lock hilang — kirim (0, 0); ArduPlane timeout dan dead-reckons
+        log_row(..., target_locked=False)
 ```
 
 ---
 
-## 6. ArduPlane Reception (`GCS_MAVLink_Plane.cpp`)
+## 6. Penerimaan ArduPlane (`GCS_MAVLink_Plane.cpp`)
 
-`DEBUG_VECT` is dispatched to `handle_tracking_message()` which:
+`DEBUG_VECT` dikirim ke `handle_tracking_message()` yang:
 
-1. Decodes with `mavlink_msg_debug_vect_decode()`.
-2. Returns early if not in TRACKING mode.
-3. Scales normalised errors to radians using `TRACKING_MAX_DEG` (default 45 deg):
+1. Mendekode dengan `mavlink_msg_debug_vect_decode()`.
+2. Kembali lebih awal jika tidak dalam mode TRACKING.
+3. Menskalakan error yang dinormalisasi ke radian menggunakan `TRACKING_MAX_DEG` (default 45 deg):
 
 ```cpp
 float max_rad = tracking_max_deg * (PI / 180.0f);
 handle_tracking_error(pkt.x * max_rad, pkt.y * max_rad);
 ```
 
-4. Stores `_errorx_rad` and `_errory_rad` consumed by `update()`.
+4. Menyimpan `_errorx_rad` dan `_errory_rad` yang dikonsumsi oleh `update()`.
 
 ---
 
-## 7. ArduPlane PID Loop (`mode_tracking.cpp`)
+## 7. Loop PID ArduPlane (`mode_tracking.cpp`)
 
-`ModeTracking::update()` runs each main loop cycle and converts tracking errors to roll and pitch commands.
+`ModeTracking::update()` berjalan setiap siklus main loop dan mengubah error tracking menjadi perintah roll dan pitch.
 
-```mermaid
-flowchart TD
-    DV[DEBUG_VECT received\nx=errorx  y=errory] --> HM{In TRACKING\nmode?}
-    HM -- no --> DROP[discard]
-    HM -- yes --> SCALE[Scale to radians\nerror_rad = error × MAX_DEG × π/180]
-    SCALE --> STORE[store _errorx_rad\n_errory_rad\nupdate _last_msg_ms]
+![Loop PID ArduPlane TRACKING mode](chart_02_pid_flow.png)
 
-    STORE --> UPD[update called each loop]
-    UPD --> TO{Signal timeout?}
-    TO -- yes --> ZERO[nav_roll_cd = 0\nnav_pitch_cd = 0\nreset_I both PIDs]
-    TO -- no --> DB1{|ex| > deadband?}
+### Settle Ramp
 
-    DB1 -- no  --> RI1[reset_I roll PID\nex = 0]
-    DB1 -- yes --> RP[Roll PID update_error\nnav_roll_cd = clamp result]
-    RI1 --> RP
+Pada masuk mode atau setelah timeout sinyal, output PID diskalakan dari 0 ke 1 selama `TRK_SETTLE_S` detik untuk menekan transien error awal yang besar:
 
-    RP --> DB2{|ey| > deadband?}
-    DB2 -- no  --> RI2[reset_I pitch PID\ney = 0]
-    DB2 -- yes --> PP[Pitch PID update_error\nnav_pitch_cd = clamp result]
-    RI2 --> PP
+```cpp
+const float elapsed = (now_ms - _lock_stable_ms) * 1e-3f;
+ramp = constrain_float(elapsed / settle_s, 0.0f, 1.0f);
 
-    PP --> THR[Throttle = TRIM_THROTTLE\nconstant]
+// Diterapkan ke output PID roll dan pitch:
+roll_cd  = tracking_roll_pid.update_all(degrees(ex),  0.0f, dt_s) * ramp;
+pitch_cd = tracking_pitch_pid.update_all(degrees(ey), 0.0f, dt_s) * ramp;
 ```
 
 ### Deadband
 
-Errors smaller than `TRACKING_DBAND` (default 0.573 deg) are zeroed. The I term is reset inside the deadband to prevent integrator windup:
+Error yang lebih kecil dari `TRK_DBAND` (default 0.573 deg) dinolkan. Term I direset di dalam deadband untuk mencegah integrator windup. Di dalam deadband, laju roll gyro digunakan untuk meredam aktif setiap bank residual:
 
 ```cpp
-float ex = fabsf(errorx_rad) > deadband ? errorx_rad : 0.0f;
-if (ex == 0) tracking_roll_pid.reset_I();
-
-float ey = fabsf(errory_rad) > deadband ? errory_rad : 0.0f;
-if (ey == 0) tracking_pitch_pid.reset_I();
+float ex = fabsf(_errorx_rad) > deadband_rad ? _errorx_rad : 0.0f;
+if (is_zero(ex)) {
+    tracking_roll_pid.reset_I();
+    float damp_cd = -(degrees(ahrs.get_gyro().x) * 50.0f) * ramp;
+    nav_roll_cd = constrain(damp_cd, ...);
+}
 ```
 
 ### Roll PID
 
 ```
-errorx_rad > 0  →  target right  →  roll right  →  nav_roll_cd > 0
+errorx_rad > 0  →  target kanan  →  roll kanan  →  nav_roll_cd > 0
 ```
 
-Tunable: `TRAK_ROLL_P`, `TRAK_ROLL_I`, `TRAK_ROLL_D`, `TRAK_ROLL_IMAX`
+Panggilan PID: `update_all(degrees(ex), 0.0f, dt_s)` — target = error dalam derajat, pengukuran = 0.
+
+Dapat diatur: `TRK_ROLL_P` / `_I` / `_D` / `_IMAX` (default: P=200 cd/deg, I=10, D=5, imax=3000 cd)
 
 ### Pitch PID
 
 ```
-errory_rad > 0  →  target below  →  nav_pitch_cd adjusted accordingly
+errory_rad > 0  →  target di atas  →  pitch naik  →  nav_pitch_cd > 0
 ```
 
-Tunable: `TRAK_PTCH_P`, `TRAK_PTCH_I`, `TRAK_PTCH_D`, `TRAK_PTCH_IMAX`
+Bias cruise konstan `TRK_PITCH_OFFSET` (default 3 deg) dikurangkan dari error pitch sebelum PID, memberikan sikap hidung-naik yang stabil untuk cruise level. Dalam fase terminal, tambahan `TRK_TERM_PTCH` (positif = hidung-turun) ditambahkan untuk melawan momen pitch dari throttle penuh:
 
-### Timeout
+```cpp
+float pitch_offset_deg = tracking_pitch_offset.get();
+if (in_terminal)
+    pitch_offset_deg += tracking_term_pitch.get();   // lebih banyak hidung-turun
+const float ey = ey_raw - pitch_offset_rad;
+pitch_cd = tracking_pitch_pid.update_all(degrees(ey), 0.0f, dt_s) * ramp;
+```
 
-If no `DEBUG_VECT` arrives within `TRACKING_TIMEOUT` ms (default 1000 ms), both PIDs reset and roll/pitch commands are zeroed until signal resumes.
+Dapat diatur: `TRK_PTCH_P` / `_I` / `_D` / `_IMAX` (default: P=100 cd/deg, I=500, D=0, imax=3000 cd)
 
-### Throttle
+### Timeout dan Dead-Reckoning
 
-Held constant at `TRIM_THROTTLE` percent throughout TRACKING mode.
+Jika tidak ada `DEBUG_VECT` yang tiba dalam `TRK_TIMEOUT` ms (default 1000 ms), siklus timeout pertama mengambil snapshot error terakhir yang diketahui ke dalam `_est_errorx_rad` / `_est_errory_rad`. Setiap siklus berikutnya mengintegrasikan laju bodi IMU untuk menyebarkan estimasi, lalu menerapkan peluruhan eksponensial (τ ≈ 2 s):
 
-### Mode exit
+```cpp
+_est_errorx_rad -= ahrs.get_gyro().x * dt_s;   // roll kanan → target bergeser ke kiri
+_est_errory_rad -= ahrs.get_gyro().y * dt_s;   // pitch naik → target bergeser ke bawah
+_est_errorx_rad *= expf(-dt_s * 0.5f);          // peluruhan ke nol
+_est_errory_rad *= expf(-dt_s * 0.5f);
+// PID berjalan pada error estimasi — pesawat terus mengarah ke posisi terakhir yang diketahui
+```
 
-On exit, both PID integrators and derivative filters are fully reset:
+### Throttle (tiga regime, urutan prioritas)
+
+| Prioritas | Kondisi | Throttle |
+|---|---|---|
+| 1 | Dalam `TRK_SETTLE_S` sejak akuisisi | `TRIM_THROTTLE` |
+| 2 | `TRK_APP_SPD > 0` dan kecepatan udara valid | `cruise + 3 × (target − aktual)` m/s, dibatasi [10, 90]% |
+| 3 | Fallback | `TRIM_THROTTLE` konstan |
+
+Saat banking (`|ex| > deadband`), target kecepatan pendekatan dikurangi 20% untuk menghindari overspeed dalam belokan.
+
+### Keluar mode
+
+Saat keluar, kedua integrator PID dan filter derivatif direset sepenuhnya:
 
 ```cpp
 tracking_roll_pid.reset_I();    tracking_roll_pid.reset_filter();
@@ -343,9 +326,9 @@ tracking_pitch_pid.reset_I();   tracking_pitch_pid.reset_filter();
 
 ---
 
-## 8. Joystick RC Override (optional)
+## 8. RC Override Joystick (opsional)
 
-When `--joystick` is passed, a dedicated thread reads a gamepad at `joystick_rate` Hz (default 50 Hz) and sends `RC_CHANNELS_OVERRIDE`:
+Saat `--joystick` diteruskan, thread khusus membaca gamepad pada `joystick_rate` Hz (default 50 Hz) dan mengirim `RC_CHANNELS_OVERRIDE`:
 
 ```python
 master.mav.rc_channels_override_send(
@@ -355,42 +338,167 @@ master.mav.rc_channels_override_send(
 )
 ```
 
-`UINT16_MAX` (65535) = do not override this channel. On thread stop, all channels are released by sending 0.
+`UINT16_MAX` (65535) = jangan override kanal ini. Saat thread berhenti, semua kanal dilepaskan dengan mengirim 0.
 
 ---
 
-## 9. Tunable Parameters (ArduPlane)
+## 9. Parameter yang Dapat Diatur (ArduPlane)
 
-| Parameter | Default | Description |
+### Geometri tracking
+
+| Parameter | Default | Keterangan |
 |---|---|---|
-| `TRACKING_MAX_DEG` | 45 deg | Full-scale error angle — normalised ±1 maps to ±this value in radians |
-| `TRACKING_DBAND` | 0.573 deg | Deadband; errors smaller than this are treated as zero |
-| `TRACKING_TIMEOUT` | 1000 ms | Signal loss timeout before PIDs reset |
-| `TRAK_ROLL_P/I/D` | 200/10/5 | Roll PID gains |
-| `TRAK_PTCH_P/I/D` | 100/500/0 | Pitch PID gains |
+| `TRK_MAX_DEG` | 30 deg | Sudut error skala penuh — ±1 yang dinormalisasi dipetakan ke ±nilai ini dalam radian |
+| `TRK_DBAND` | 0.573 deg | Deadband; error yang lebih kecil diperlakukan sebagai nol |
+| `TRK_TIMEOUT` | 1000 ms | Timeout kehilangan sinyal sebelum dead-reckoning diaktifkan |
+| `TRK_PITCH_OFFSET` | 3.0 deg | Bias pitch cruise konstan — positif membiaskan hidung ke atas |
+
+### Gain PID
+
+| Parameter | Default | Keterangan |
+|---|---|---|
+| `TRK_ROLL_P/I/D/IMAX` | 200 / 10 / 5 / 3000 cd | PID Roll: P dalam cdeg/deg, imax dalam cdeg |
+| `TRK_PTCH_P/I/D/IMAX` | 100 / 500 / 0 / 3000 cd | PID Pitch |
+
+### Pendekatan dan fase terminal
+
+| Parameter | Default | Keterangan |
+|---|---|---|
+| `TRK_SETTLE_S` | 2.0 s | Durasi ramp-up setelah masuk mode atau re-akuisisi |
+| `TRK_APP_SPD` | 0 m/s | Target kecepatan udara pendekatan; 0 = throttle open-loop |
+| `TRK_TERM_ALT` | 0 m | Ambang AGL untuk fase terminal; 0 = nonaktif |
+| `TRK_TERM_PTCH` | 0 deg | Bias pitch hidung-turun tambahan dalam fase terminal |
+| `TRK_TERM_TREND` | 10 siklus | Jumlah siklus penurunan errory berturut-turut untuk mengaktifkan latch terminal |
+| `TRK_TERM_EY` | -0.6 | Ambang errory minimum untuk memicu hitungan trend terminal |
 
 ---
 
-## 10. HUD Overlay
+## 10. Overlay HUD
 
-Two lines drawn at the bottom of the display window each frame:
+Setiap frame menerima dua lapisan anotasi.
+
+### 10.1 Instrumen HUD (`HudDisplay`)
+
+`HudDisplay.draw_hud()` dipanggil dengan telemetri langsung dari ATTITUDE dan GLOBAL_POSITION_INT:
+
+| Elemen | Sumber | Keterangan |
+|---|---|---|
+| Tape yaw | `_yaw_deg` (ATTITUDE) | Strip kompas horizontal dipusatkan di bawah frame; label N/E/S/W |
+| Tangga pitch | `_pitch_deg` (ATTITUDE) | Tanda centang vertikal menunjukkan sudut pitch; garis horizon pada 0° berwarna merah |
+| Indikator roll | `_roll_deg` (ATTITUDE) | Arc dan pembacaan sudut bank di atas tampilan pitch |
+| Lokasi | `_lat`, `_lon` (GLOBAL_POSITION_INT) | Koordinat desimal dicetak di bawah tape yaw |
+
+Instrumen dikomposit ke frame dengan `addWeighted(frame, 0.6, hud, 0.4, ...)` sehingga overlay tracking tetap terlihat di bawahnya.
+
+### 10.2 Teks status
+
+Tiga baris yang digambar di kiri bawah setiap frame:
 
 ```
 MODE: <flight_mode>  LOCK: <ON | OFF | NO TARGET>
+v: <airspeed>m/s  h: <rel_alt>m  thr: <throttle>%
 FPS: <fps>  ex=<errorx>  ey=<errory>
 ```
 
-| LOCK value | Meaning |
+| Field | Sumber |
+|---|---|
+| `flight_mode` | HEARTBEAT `custom_mode` |
+| LOCK | Status `_in_tracking` / ch6 |
+| `airspeed` | VFR_HUD `airspeed` (m/s) |
+| `rel_alt` | GLOBAL_POSITION_INT `relative_alt` (m AGL) |
+| `throttle` | VFR_HUD `throttle` (%) |
+| `errorx/errory` | Error yang diprediksi (setelah PN lead), hanya saat terkunci |
+
+| Nilai LOCK | Arti |
 |---|---|
 | `ON` | `_in_tracking = True` |
-| `NO TARGET` | ch6 locked but no target detected |
-| `OFF` | ch6 not locked |
+| `NO TARGET` | ch6 aktif tapi tidak ada target terdeteksi |
+| `OFF` | ch6 tidak aktif |
 
 ---
 
-## 11. Key Bindings
+## 11. Kompensasi Latensi dan Proportional Navigation Lead
 
-| Key | Action |
+Saat tracker menghitung `errorx` dan `errory` dari centroid frame saat ini, nilai-nilai tersebut sudah menggambarkan posisi target **sesaat yang lalu** — bukan posisi saat ini. Dua penundaan yang tumpang tindih berkontribusi pada keusangan ini:
+
+1. **Latensi pipeline** `τ_L` (≈ 80 ms) — waktu dari penangkapan foton hingga panggilan `send_tracking()`, mencakup eksposur kamera, transfer USB, konversi HSV, iterasi CamShift, dan overhead Python.
+2. **Lag aktuasi** — flight controller menerima error, menjalankan update PID, dan airframe merespons dalam waktu terbatas tambahan.
+
+Mengirim error mentah ke kontroler proporsional menyebabkan kontroler selalu bereaksi terhadap posisi yang sudah ditinggalkan target, menghasilkan overshoot sistematis yang memburuk dengan kecepatan sudut target.
+
+### 11.1 Prediktor Taylor Orde Pertama
+
+Prediksi adalah ekstrapolasi maju orde pertama (linear) dari sudut LOS:
+
+```
+ė_x = (e_x[k] − e_x[k−1]) / dt
+ė_y = (e_y[k] − e_y[k−1]) / dt
+
+T_lead = τ_L + T_PN
+
+ê_x = clamp(e_x[k] + ė_x · T_lead,  −1, +1)
+ê_y = clamp(e_y[k] + ė_y · T_lead,  −1, +1)
+```
+
+di mana `ê_x`, `ê_y` adalah error yang diprediksi yang dikirim ke flight controller. Ini adalah dua suku pertama dari ekspansi Taylor `e(t)` di sekitar sampel saat ini:
+
+```
+e(t + T) ≈ e(t) + ė(t) · T   (Taylor orde pertama, error O(T²))
+```
+
+Kondisi `0 < dt < 0.5 s` melindungi dari estimasi derivatif yang basi pada frame drop atau re-akuisisi.
+
+### 11.2 Proportional Navigation Lead
+
+Komponen kedua, `T_PN` (≈ 300 ms), mengimplementasikan hukum panduan **proportional navigation (PN)** yang disederhanakan. PN klasik memerintahkan akselerasi lateral proporsional terhadap laju LOS (line-of-sight) [15, 16]:
+
+```
+a_c = N · V_c · λ̇
+```
+
+di mana `N` adalah konstanta navigasi (biasanya 3–5), `V_c` adalah kecepatan penutupan, dan `λ̇` adalah laju sudut LOS. Untuk kasus sudut kecil, error yang dinormalisasi mendekati sudut LOS (`e_x ≈ λ_x`), sehingga `ė_x ≈ λ̇_x`. Disubstitusi ke ekspresi PID:
+
+```
+u ∝ ê_x = e_x + ė_x · (τ_L + T_PN)
+         = e_x + λ̇_x · τ_L  +  λ̇_x · T_PN
+          \_____________/     \__________/
+           pemulihan latensi     PN lead
+```
+
+Produk pertama memulihkan sudut basi yang diinduksi latensi; suku kedua memberikan bias maju proporsional terhadap laju LOS, mengantisipasi posisi target `T_PN` detik ke depan. Ini setara dengan pendekatan **zero-effort-miss (ZEM)** di bawah asumsi kecepatan penutupan dan laju LOS yang kira-kira konstan selama interval lead [17].
+
+"Konstanta" navigasi tidak ditetapkan secara eksplisit di sini; sebaliknya gain PID roll ArduPlane memainkan peran `N · V_c`, dan `T_PN` adalah satu-satunya yang dapat diatur yang mengontrol seberapa agresif seeker memimpin target.
+
+### 11.3 Konstanta Implementasi
+
+| Konstanta | Nilai | Peran |
+|---|---|---|
+| `_LATENCY_S` | 0.08 s | Perkiraan latensi pipeline — menghilangkan bias sudut basi |
+| `_PN_LEAD_S` | 0.30 s | Waktu lead proportional navigation — mengantisipasi gerakan target |
+| `T_lead` | 0.38 s | Cakrawala prediksi gabungan (`τ_L + T_PN`) |
+
+```python
+# seekerctrl.py — error PN yang dikompensasi latensi
+dt_err = now - self._prev_err_t
+if 0.0 < dt_err < 0.5:
+    dx_dt  = (raw_ex - self._prev_errorx_v) / dt_err
+    dy_dt  = (raw_ey - self._prev_errory_v) / dt_err
+    lead   = _LATENCY_S + _PN_LEAD_S
+    errorx = max(-1.0, min(1.0, raw_ex + dx_dt * lead))
+    errory = max(-1.0, min(1.0, raw_ey + dy_dt * lead))
+```
+
+### 11.4 Keterbatasan
+
+- Prediktor berorde pertama; target dengan akselerasi sudut tinggi (belokan tajam) menginduksi error prediksi `O(T²)`.
+- `_PN_LEAD_S` adalah konstanta tetap; hukum PN penuh akan menyesuaikan `T_lead` sebagai fungsi perkiraan time-to-go, yang berkurang dalam fase terminal. Dalam praktiknya, regime throttle penuh di fase terminal mempersingkat waktu intersep dan error residual kecil relatif terhadap ukuran target fisik.
+- Derivatif `ė` dihitung dari timestamp frame berurutan; pada frame rate rendah (< 10 fps) noise pada `ė` dapat melebihi sinyal. Penjaga `dt < 0.5 s` menonaktifkan prediksi pada frame tersebut.
+
+---
+
+## 12. Tombol Pintasan
+
+| Tombol | Aksi |
 |---|---|
-| `q` | Quit |
+| `q` | Keluar |
 | `r` | Reset tracker (`_track_win = None`, `_detect_count = 0`) |

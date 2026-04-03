@@ -1,51 +1,77 @@
-# Literature Review
+# Tinjauan Pustaka
 
-This review surveys the foundational and applied literature underpinning the color detection, visual tracking, and MAVLink actuation pipeline implemented in drone-seeker. The works are grouped by topic area and discussed in the context of the design decisions made in this system.
-
----
-
-## 1. Color Space Selection — HSV
-
-The choice of the HSV (Hue–Saturation–Value) color space as the basis for detection stems directly from the formal framework introduced by Smith [1]. By separating chromatic information (Hue) from luminance (Value), HSV decouples the color identity of an object from the ambient illumination falling on it. This is critical in outdoor drone applications where sunlight intensity and angle vary continuously during a flight. The geometric and perceptual properties of HSV are covered comprehensively by Gonzalez and Woods [2], whose treatment of color segmentation remains the standard engineering reference. In drone-seeker, all three detection methods operate in HSV: the Gaussian back-projection method builds a confidence histogram over the hue channel; the adaptive method normalizes and thresholds the hue channel locally; and the dual inRange method applies per-channel bounds directly in HSV space.
+Tinjauan ini mengkaji literatur dasar dan terapan yang mendukung pipeline deteksi warna, visual tracking, dan aktuasi MAVLink yang diimplementasikan dalam drone-seeker. Karya-karya dikelompokkan berdasarkan area topik dan dibahas dalam konteks keputusan desain yang dibuat dalam sistem ini.
 
 ---
 
-## 2. Histogram Back-Projection
+## 1. Pemilihan Ruang Warna — HSV
 
-The Gaussian back-projection detector in drone-seeker is a direct application of the color indexing framework introduced by Swain and Ballard [3]. Their seminal 1991 paper showed that a color histogram of a reference object could be used to compute, for each pixel of a query image, the probability that the pixel belongs to that object — a process they termed back-projection. The resulting probability map is then thresholded to obtain a detection mask. In drone-seeker, `cv2.calcBackProject` is called with a pre-built Gaussian confidence histogram (`_confidence_hist`) that assigns high probability only to hue bins within ±2.5σ of the calibrated mean hue, suppressing all other hues to zero. The Saturation and Value constraints are enforced separately to reject achromatic and dark regions.
-
----
-
-## 3. Circular Statistics for Hue Modelling
-
-Hue is a circular (periodic) quantity: the hue of a "hot pink" object may be centered near H = 165 in OpenCV's 0–179 scale, but when pink spans the boundary (e.g., H = 175 wraps around to H = 0), standard Euclidean mean and standard deviation give incorrect results. The correct treatment is provided by Fisher [4] and Mardia and Jupp [5], whose textbooks establish the theory of circular statistics. The mean of a circular distribution is computed by mapping each angle to a unit vector, averaging the vectors, and taking the argument of the resultant — a method that handles wrap-around naturally. The circular standard deviation (or angular deviation) is derived from the magnitude of that resultant. Drone-seeker's `_fit_gaussian` function implements this directly for hue calibration.
-
-The theoretical necessity for circular arithmetic on Hue is further demonstrated by Hanbury and Serra [6], who show that morphological operators and distance metrics applied naively to the Hue channel — treating it as a linear variable — produce topologically inconsistent results. Their work motivates the use of circular distance in `_confidence_hist` construction and in the angular wrapping applied during adaptive thresholding.
+Pemilihan ruang warna HSV (Hue–Saturation–Value) sebagai dasar deteksi berasal langsung dari kerangka formal yang diperkenalkan oleh Smith [1]. Dengan memisahkan informasi kromatik (Hue) dari luminansi (Value), HSV memisahkan identitas warna suatu objek dari iluminasi lingkungan yang jatuh padanya. Hal ini sangat penting dalam aplikasi drone outdoor di mana intensitas dan sudut sinar matahari berubah terus-menerus selama penerbangan. Sifat geometris dan perseptual HSV dibahas secara komprehensif oleh Gonzalez dan Woods [2], yang pembahasannya tentang segmentasi warna tetap menjadi referensi teknik standar. Dalam drone-seeker, ketiga metode deteksi beroperasi dalam HSV: metode back-projection Gaussian membangun histogram kepercayaan pada kanal hue; metode adaptif menormalisasi dan mengenakan threshold pada kanal hue secara lokal; dan metode dual inRange menerapkan batas per-kanal langsung dalam ruang HSV.
 
 ---
 
-## 4. Adaptive Thresholding
+## 2. Back-Projection Histogram
 
-The adaptive detection method in drone-seeker was motivated by the limitations of global thresholding under non-uniform illumination. Sauvola and Pietikäinen [7] established the principle of local adaptive binarization: the threshold at each pixel is derived from the local mean and standard deviation within a spatial neighbourhood, making the decision invariant to slow spatial gradients in illumination. Bradley and Roth [8] reformulated this approach using integral images, achieving near-constant-time computation regardless of neighbourhood size — a key property for real-time video processing. In drone-seeker's `_mask_adaptive`, the Hue channel is first normalized to the local illumination level, then `cv2.adaptiveThreshold` (which uses a local mean threshold equivalent to Bradley–Roth) is applied with a block size of 21 pixels. The result is masked against a coarse hue gate to retain only hue-plausible regions.
-
----
-
-## 5. CamShift Tracking
-
-Once a target is detected through five consecutive frames, drone-seeker transitions from detection to tracking using the CamShift algorithm. CamShift (Continuously Adaptive Mean Shift) was introduced by Bradski [9, 10] as an extension of the Mean Shift algorithm to video sequences. Mean Shift is a non-parametric mode-seeking procedure that iteratively shifts a window toward the local maximum of a probability density function — in this case, a back-projected color histogram. CamShift additionally adapts the size and orientation of the tracking window at each frame to match the current scale of the tracked object. The mathematical foundation of this approach, using kernel density estimation with color histograms as the underlying probability model, was rigorously formalized by Comaniciu, Ramesh, and Meer [11], whose kernel-based tracker provides the theoretical basis for the practical CamShift implementation available as `cv2.CamShift` in OpenCV.
-
-In drone-seeker, CamShift is initialized with the bounding rectangle returned by the last successful detection step. The tracker runs on the same Gaussian confidence back-projection map used for detection, ensuring consistent color modeling between the two stages. If the tracker window collapses below a minimum area or the confidence map loses signal, the system falls back to detection mode.
+Detektor back-projection Gaussian dalam drone-seeker merupakan penerapan langsung dari kerangka color indexing yang diperkenalkan oleh Swain dan Ballard [3]. Makalah seminal mereka tahun 1991 menunjukkan bahwa histogram warna suatu objek referensi dapat digunakan untuk menghitung, untuk setiap piksel gambar kueri, probabilitas bahwa piksel tersebut milik objek tersebut — sebuah proses yang mereka sebut back-projection. Peta probabilitas yang dihasilkan kemudian di-threshold untuk mendapatkan mask deteksi. Dalam drone-seeker, `cv2.calcBackProject` dipanggil dengan histogram kepercayaan Gaussian yang telah dibuat (`_confidence_hist`) yang hanya memberikan probabilitas tinggi pada bin hue dalam ±2.5σ dari hue mean yang dikalibrasi, menekan semua hue lain ke nol. Batasan Saturation dan Value diterapkan secara terpisah untuk menolak region akromatik dan gelap.
 
 ---
 
-## 6. Mathematical Morphology
+## 3. Statistik Sirkular untuk Pemodelan Hue
 
-Raw thresholded binary masks from any of the three detection methods typically contain salt-and-pepper noise (isolated positive pixels from accidental hue matches) and small intra-object gaps (pixels that fail the threshold near edges or in shadowed regions). Mathematical morphology, whose formal foundations were established by Serra [12], provides the standard operations for cleaning these artefacts. An Opening (erosion followed by dilation with the same structuring element) removes isolated noise without significantly eroding large connected regions. A subsequent Dilation expands the surviving regions to fill small holes and merge nearby fragments. Drone-seeker applies this OPEN → DILATE sequence after the majority-vote fusion of the three detection masks, using a 5×5 elliptical structuring element for both operations.
+Hue adalah besaran sirkular (periodik): hue dari objek "hot pink" mungkin terpusat di sekitar H = 165 dalam skala 0–179 OpenCV, tetapi ketika pink melintasi batas (misalnya H = 175 membungkus ke H = 0), rata-rata Euclidean dan standar deviasi standar memberikan hasil yang salah. Perlakuan yang benar diberikan oleh Fisher [4] dan Mardia dan Jupp [5], yang buku teks mereka menetapkan teori statistik sirkular. Rata-rata distribusi sirkular dihitung dengan memetakan setiap sudut ke vektor satuan, merata-ratakan vektor, dan mengambil argumen resultan — metode yang menangani pembungkusan secara alami. Standar deviasi sirkular (atau deviasi sudut) diturunkan dari besaran resultan tersebut. Fungsi `_fit_gaussian` drone-seeker mengimplementasikan ini secara langsung untuk kalibrasi hue.
+
+Kebutuhan teoritis untuk aritmetika sirkular pada Hue lebih lanjut ditunjukkan oleh Hanbury dan Serra [6], yang menunjukkan bahwa operator morfologis dan metrik jarak yang diterapkan secara naif pada kanal Hue — dengan memperlakukannya sebagai variabel linear — menghasilkan hasil yang tidak konsisten secara topologis. Karya mereka memotivasi penggunaan jarak sirkular dalam konstruksi `_confidence_hist` dan dalam pembungkusan sudut yang diterapkan selama thresholding adaptif.
 
 ---
 
-## 7. MAVLink Communication Protocol
+## 4. Thresholding Adaptif
 
-The tracking error signals computed by drone-seeker are transmitted to the ArduPlane flight controller over a serial link using the MAVLink protocol. MAVLink was introduced by Lorenz Meier at ETH Zurich in 2009 and is now maintained by the Dronecode Project [14]. It is a lightweight framing protocol designed for resource-constrained embedded systems: each message carries a 1-byte CRC extra (a message-type-specific constant mixed into the checksum) to detect version mismatches and message corruption without a separate integrity field. The protocol architecture, message framing, and CRC-extra mechanism are surveyed comprehensively by Koubaa et al. [13], who also review the integration of MAVLink into both ArduPilot and PX4 autopilots.
+Metode deteksi adaptif dalam drone-seeker dimotivasi oleh keterbatasan thresholding global di bawah iluminasi yang tidak merata. Sauvola dan Pietikäinen [7] menetapkan prinsip binarisasi adaptif lokal: threshold pada setiap piksel diturunkan dari rata-rata dan standar deviasi lokal dalam lingkungan spasial, membuat keputusan tidak berubah terhadap gradien spasial lambat dalam iluminasi. Bradley dan Roth [8] merumuskan ulang pendekatan ini menggunakan integral image, mencapai komputasi yang hampir konstan terlepas dari ukuran lingkungan — properti kunci untuk pemrosesan video real-time. Dalam `_mask_adaptive` drone-seeker, kanal Hue pertama dinormalisasi ke tingkat iluminasi lokal, kemudian `cv2.adaptiveThreshold` (yang menggunakan threshold rata-rata lokal setara dengan Bradley–Roth) diterapkan dengan ukuran blok 21 piksel. Hasilnya di-mask terhadap gate hue kasar untuk mempertahankan hanya region yang plausibel secara hue.
 
-In drone-seeker, tracking errors are transmitted as `DEBUG_VECT` messages (MAVLink ID 250), a standard message present in the compiled `MAVLINK_MESSAGE_CRCS` table of ArduPlane. This choice was driven by a concrete failure mode: MAVLink's `mavlink_get_msg_entry()` silently discards any message whose ID is not in the compiled table, regardless of content. Messages sent with non-standard IDs (IDs 229, 230, 202 were all attempted) were dropped at the receiver before reaching the application layer. Switching to the standard `DEBUG_VECT` message resolved the issue and enabled reliable reception of tracking errors in the `ModeTracking` flight mode handler.
+---
+
+## 5. Tracking CamShift
+
+Setelah target terdeteksi melalui lima frame berturut-turut, drone-seeker bertransisi dari deteksi ke tracking menggunakan algoritma CamShift. CamShift (Continuously Adaptive Mean Shift) diperkenalkan oleh Bradski [9, 10] sebagai perluasan algoritma Mean Shift ke sekuens video. Mean Shift adalah prosedur pencarian modus non-parametrik yang secara iteratif menggeser window menuju maksimum lokal fungsi densitas probabilitas — dalam hal ini, histogram warna yang diproyeksikan kembali. CamShift juga mengadaptasi ukuran dan orientasi window tracking pada setiap frame agar sesuai dengan skala objek yang dilacak saat ini. Fondasi matematika dari pendekatan ini, menggunakan estimasi densitas kernel dengan histogram warna sebagai model probabilitas dasar, diformalisasi secara ketat oleh Comaniciu, Ramesh, dan Meer [11], yang tracker berbasis kernel memberikan landasan teoritis untuk implementasi CamShift praktis yang tersedia sebagai `cv2.CamShift` dalam OpenCV.
+
+Dalam drone-seeker, CamShift diinisialisasi dengan bounding rectangle yang dikembalikan oleh langkah deteksi terakhir yang berhasil. Tracker berjalan pada peta back-projection kepercayaan Gaussian yang sama yang digunakan untuk deteksi, memastikan pemodelan warna yang konsisten antara dua tahap. Jika window tracker menyusut di bawah area minimum atau peta kepercayaan kehilangan sinyal, sistem kembali ke mode deteksi.
+
+---
+
+## 6. Morfologi Matematika
+
+Mask biner yang di-threshold mentah dari salah satu dari tiga metode deteksi biasanya mengandung noise salt-and-pepper (piksel positif terisolasi dari kecocokan hue yang tidak disengaja) dan celah intra-objek kecil (piksel yang gagal threshold di dekat tepi atau di region yang teduh). Morfologi matematika, yang fondasi formalnya ditetapkan oleh Serra [12], menyediakan operasi standar untuk membersihkan artefak ini. Opening (erosi diikuti dilatasi dengan elemen penataan yang sama) menghilangkan noise terisolasi tanpa mengikis secara signifikan region terhubung yang besar. Dilatasi selanjutnya memperluas region yang bertahan untuk mengisi lubang kecil dan menggabungkan fragmen yang berdekatan. Drone-seeker menerapkan urutan OPEN → DILATE ini setelah fusi voting mayoritas dari tiga mask deteksi, menggunakan elemen penataan elips 5×5 untuk kedua operasi.
+
+---
+
+## 7. Protokol Komunikasi MAVLink
+
+Sinyal error tracking yang dihitung oleh drone-seeker dikirimkan ke flight controller ArduPlane melalui link serial menggunakan protokol MAVLink. MAVLink diperkenalkan oleh Lorenz Meier di ETH Zurich pada 2009 dan kini dikelola oleh Dronecode Project [14]. Ini adalah protokol framing ringan yang dirancang untuk sistem tertanam dengan sumber daya terbatas: setiap pesan membawa 1-byte CRC extra (konstanta spesifik-tipe-pesan yang dicampur ke dalam checksum) untuk mendeteksi ketidakcocokan versi dan kerusakan pesan tanpa field integritas terpisah. Arsitektur protokol, framing pesan, dan mekanisme CRC-extra disurvei secara komprehensif oleh Koubaa et al. [13], yang juga meninjau integrasi MAVLink ke dalam autopilot ArduPilot dan PX4.
+
+Dalam drone-seeker, error tracking dikirim sebagai pesan `DEBUG_VECT` (MAVLink ID 250), pesan standar yang ada dalam tabel `MAVLINK_MESSAGE_CRCS` yang dikompilasi ArduPlane. Pilihan ini didorong oleh mode kegagalan konkret: `mavlink_get_msg_entry()` MAVLink secara diam-diam membuang pesan apa pun yang ID-nya tidak ada dalam tabel yang dikompilasi, terlepas dari kontennya. Pesan yang dikirim dengan ID non-standar (ID 229, 230, 202 semuanya dicoba) dibuang di penerima sebelum mencapai lapisan aplikasi. Beralih ke pesan `DEBUG_VECT` standar menyelesaikan masalah ini dan memungkinkan penerimaan error tracking yang andal dalam handler mode penerbangan `ModeTracking`.
+
+---
+
+## 8. Kompensasi Latensi dan Panduan Proportional Navigation
+
+### 8.1 Masalah Latensi Pipeline
+
+Setiap loop tracking berbasis gambar digital mengandung penundaan inheren antara saat foton mengenai sensor dan saat sinyal kontrol yang diturunkan mencapai aktuator. Dalam drone-seeker, pipeline ini mencakup eksposur kamera, transfer USB (atau CSI), konversi ruang warna, back-projection, iterasi CamShift, dan serialisasi Python-ke-MAVLink — total diperkirakan sekitar 80 ms dalam kondisi tipikal. Ketika target yang dilacak memiliki kecepatan sudut non-nol relatif terhadap kamera, error yang dihitung dari frame saat ini mewakili sudut LOS pada waktu `t − τ_L`, bukan pada waktu saat ini `t`. Kontroler proporsional yang bertindak berdasarkan pengukuran basi ini memerintahkan koreksi yang secara konsisten tertinggal dari arah target sebenarnya, menghasilkan phase lag yang termanifestasi sebagai osilasi atau offset tracking steady-state.
+
+Solusi klasik untuk loop kontrol dengan time delay murni adalah Smith predictor, yang diperkenalkan oleh Smith [15]. Smith predictor menambah kontroler feedback konvensional dengan model internal plant dan delay, menghasilkan prediksi output pada waktu saat ini dari input masa lalu. Dalam drone-seeker, model plant direduksi menjadi ekstrapolasi Taylor orde pertama dari sudut LOS: beda hingga pengukuran LOS berturut-turut memberikan estimasi laju LOS, yang kemudian digunakan untuk memproyeksikan sudut saat ini ke depan sebesar `τ_L`. Ini memulihkan sudut LOS seketika yang diperkirakan dan menghilangkan phase lag sistematis yang diinduksi oleh pipeline.
+
+### 8.2 Panduan Proportional Navigation
+
+Di luar pemulihan latensi semata, drone-seeker menerapkan lead maju tambahan sebesar `T_PN = 0.30 s` untuk mengimplementasikan hukum panduan **proportional navigation (PN)** yang disederhanakan. Proportional navigation adalah prinsip panduan dominan yang digunakan dalam rudal homing dan dianalisis secara formal oleh Yuan [16] sejak tahun 1948. Dalam bentuk klasiknya, PN memerintahkan akselerasi lateral proporsional terhadap laju sudut LOS:
+
+```
+a_c = N · V_c · λ̇
+```
+
+di mana `N` adalah konstanta navigasi (biasanya 3–5 untuk implementasi praktis [17]), `V_c` adalah kecepatan penutupan antara pengejar dan target, dan `λ̇` adalah turunan waktu dari sudut LOS `λ`. Properti kunci PN adalah bahwa jika `λ̇ → 0`, pengejar dan target berada pada jalur tabrakan; hukum panduan mendorong pengejar untuk mempertahankan sudut LOS yang konstan, yang merupakan kondisi geometris untuk intersepsi.
+
+Dalam drone-seeker, `errorx` dan `errory` mendekati sudut LOS horizontal dan vertikal di bawah asumsi sudut kecil. Laju beda-hingga mereka `ė_x`, `ė_y` mendekati `λ̇` pada bidang masing-masing. Suku lead PN oleh karena itu mengubah error yang dikirim ke flight controller dari sudut seketika `e(t)` menjadi sudut yang diprediksi `e(t) + ė · T_PN`, yang kemudian didorong ke nol oleh PID ArduPlane. Gain proporsional PID menyerap peran `N · V_c` dalam formulasi klasik, dan `T_PN` adalah satu-satunya yang dapat diatur yang mengontrol agresivitas lead.
+
+Prediktor gabungan — pemulihan latensi ditambah PN lead — setara dengan pendekatan **panduan zero-effort-miss (ZEM)** [17]. ZEM adalah prediksi jarak miss jika pengejar dan target mempertahankan trajektori mereka saat ini; panduan PN memerintahkan akselerasi yang mengurangi ZEM ke nol. Di bawah asumsi kecepatan penutupan konstan dan laju LOS yang berubah lambat selama cakrawala prediksi, ZEM mereduksi menjadi `λ̇ · T_go · V_c`, dan mendorongnya ke nol dengan memerintahkan `e_predicted = e + ė · (τ_L + T_PN) → 0` konsisten dengan panduan PN. Regime throttle penuh fase terminal mempersingkat time-to-go aktual, membuat pendekatan ini lebih akurat saat jangkauan target berkurang.
+
+Perlakuan komprehensif tentang varian proportional navigation — pure PN, true PN, augmented PN — dan sifat optimalitasnya dalam asumsi yang berbeda tentang kemampuan manuver target diberikan oleh Shneydor [17] dan Zarchan [18]. Zarchan khususnya menurunkan metode adjoint untuk analisis sensitivitas jarak miss, yang memberikan landasan teoritis untuk memilih `N` dan menilai dampak latensi dan noise seeker terhadap akurasi intersepsi.

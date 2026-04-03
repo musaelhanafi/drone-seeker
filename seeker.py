@@ -5,10 +5,10 @@ import time
 
 
 # ── Hot-pink HSV range (OpenCV hue 0-179) ────────────────────────────────────
-# Hot pink sits at H ≈ 150-175 (≈300-350° on the standard wheel).
+# Hot pink sits at H ≈ 130-173 (≈300-330° on the standard wheel).
 # High saturation floor (100) rejects pastel / pale pinks.
 _PINK_RANGES = [
-    (np.array([150, 100, 80]), np.array([175, 255, 255])),  # hot pink / magenta
+    (np.array([130, 100, 80]), np.array([173, 233, 233])),  # hot pink / magenta
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
@@ -24,29 +24,51 @@ def _pink_mask(hsv: np.ndarray) -> np.ndarray:
     for lo, hi in _PINK_RANGES:
         mask |= cv2.inRange(hsv, lo, hi)
     # small morphological clean-up
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
     return mask
 
 
-def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
-    """Return the bounding rect (x, y, w, h) of the largest blob by area.
-    Returns None if no blob meets the minimum area threshold.
+_MIN_EXTENT = 0.45   # minimum ratio of contour area to bounding-box area (box-like filter)
+
+
+def _nearest_blob_rect(mask: np.ndarray, frame_shape=None, box_filter: bool = True):
+    """Return the bounding rect (x, y, w, h) of the best blob.
+
+    When box_filter=True, candidates must exceed _MIN_EXTENT (contour area /
+    bounding-box area) and are ranked by extent × area — preferring rectangular
+    targets.  When box_filter=False, the largest blob by area is returned with
+    no shape constraint.
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    sized = [(c, cv2.contourArea(c)) for c in contours]  # compute area once
-    valid = [(c, a) for c, a in sized if a >= _MIN_BLOB_AREA]
-    if not valid:
-        return None
-    best, _ = max(valid, key=lambda item: item[1])
-    return cv2.boundingRect(best)
+    best_score = -1.0
+    best_rect  = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < _MIN_BLOB_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        bbox_area   = w * h
+        if bbox_area == 0:
+            continue
+        if box_filter:
+            extent = area / bbox_area
+            if extent < _MIN_EXTENT:
+                continue
+            score = extent * area
+        else:
+            score = area
+        if score > best_score:
+            best_score = score
+            best_rect  = (x, y, w, h)
+    return best_rect
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 2.5   # confidence window: ±_GAUSS_SIGMA * std
+_GAUSS_SIGMA        = 2.0   # confidence window: ±2.0σ
 
 
 def _load_histogram(path: str) -> np.ndarray | None:
@@ -94,11 +116,11 @@ def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
 
 
 def _confidence_hist(hist: np.ndarray, mean: float, std: float) -> np.ndarray:
-    """Return a copy of *hist* with bins outside mean ± _GAUSS_SIGMA*std zeroed.
+    """Return a copy of *hist* with bins outside mean ± 2.5σ zeroed.
 
     The resulting histogram carries the original hue weights for the confident
     bins only.  Back-projecting it onto an HSV frame produces non-zero values
-    only for pixels whose hue falls within the 3-sigma confidence window.
+    only for pixels whose hue falls within the 2.5σ confidence window.
     """
     bins = np.arange(180, dtype=np.float32)
     diff = np.abs(bins - mean)
@@ -119,6 +141,9 @@ class Seeker:
         histogram_file: str = _CAL_HISTOGRAM_FILE,
         show_histogram: bool = False,
         show_mask: bool = False,
+        mask_algo: str = "all",
+        use_camshift: bool = True,
+        box_filter: bool = True,
     ):
         """
         source          : camera index (int) or video / image file path (str)
@@ -133,6 +158,14 @@ class Seeker:
                           separate window named "<window_name> — Histogram".
         show_mask       : if True, display the detection mask each frame in a
                           separate window named "<window_name> — Mask".
+        mask_algo       : which detection algorithm(s) to use when a calibration
+                          histogram is loaded.  One of:
+                            "gaussian"  — Gaussian back-projection only (Method 1)
+                            "adaptive"  — Adaptive hue threshold only   (Method 2)
+                            "inrange"   — Dual inRange only              (Method 3)
+                            "all"       — 2-of-3 majority vote (default)
+        box_filter      : if True, reject blobs whose extent (contour/bbox area)
+                          is below _MIN_EXTENT — prefers rectangular targets.
         """
         self.source          = source
         self.window_name     = window_name
@@ -141,6 +174,9 @@ class Seeker:
         self.crop            = crop   # (x, y, w, h) or None
         self._show_histogram = show_histogram
         self._show_mask      = show_mask
+        self._mask_algo      = mask_algo
+        self._use_camshift   = use_camshift
+        self._box_filter     = box_filter
 
         self._cal_hist        = _load_histogram(histogram_file)
         if self._cal_hist is not None:
@@ -209,36 +245,36 @@ class Seeker:
         """Method 1 — Gaussian statistical threshold.
 
         Back-projects the ±sigma confidence histogram onto the blurred hue
-        channel.  Saturation (30–200) and value (80–255) gates reject
+        channel.  Saturation and value floors (40) gate reject
         grey, dark, and over-exposed pixels.
         """
         hsv_blur = hsv.copy()
         hsv_blur[:, :, 0] = h_blur
         bp     = cv2.calcBackProject([hsv_blur], [0], self._conf_hist, [0, 180], 1)
-        in_sat = (hsv[:, :, 1] >= 100) & (hsv[:, :, 1] <= 255)
-        in_val =  hsv[:, :, 2] >= 80
-        return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+        in_sat = hsv[:, :, 1] >= 40
+        in_val = hsv[:, :, 2] >= 40
+        return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 233
 
     def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
         """Method 2 — Adaptive threshold on hue channel.
 
-        Normalises the blurred H channel to 0-255 then applies an adaptive
+        Normalises the blurred H channel to 0-233 then applies an adaptive
         Gaussian threshold (blockSize=21, C=3).  This finds pixels whose hue
         is locally consistent — above the local hue mean — and therefore
         handles illumination variation across the frame without a global
         threshold.  Fused with a direct hue-distance fence so only the
         calibrated colour band passes.
         """
-        h_norm   = cv2.normalize(h_blur, None, 0, 255, cv2.NORM_MINMAX)
+        h_norm   = cv2.normalize(h_blur, None, 0, 233, cv2.NORM_MINMAX)
         adapt    = cv2.adaptiveThreshold(
-            h_norm, 255,
+            h_norm, 233,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             blockSize=21, C=3,
         )
         diff     = np.abs(h_blur.astype(np.float32) - self._gauss_mean)
         diff     = np.minimum(diff, 180.0 - diff)            # circular wrap
-        hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 255
+        hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 233
         return cv2.bitwise_and(adapt, hue_gate)
 
     def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
@@ -258,8 +294,8 @@ class Seeker:
             a, b = max(0, int(a)), min(179, int(b))
             if a <= b:
                 mask |= cv2.inRange(hsv,
-                                    np.array([a, 100,  80]),
-                                    np.array([b, 255, 255]))
+                                    np.array([a, 40, 40]),
+                                    np.array([b, 233, 233]))
 
         if lo_h < 0:
             _add_range(lo_h + 180, 179)
@@ -275,20 +311,30 @@ class Seeker:
     # ── Combined detection mask ───────────────────────────────────────────────
 
     def _detection_mask(self, hsv: np.ndarray) -> np.ndarray:
-        """Return a binary detection mask using a 2-of-3 vote.
+        """Return a binary detection mask.
 
-        Falls back to hardcoded HSV ranges when no calibration histogram is loaded.
+        When a calibration histogram is loaded, uses the algorithm selected by
+        self._mask_algo ("gaussian", "adaptive", "inrange", or "all" for 2-of-3
+        majority vote).  Falls back to hardcoded HSV ranges otherwise.
         """
         if self._conf_hist is not None:
-            h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
-            m1     = self._mask_gaussian(hsv, h_blur)
-            m2     = self._mask_adaptive(hsv, h_blur)
-            m3     = self._mask_inrange(hsv)
-            votes  = ((m1 > 0).astype(np.uint8) +
-                      (m2 > 0).astype(np.uint8) +
-                      (m3 > 0).astype(np.uint8))
-            mask   = (votes >= 2).astype(np.uint8) * 255
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            algo   = self._mask_algo
+            h_blur = cv2.GaussianBlur(hsv[:, :, 0], (3, 3), 0)
+            if algo == "gaussian":
+                mask = self._mask_gaussian(hsv, h_blur)
+            elif algo == "adaptive":
+                mask = self._mask_adaptive(hsv, h_blur)
+            elif algo == "inrange":
+                mask = self._mask_inrange(hsv)
+            else:  # "all" — 2-of-3 majority vote
+                m1    = self._mask_gaussian(hsv, h_blur)
+                m2    = self._mask_adaptive(hsv, h_blur)
+                m3    = self._mask_inrange(hsv)
+                votes = ((m1 > 0).astype(np.uint8) +
+                         (m2 > 0).astype(np.uint8) +
+                         (m3 > 0).astype(np.uint8))
+                mask  = (votes >= 2).astype(np.uint8) * 233
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
             mask   = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
         else:
@@ -311,21 +357,44 @@ class Seeker:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         out = frame.copy()
 
+        if not self._use_camshift:
+            # ── Detection-only path (no CamShift) ─────────────────────────────
+            mask = self._detection_mask(hsv)
+            if getattr(self, "_mask_window", None):
+                cv2.imshow(self._mask_window, mask)
+            rect = _nearest_blob_rect(mask, frame.shape, self._box_filter)
+            if rect is None:
+                self._draw_center_cross(out, w_frame, h_frame)
+                self._update_histogram_window()
+                return out, None, None
+            x, y, w, h = rect
+            cx = x + w // 2
+            cy = y + h // 2
+            ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
+            ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
+            centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
+            box_colour = (0, 233, 0) if centred else (203, 192, 233)
+            cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
+            cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
+            cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
+            cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
+            self._draw_center_cross(out, w_frame, h_frame)
+            self._update_histogram_window()
+            return out, cx, cy
+
+        # Always run the full detection pipeline — used both for acquiring lock
+        # and for validating / correcting CamShift while locked.
+        mask = self._detection_mask(hsv)
+        blob = _nearest_blob_rect(mask, frame.shape, self._box_filter)
+
         locked = (self._roi_hist is not None and
                   self._track_win is not None and
-                  self._detect_count >= 5)
+                  self._detect_count >= 3)
 
-        if locked:
-            # Fast path: one inRange call instead of the full 3-method pipeline.
-            mask = (self._mask_inrange(hsv) if self._conf_hist is not None
-                    else _pink_mask(hsv))
-        else:
-            # Detection path: full pipeline on half-resolution frame.
-            mask = self._detection_mask(hsv)
-            rect = _nearest_blob_rect(mask, frame.shape)
-            if rect is not None:
-                self._track_win    = rect
-                self._detect_count = min(self._detect_count + 1, 5)
+        if not locked:
+            if blob is not None:
+                self._track_win    = blob
+                self._detect_count = min(self._detect_count + 1, 3)
             else:
                 self._detect_count = 0
                 self._track_win    = None
@@ -333,7 +402,7 @@ class Seeker:
         if getattr(self, "_mask_window", None):
             cv2.imshow(self._mask_window, mask)
 
-        if self._roi_hist is None or self._track_win is None or self._detect_count < 5:
+        if self._roi_hist is None or self._track_win is None or self._detect_count < 3:
             self._draw_center_cross(out, w_frame, h_frame)
             self._update_histogram_window()
             return out, None, None
@@ -355,21 +424,34 @@ class Seeker:
             self._update_histogram_window()
             return out, None, None
 
+        # ── Snap: if blob disagrees with CamShift centre by > half blob size,
+        #    correct the window to the blob to prevent drift ──────────────────
+        if blob is not None:
+            cs_cx = int(ret[0][0])
+            cs_cy = int(ret[0][1])
+            bx, by, bw, bh = blob
+            b_cx = bx + bw // 2
+            b_cy = by + bh // 2
+            dist  = ((cs_cx - b_cx) ** 2 + (cs_cy - b_cy) ** 2) ** 0.5
+            if dist > max(bw, bh) * 0.5:
+                self._track_win    = blob
+                self._detect_count = max(self._detect_count - 1, 0)
+
         cx = int(ret[0][0])
         cy = int(ret[0][1])
 
         # ── Draw rotated bounding box (green when centred, pink otherwise) ────
         ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
-        ey = (cy - h_frame / 2.0) / (h_frame / 2.0)
+        ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
         centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-        box_colour = (0, 255, 0) if centred else (203, 192, 255)
+        box_colour = (0, 233, 0) if centred else (203, 192, 233)
         pts = cv2.boxPoints(ret).astype(np.intp)
         cv2.polylines(out, [pts], True, box_colour, 2)
 
         # centroid crosshair
-        cv2.line(out, (0, cy), (w_frame, cy), (0, 255, 255), 1)
-        cv2.line(out, (cx, 0), (cx, h_frame), (0, 255, 255), 1)
-        cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
+        cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
+        cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
+        cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
 
         self._draw_center_cross(out, w_frame, h_frame)
         self._update_histogram_window()
@@ -392,11 +474,11 @@ class Seeker:
         # hue axis ticks every 30°
         for hue in range(0, 181, 30):
             x = int(hue * bar_w)
-            cv2.line(canvas, (x, height), (x, height + 5), (200, 200, 200), 1)
+            cv2.line(canvas, (x, height), (x, height + 3), (200, 200, 200), 1)
             cv2.putText(canvas, str(hue), (max(0, x - 8), height + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
-        cv2.putText(canvas, "Hue (0-179)", (width // 2 - 35, height + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, (200, 200, 200), 1)
+        cv2.putText(canvas, "Hue (0-179)", (width // 2 - 33, height + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
         return canvas
 
     def _update_histogram_window(self):
@@ -406,7 +488,7 @@ class Seeker:
         cv2.imshow(self._hist_window, self._render_histogram(self._cal_hist))
 
     @staticmethod
-    def _draw_center_cross(frame, w, h, box=80, arm=16, color=(0, 0, 255), thickness=3):
+    def _draw_center_cross(frame, w, h, box=80, arm=16, color=(0, 0, 233), thickness=3):
         """Draw a corner-bracket crosshair (L-shapes at 4 corners of a box) with a small center cross."""
         cx, cy = w // 2, h // 2
         corners = [
@@ -420,8 +502,8 @@ class Seeker:
             cv2.line(frame, (x, y), (x, y + arm * dy), color, thickness)
         # center cross
         cs = 24
-        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), (0, 0, 255), 3)
-        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), (0, 0, 255), 3)
+        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), (0, 0, 233), 3)
+        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), (0, 0, 233), 3)
 
     # ── Error computation ─────────────────────────────────────────────────────
 
@@ -483,10 +565,10 @@ class Seeker:
                 if errorx is not None:
                     label = f"ex={errorx:+.3f}  ey={errory:+.3f}"
                     cv2.putText(annotated, label, (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 233, 0), 2)
 
                 cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 233, 0), 2)
 
                 cv2.imshow(self.window_name, annotated)
 
