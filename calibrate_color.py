@@ -17,6 +17,7 @@ Controls:
 
 import argparse
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -32,87 +33,126 @@ HIST_WINDOW = "Histogram"
 MASK_WINDOW = "Mask"
 OUT_FILE    = "color_histogram.txt"
 
+# Module-level precomputed constants
+_KERN5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_OUTER_LUT = np.zeros(256, dtype=np.uint8)
+_OUTER_LUT[255] = 128
 
 
-def _mask_gaussian(hsv: np.ndarray, h_blur: np.ndarray, conf_hist: np.ndarray) -> np.ndarray:
-    """Method 1 — Gaussian back-projection (sat floor 40, val floor 40)."""
-    hsv_blur = hsv.copy()
-    hsv_blur[:, :, 0] = h_blur
-    bp     = cv2.calcBackProject([hsv_blur], [0], conf_hist, [0, 180], 1)
-    in_sat = hsv[:, :, 1] >= 40
-    in_val = hsv[:, :, 2] >= 40
-    return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+
+def _build_inrange_bounds(gauss_mean: float, gauss_std: float) -> dict:
+    """Precompute cv2.inRange bounds for core (±1σ) and outer (±Nσ) bands."""
+    result = {}
+    for key, (mean, hw) in [("core",  (gauss_mean, gauss_std)),
+                             ("outer", (gauss_mean, _GAUSS_SIGMA * gauss_std))]:
+        lo, hi = mean - hw, mean + hw
+        if lo < 0:
+            result[key] = (
+                np.array([max(0, int(lo + 180)), 40, 40],    dtype=np.uint8),
+                np.array([179,                   255, 255],   dtype=np.uint8),
+                np.array([0,                     40,  40],    dtype=np.uint8),
+                np.array([min(179, int(hi)),      255, 255],  dtype=np.uint8),
+                "wrap_lo",
+            )
+        elif hi > 179:
+            result[key] = (
+                np.array([max(0, int(lo)),          40,  40], dtype=np.uint8),
+                np.array([179,                      255, 255], dtype=np.uint8),
+                np.array([0,                        40,  40], dtype=np.uint8),
+                np.array([min(179, int(hi - 180)),  255, 255], dtype=np.uint8),
+                "wrap_hi",
+            )
+        else:
+            result[key] = (
+                np.array([max(0, int(lo)),   40,  40],  dtype=np.uint8),
+                np.array([min(179, int(hi)), 255, 255], dtype=np.uint8),
+                None, None, "single",
+            )
+    return result
+
+
+def _build_hue_gate_lut(gauss_mean: float, gauss_std: float) -> np.ndarray:
+    """256-element LUT: hue → 255 if within ±Nσ of mean, else 0."""
+    lut  = np.zeros(256, dtype=np.uint8)
+    bins = np.arange(180, dtype=np.float32)
+    d    = np.abs(bins - gauss_mean)
+    d    = np.minimum(d, 180.0 - d)
+    lut[:180] = (d < _GAUSS_SIGMA * gauss_std).astype(np.uint8) * 255
+    return lut
+
+
+def _apply_inrange_band(hsv: np.ndarray, bands: dict, key: str) -> np.ndarray:
+    lo_a, hi_a, lo_b, hi_b, mode = bands[key]
+    if mode == "single":
+        return cv2.inRange(hsv, lo_a, hi_a)
+    return cv2.bitwise_or(cv2.inRange(hsv, lo_a, hi_a),
+                          cv2.inRange(hsv, lo_b, hi_b))
+
+
+def _mask_gaussian(hsv: np.ndarray, h_blur: np.ndarray,
+                   conf_hist: np.ndarray, bands: dict) -> np.ndarray:
+    """Method 1 — Gaussian back-projection with S/V gate."""
+    h_save = hsv[:, :, 0].copy()   # save H channel only (1 plane, not full frame)
+    hsv[:, :, 0] = h_blur
+    bp = cv2.calcBackProject([hsv], [0], conf_hist, [0, 180], 1)
+    hsv[:, :, 0] = h_save
+    sv_ok = _apply_inrange_band(hsv, bands, "outer")
+    _, bp_bin = cv2.threshold(bp, 0, 255, cv2.THRESH_BINARY)
+    return cv2.bitwise_and(bp_bin, sv_ok)
 
 
 def _mask_adaptive(hsv: np.ndarray, h_blur: np.ndarray,
-                   gauss_mean: float, gauss_std: float) -> np.ndarray:
-    """Method 2 — Adaptive hue threshold + ±3σ hue-distance gate."""
-    h_norm = cv2.normalize(h_blur, None, 0, 255, cv2.NORM_MINMAX)
-    adapt  = cv2.adaptiveThreshold(
-        h_norm, 255,
+                   hue_gate_lut: np.ndarray) -> np.ndarray:
+    """Method 2 — Adaptive hue threshold + precomputed σ-gate LUT."""
+    # h_blur is uint8 0-179 — skip per-frame normalize; blockSize 11 (down from 21).
+    adapt    = cv2.adaptiveThreshold(
+        h_blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=21, C=3,
+        blockSize=11, C=3,
     )
-    diff     = np.abs(h_blur.astype(np.float32) - gauss_mean)
-    diff     = np.minimum(diff, 180.0 - diff)
-    hue_gate = (diff < _GAUSS_SIGMA * gauss_std).astype(np.uint8) * 255
+    hue_gate = cv2.LUT(h_blur, hue_gate_lut)
     return cv2.bitwise_and(adapt, hue_gate)
 
 
-def _mask_inrange(hsv: np.ndarray, gauss_mean: float, gauss_std: float) -> np.ndarray:
-    """Method 3 — Dual inRange with wraparound-safe hue band."""
-    lo_h = gauss_mean - _GAUSS_SIGMA * gauss_std
-    hi_h = gauss_mean + _GAUSS_SIGMA * gauss_std
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-
-    def _add_range(a, b):
-        nonlocal mask
-        a, b = max(0, int(a)), min(179, int(b))
-        if a <= b:
-            mask |= cv2.inRange(hsv,
-                                np.array([a, 40, 40]),
-                                np.array([b, 255, 255]))
-
-    if lo_h < 0:
-        _add_range(lo_h + 180, 179)
-        _add_range(0, hi_h)
-    elif hi_h > 179:
-        _add_range(lo_h, 179)
-        _add_range(0, hi_h - 180)
-    else:
-        _add_range(lo_h, hi_h)
-    return mask
+def _mask_inrange(hsv: np.ndarray, bands: dict) -> np.ndarray:
+    """Method 3 — Soft-weighted two-band inRange (core=255, outer-only=128)."""
+    core  = _apply_inrange_band(hsv, bands, "core")
+    outer = _apply_inrange_band(hsv, bands, "outer")
+    cv2.subtract(outer, core, dst=outer)
+    outer = cv2.LUT(outer, _OUTER_LUT)   # 255→128, 0→0
+    return cv2.bitwise_or(core, outer)
 
 
-def _detection_mask(hsv: np.ndarray, conf_hist, gauss_mean, gauss_std,
+def _detection_mask(hsv: np.ndarray, conf_hist, bands, hue_gate_lut,
                     algo: str = "all") -> np.ndarray:
     """Build detection mask using the selected algorithm.
 
     algo: "gaussian" | "adaptive" | "inrange" | "all" (2-of-3 majority vote)
     Falls back to hardcoded pink ranges when conf_hist is None.
+    bands and hue_gate_lut are precomputed from gauss_mean/std; pass None when
+    conf_hist is None.
     """
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     if conf_hist is not None:
         h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
         if algo == "gaussian":
-            mask = _mask_gaussian(hsv, h_blur, conf_hist)
+            mask = _mask_gaussian(hsv, h_blur, conf_hist, bands)
         elif algo == "adaptive":
-            mask = _mask_adaptive(hsv, h_blur, gauss_mean, gauss_std)
+            mask = _mask_adaptive(hsv, h_blur, hue_gate_lut)
         elif algo == "inrange":
-            mask = _mask_inrange(hsv, gauss_mean, gauss_std)
-        else:  # "all" — 2-of-3 vote
-            m1    = _mask_gaussian(hsv, h_blur, conf_hist)
-            m2    = _mask_adaptive(hsv, h_blur, gauss_mean, gauss_std)
-            m3    = _mask_inrange(hsv, gauss_mean, gauss_std)
-            votes = ((m1 > 0).astype(np.uint8) +
-                     (m2 > 0).astype(np.uint8) +
-                     (m3 > 0).astype(np.uint8))
-            mask  = (votes >= 2).astype(np.uint8) * 255
+            mask = _mask_inrange(hsv, bands)
+        else:  # "all" — 2-of-3 majority vote
+            m1    = _mask_gaussian(hsv, h_blur, conf_hist, bands)
+            m2    = _mask_adaptive(hsv, h_blur, hue_gate_lut)
+            m3    = _mask_inrange(hsv, bands)
+            votes = (m1 > 0).view(np.uint8)
+            votes = votes + (m2 > 0).view(np.uint8)
+            votes = votes + (m3 > 0).view(np.uint8)
+            _, mask = cv2.threshold(votes, 1, 255, cv2.THRESH_BINARY)
     else:
         mask = _pink_mask(hsv)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   _KERN5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, _KERN5)
     return mask
 
 
@@ -203,26 +243,51 @@ def main():
     saved_hist = _load_histogram(args.output)
     if saved_hist is not None:
         gauss_mean, gauss_std = _fit_gaussian(saved_hist)
-        conf_hist  = _confidence_hist(saved_hist, gauss_mean, gauss_std)
+        conf_hist    = _confidence_hist(saved_hist, gauss_mean, gauss_std)
+        bands        = _build_inrange_bounds(gauss_mean, gauss_std)
+        hue_gate_lut = _build_hue_gate_lut(gauss_mean, gauss_std)
         kept = int((conf_hist.flatten() > 0).sum())
         print(f"[Cal] Confidence hist: mean={gauss_mean:.1f}  std={gauss_std:.1f}  bins={kept}/180")
     else:
-        gauss_mean = gauss_std = conf_hist = None
+        gauss_mean = gauss_std = conf_hist = bands = hue_gate_lut = None
         print("[Cal] No histogram file found — using hardcoded pink ranges.")
 
     hist          = None   # histogram of current detection
     saved         = saved_hist is not None
     manual_rect   = None   # user-drawn ROI (overrides auto-detected blob when set)
     detect_count  = 0      # consecutive frames blob was detected (lock after 3)
+    miss_count    = 0      # consecutive frames blob was absent (drop after MISS_THRESH)
+    last_center   = None   # (cx, cy) of last confirmed blob — biases blob selection
+    MISS_THRESH   = 5
+
+    # ── Background capture thread ─────────────────────────────────────────────
+    _cap_lock  = threading.Lock()
+    _cap_buf   = [False, None]   # [ok, frame]
+    _cap_stop  = [False]
+
+    def _capture_loop():
+        while not _cap_stop[0]:
+            ok, frm = cap.read()
+            with _cap_lock:
+                _cap_buf[0], _cap_buf[1] = ok, frm
+
+    _cap_thread = threading.Thread(target=_capture_loop, daemon=True)
+    _cap_thread.start()
+
+    # Pre-allocated per-frame buffers (lazily sized on first frame)
+    _hsv_buf = None
+    _disp_buf = None
 
     print("[Cal] Point camera at target.")
     print("[Cal]  S — save   R — reset   D — draw region   C — clear region   Q/Esc — quit")
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("[Cal] End of stream.")
-            break
+        with _cap_lock:
+            ok, frame = _cap_buf[0], _cap_buf[1]
+        if not ok or frame is None:
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                break
+            continue
 
         if crop is not None:
             cx, cy, cw, ch = crop
@@ -233,19 +298,33 @@ def main():
                 ch = fh - cy
             frame = frame[cy:cy + ch, cx:cx + cw]
 
-        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = _detection_mask(hsv, conf_hist, gauss_mean, gauss_std, args.mask_algo)
-        rect    = _nearest_blob_rect(mask, frame.shape)
-        display = frame.copy()
+        fh, fw = frame.shape[:2]
+        if _hsv_buf is None or _hsv_buf.shape[:2] != (fh, fw):
+            _hsv_buf  = np.empty((fh, fw, 3), dtype=np.uint8)
+            _disp_buf = np.empty_like(frame)
+        cv2.cvtColor(frame, cv2.COLOR_BGR2HSV, dst=_hsv_buf)
+        hsv = _hsv_buf
+        np.copyto(_disp_buf, frame)
+        display = _disp_buf
+
+        mask = _detection_mask(hsv, conf_hist, bands, hue_gate_lut, args.mask_algo)
+        rect = _nearest_blob_rect(mask, frame.shape, prefer_pt=last_center)
         if args.mask:
             cv2.imshow(MASK_WINDOW, mask)
 
-        # Update confirmation counter (manual ROI bypasses the counter)
+        # Update confirmation / miss counters (manual ROI bypasses both).
         if manual_rect is None:
             if rect is not None:
                 detect_count = min(detect_count + 1, 3)
+                miss_count   = 0
+                x, y, w, h  = rect
+                last_center  = (x + w // 2, y + h // 2)
             else:
-                detect_count = 0
+                miss_count += 1
+                if miss_count >= MISS_THRESH:
+                    detect_count = 0
+                    last_center  = None
+                    miss_count   = 0
         confirmed = (manual_rect is not None) or (detect_count >= 3)
 
         active_rect = manual_rect if manual_rect is not None else (rect if confirmed else None)
@@ -314,9 +393,11 @@ def main():
             if hist is not None:
                 np.savetxt(args.output, hist.flatten(), fmt="%.4f")
                 print(f"[Cal] Histogram saved → {args.output}  ({len(hist)} bins)")
-                saved = True
+                saved        = True
                 gauss_mean, gauss_std = _fit_gaussian(hist)
-                conf_hist = _confidence_hist(hist, gauss_mean, gauss_std)
+                conf_hist    = _confidence_hist(hist, gauss_mean, gauss_std)
+                bands        = _build_inrange_bounds(gauss_mean, gauss_std)
+                hue_gate_lut = _build_hue_gate_lut(gauss_mean, gauss_std)
                 kept = int((conf_hist.flatten() > 0).sum())
                 print(f"[Cal] Detection updated: mean={gauss_mean:.1f}  std={gauss_std:.1f}  bins={kept}/180")
             else:
@@ -326,9 +407,13 @@ def main():
             saved        = False
             manual_rect  = None
             detect_count = 0
-            gauss_mean   = gauss_std = conf_hist = None
+            miss_count   = 0
+            last_center  = None
+            gauss_mean   = gauss_std = conf_hist = bands = hue_gate_lut = None
             print("[Cal] Reset — reverted to pink HSV ranges.")
 
+    _cap_stop[0] = True
+    _cap_thread.join(timeout=1.0)
     cap.release()
     cv2.destroyAllWindows()
 

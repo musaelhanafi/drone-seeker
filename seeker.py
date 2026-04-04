@@ -1,6 +1,7 @@
 import collections
 import cv2
 import numpy as np
+import threading
 import time
 
 
@@ -8,7 +9,7 @@ import time
 # Hot pink sits at H ≈ 130-173 (≈300-330° on the standard wheel).
 # High saturation floor (100) rejects pastel / pale pinks.
 _PINK_RANGES = [
-    (np.array([130, 100, 80]), np.array([173, 233, 233])),  # hot pink / magenta
+    (np.array([130, 40, 80]), np.array([173, 233, 233])),  # hot pink / magenta
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
@@ -30,16 +31,29 @@ def _pink_mask(hsv: np.ndarray) -> np.ndarray:
     return mask
 
 
-_MIN_EXTENT = 0.45   # minimum ratio of contour area to bounding-box area (box-like filter)
+_MIN_EXTENT   = 0.45   # minimum contour/bbox fill ratio
+_MIN_SOLIDITY = 0.60   # minimum contour/convex-hull fill ratio (rejects L-shapes, noise)
+_MIN_DIM      = 4      # minimum blob width AND height in pixels
+_MAX_ASPECT   = 6.0    # maximum long/short side ratio (rejects thin slivers)
 
 
-def _nearest_blob_rect(mask: np.ndarray, frame_shape=None, box_filter: bool = True):
+def _nearest_blob_rect(mask: np.ndarray, frame_shape=None,
+                       box_filter: bool = True,
+                       prefer_pt: tuple | None = None):
     """Return the bounding rect (x, y, w, h) of the best blob.
 
-    When box_filter=True, candidates must exceed _MIN_EXTENT (contour area /
-    bounding-box area) and are ranked by extent × area — preferring rectangular
-    targets.  When box_filter=False, the largest blob by area is returned with
-    no shape constraint.
+    When box_filter=True, candidates must pass four shape tests:
+      - minimum area (_MIN_BLOB_AREA)
+      - minimum dimension in both axes (_MIN_DIM)
+      - extent  = contour_area / bbox_area        >= _MIN_EXTENT
+      - solidity = contour_area / convex_hull_area >= _MIN_SOLIDITY
+      - aspect ratio (long/short) <= _MAX_ASPECT
+    Survivors are scored by solidity × extent × area so compact, filled,
+    large blobs rank highest.  When prefer_pt=(px, py) is given the score is
+    divided by (1 + dist/100) so blobs closer to the reference win ties.
+
+    When box_filter=False, the largest blob by raw contour area is returned
+    with no shape constraint.
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -51,16 +65,35 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None, box_filter: bool = Tr
         if area < _MIN_BLOB_AREA:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        bbox_area   = w * h
-        if bbox_area == 0:
+        if w == 0 or h == 0:
             continue
         if box_filter:
-            extent = area / bbox_area
+            # Dimension gate
+            if w < _MIN_DIM or h < _MIN_DIM:
+                continue
+            # Aspect ratio gate
+            aspect = max(w, h) / min(w, h)
+            if aspect > _MAX_ASPECT:
+                continue
+            # Extent (fill of bounding box)
+            extent = area / (w * h)
             if extent < _MIN_EXTENT:
                 continue
-            score = extent * area
+            # Solidity (fill of convex hull)
+            hull      = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            solidity  = area / hull_area if hull_area > 0 else 0.0
+            if solidity < _MIN_SOLIDITY:
+                continue
+            score = solidity * extent * area
         else:
             score = area
+        # Soft bias toward reference point when provided
+        if prefer_pt is not None:
+            bcx  = x + w * 0.5
+            bcy  = y + h * 0.5
+            dist = ((bcx - prefer_pt[0]) ** 2 + (bcy - prefer_pt[1]) ** 2) ** 0.5
+            score /= (1.0 + dist / 100.0)
         if score > best_score:
             best_score = score
             best_rect  = (x, y, w, h)
@@ -68,7 +101,52 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None, box_filter: bool = Tr
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 2.0   # confidence window: ±2.0σ
+_GAUSS_SIGMA        = 3.0   # confidence window: ±3.0σ
+
+# ── Kalman filter tuning (position tracking) ──────────────────────────────────
+_KF_Q_POS    = 2.0    # process noise — position  (px^2/s)
+_KF_Q_VEL    = 80.0   # process noise — velocity  (px^2/s^3)
+_KF_R        = 30.0   # measurement noise         (px^2)
+_KF_MISS_MAX = 5      # predict this many frames after lock loss, then give up
+
+
+def _kf1d(x0, x1, P00, P01, P10, P11, meas, dt):
+    """One step of a 1-D constant-velocity Kalman filter.
+
+    State [pos, vel], observation = pos only.
+    Returns (filtered_pos, nx0, nx1, nP00, nP01, nP10, nP11).
+    """
+    # ── Predict ───────────────────────────────────────────────────────────────
+    px0  = x0 + x1 * dt
+    px1  = x1
+    pp00 = P00 + dt * (P10 + P01) + dt * dt * P11 + _KF_Q_POS
+    pp01 = P01 + dt * P11
+    pp10 = P10 + dt * P11
+    pp11 = P11 + _KF_Q_VEL
+    # ── Update ────────────────────────────────────────────────────────────────
+    S_inv = 1.0 / (pp00 + _KF_R)
+    K0    = pp00 * S_inv
+    K1    = pp10 * S_inv
+    innov = meas - px0
+    nx0   = px0 + K0 * innov
+    nx1   = px1 + K1 * innov
+    nP00  = (1.0 - K0) * pp00
+    nP01  = (1.0 - K0) * pp01
+    nP10  = pp10 - K1 * pp00
+    nP11  = pp11 - K1 * pp01
+    return nx0, nx1, nP00, nP01, nP10, nP11
+
+
+def _kf1d_pred(x0, x1, P00, P01, P10, P11, dt):
+    """Kalman predict-only step (no measurement).  Propagates state and covariance."""
+    px0  = x0 + x1 * dt
+    px1  = x1
+    pp00 = P00 + dt * (P10 + P01) + dt * dt * P11 + _KF_Q_POS
+    pp01 = P01 + dt * P11
+    pp10 = P10 + dt * P11
+    pp11 = P11 + _KF_Q_VEL
+    return px0, px1, pp00, pp01, pp10, pp11
+
 
 
 def _load_histogram(path: str) -> np.ndarray | None:
@@ -194,8 +272,50 @@ class Seeker:
         self._detect_count    = 0      # consecutive successful detections
         self._res_logged      = False
         self._term_crit  = (
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 1
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.5
         )
+        self._win_w_ema  = 0.0   # EMA of CamShift window width
+        self._win_h_ema  = 0.0   # EMA of CamShift window height
+        self._EMA_ALPHA  = 0.3   # EMA smoothing factor (lower = smoother)
+        # Kalman filter state (independent x/y axes, constant-velocity model)
+        self._kf_x0 = 0.0;  self._kf_x1 = 0.0   # x: [position, velocity]
+        self._kf_Px = [1.0, 0.0, 0.0, 1.0]       # x: P row-major [P00,P01,P10,P11]
+        self._kf_y0 = 0.0;  self._kf_y1 = 0.0   # y: [position, velocity]
+        self._kf_Py = [1.0, 0.0, 0.0, 1.0]       # y: P row-major
+        self._kf_initialized = False
+        self._kf_last_t      = 0.0
+        self._miss_count     = 0     # consecutive predict-only frames since lock lost
+        # Precompute morphological kernels — avoids per-frame allocation
+        self._kern3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._kern5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Precompute hue LUT and inRange bounds (fixed once calibrated)
+        if self._gauss_mean is not None and self._gauss_std is not None:
+            bins = np.arange(180, dtype=np.float32)
+            d    = np.abs(bins - self._gauss_mean)
+            self._hue_dist_lut = np.minimum(d, 180.0 - d).astype(np.float32)
+            # Boolean LUT: True where hue bin is within ±GAUSS_SIGMA*std
+            sigma_thresh = _GAUSS_SIGMA * self._gauss_std
+            self._hue_gate_lut = (self._hue_dist_lut < sigma_thresh).astype(np.uint8) * 255
+            # Precompute inRange band bounds (core = ±1σ, outer = ±Nσ)
+            self._inrange_core  = self._gauss_mean, self._gauss_std
+            self._inrange_outer = self._gauss_mean, _GAUSS_SIGMA * self._gauss_std
+            # Precompute np.array bounds for inRange calls (avoids per-frame allocation)
+            self._precomp_bands = self._build_inrange_bounds()
+        else:
+            self._hue_dist_lut  = None
+            self._hue_gate_lut  = None
+            self._inrange_core  = None
+            self._inrange_outer = None
+            self._precomp_bands = None
+        # Persistent buffer for H channel copy in _mask_gaussian
+        self._h_buf = None
+        # Persistent output and HSV buffers — allocated on first frame, reused after
+        self._out_buf = None
+        self._hsv_buf = None
+        # LUT: maps inRange output (binary 0/255) to half-weight (0/128) in one call
+        _lut = np.zeros(256, dtype=np.uint8)
+        _lut[255] = 128
+        self._outer_lut = _lut
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -211,6 +331,13 @@ class Seeker:
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[Seeker] Opened source={self.source!r}  capture={actual_w}x{actual_h}")
+        # Start background capture thread so read_frame() never blocks on I/O.
+        self._cap_lock  = threading.Lock()
+        self._cap_stop  = False
+        self._cap_ok    = False
+        self._cap_frame = None
+        self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._cap_thread.start()
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         if self._show_histogram and self._cal_hist is not None:
             self._hist_window = f"{self.window_name} — Histogram"
@@ -224,8 +351,20 @@ class Seeker:
         else:
             self._mask_window = None
 
+    def _capture_loop(self):
+        """Background thread: continuously read frames, always keep the latest."""
+        while not self._cap_stop:
+            ok, frame = self.cap.read()
+            with self._cap_lock:
+                self._cap_ok    = ok
+                self._cap_frame = frame
+
     def close(self):
         """Release the capture device and destroy the display window."""
+        if getattr(self, "_cap_thread", None):
+            self._cap_stop = True
+            self._cap_thread.join(timeout=1.0)
+            self._cap_thread = None
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -239,108 +378,123 @@ class Seeker:
 
     # ── Tracking helpers ──────────────────────────────────────────────────────
 
+    def _build_inrange_bounds(self) -> dict:
+        """Precompute all np.array bounds for inRange calls — called once at init."""
+        result = {}
+        for key, (mean, hw) in [("core",  self._inrange_core),
+                                 ("outer", self._inrange_outer)]:
+            lo, hi = mean - hw, mean + hw
+            if lo < 0:
+                result[key] = (
+                    np.array([max(0, int(lo + 180)), 40, 40],  dtype=np.uint8),
+                    np.array([179,                   255, 255], dtype=np.uint8),
+                    np.array([0,              40,  40],         dtype=np.uint8),
+                    np.array([min(179, int(hi)), 255, 255],     dtype=np.uint8),
+                    "wrap_lo",
+                )
+            elif hi > 179:
+                result[key] = (
+                    np.array([max(0, int(lo)), 40, 40],         dtype=np.uint8),
+                    np.array([179,             255, 255],        dtype=np.uint8),
+                    np.array([0,                        40, 40], dtype=np.uint8),
+                    np.array([min(179, int(hi-180)), 255, 255],  dtype=np.uint8),
+                    "wrap_hi",
+                )
+            else:
+                result[key] = (
+                    np.array([max(0, int(lo)), 40, 40],   dtype=np.uint8),
+                    np.array([min(179, int(hi)), 255, 255], dtype=np.uint8),
+                    None, None, "single",
+                )
+        return result
+
+    def _apply_inrange_band(self, hsv: np.ndarray, key: str) -> np.ndarray:
+        """Apply a precomputed inRange band by key ('core' or 'outer')."""
+        lo_a, hi_a, lo_b, hi_b, mode = self._precomp_bands[key]
+        if mode == "single":
+            return cv2.inRange(hsv, lo_a, hi_a)
+        return cv2.bitwise_or(cv2.inRange(hsv, lo_a, hi_a),
+                              cv2.inRange(hsv, lo_b, hi_b))
+
     # ── Detection sub-masks ───────────────────────────────────────────────────
 
     def _mask_gaussian(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
-        """Method 1 — Gaussian statistical threshold.
-
-        Back-projects the ±sigma confidence histogram onto the blurred hue
-        channel.  Saturation and value floors (40) gate reject
-        grey, dark, and over-exposed pixels.
-        """
-        hsv_blur = hsv.copy()
-        hsv_blur[:, :, 0] = h_blur
-        bp     = cv2.calcBackProject([hsv_blur], [0], self._conf_hist, [0, 180], 1)
-        in_sat = hsv[:, :, 1] >= 40
-        in_val = hsv[:, :, 2] >= 40
-        return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 233
+        """Method 1 — Gaussian back-projection with S/V gate."""
+        # Use pre-allocated buffer to avoid repeated allocation
+        if self._h_buf is None or self._h_buf.shape != hsv[:, :, 0].shape:
+            self._h_buf = hsv[:, :, 0].copy()
+        else:
+            np.copyto(self._h_buf, hsv[:, :, 0])
+        hsv[:, :, 0] = h_blur
+        bp = cv2.calcBackProject([hsv], [0], self._conf_hist, [0, 180], 1)
+        hsv[:, :, 0] = self._h_buf
+        sv_ok = self._apply_inrange_band(hsv, "outer")   # reuse outer band as S/V gate
+        return cv2.bitwise_and(cv2.threshold(bp, 0, 255, cv2.THRESH_BINARY)[1], sv_ok)
 
     def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
-        """Method 2 — Adaptive threshold on hue channel.
-
-        Normalises the blurred H channel to 0-233 then applies an adaptive
-        Gaussian threshold (blockSize=21, C=3).  This finds pixels whose hue
-        is locally consistent — above the local hue mean — and therefore
-        handles illumination variation across the frame without a global
-        threshold.  Fused with a direct hue-distance fence so only the
-        calibrated colour band passes.
-        """
-        h_norm   = cv2.normalize(h_blur, None, 0, 233, cv2.NORM_MINMAX)
-        adapt    = cv2.adaptiveThreshold(
-            h_norm, 233,
+        """Method 2 — Adaptive hue threshold + precomputed σ-gate LUT."""
+        # h_blur is uint8 0-179; use directly — skips per-frame normalize.
+        # blockSize=11 (down from 21) halves the neighbourhood work.
+        adapt  = cv2.adaptiveThreshold(
+            h_blur, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            blockSize=21, C=3,
+            blockSize=11, C=3,
         )
-        diff     = np.abs(h_blur.astype(np.float32) - self._gauss_mean)
-        diff     = np.minimum(diff, 180.0 - diff)            # circular wrap
-        hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 233
+        hue_gate = self._hue_gate_lut[h_blur]
         return cv2.bitwise_and(adapt, hue_gate)
 
     def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
-        """Method 3 — Dual inRange (wraparound-safe).
-
-        Builds one or two cv2.inRange bands from the calibrated mean±sigma
-        window, splitting at the 0/180 hue boundary so colours that straddle
-        it (pink/red/magenta) are detected correctly.
-        """
-        lo_h = self._gauss_mean - _GAUSS_SIGMA * self._gauss_std
-        hi_h = self._gauss_mean + _GAUSS_SIGMA * self._gauss_std
-
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-
-        def _add_range(a, b):
-            nonlocal mask
-            a, b = max(0, int(a)), min(179, int(b))
-            if a <= b:
-                mask |= cv2.inRange(hsv,
-                                    np.array([a, 40, 40]),
-                                    np.array([b, 233, 233]))
-
-        if lo_h < 0:
-            _add_range(lo_h + 180, 179)
-            _add_range(0, hi_h)
-        elif hi_h > 179:
-            _add_range(lo_h, 179)
-            _add_range(0, hi_h - 180)
-        else:
-            _add_range(lo_h, hi_h)
-
-        return mask
+        """Method 3 — Two-band inRange using fully precomputed bounds."""
+        core  = self._apply_inrange_band(hsv, "core")
+        outer = self._apply_inrange_band(hsv, "outer")
+        # outer-only pixels get half weight; core pixels get full 255
+        cv2.subtract(outer, core, dst=outer)          # removes core pixels, no temp alloc
+        outer = cv2.LUT(outer, self._outer_lut)       # 255→128, 0→0
+        return cv2.bitwise_or(core, outer)
 
     # ── Combined detection mask ───────────────────────────────────────────────
 
-    def _detection_mask(self, hsv: np.ndarray) -> np.ndarray:
-        """Return a binary detection mask.
+    def _detection_mask(self, hsv: np.ndarray,
+                        locked: bool = False) -> tuple[np.ndarray, int]:
+        """Return (mask, scale=1) always full-res.
 
-        When a calibration histogram is loaded, uses the algorithm selected by
-        self._mask_algo ("gaussian", "adaptive", "inrange", or "all" for 2-of-3
-        majority vote).  Falls back to hardcoded HSV ranges otherwise.
+        Locked     → fast inRange only (no back-projection or adaptive).
+        Acquiring  → full pipeline matching calibrate_color exactly.
         """
-        if self._conf_hist is not None:
-            algo   = self._mask_algo
-            h_blur = cv2.GaussianBlur(hsv[:, :, 0], (3, 3), 0)
+        if self._conf_hist is None:
+            return _pink_mask(hsv), 1
+
+        if locked:
+            mask = self._mask_inrange(hsv)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kern3)
+            return mask, 1
+
+        # ── Acquisition: full-res ─────────────────────────────────────────────
+        algo = self._mask_algo
+
+        if algo == "inrange":
+            # Fastest path — no blur needed
+            mask = self._mask_inrange(hsv)
+        else:
+            h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
             if algo == "gaussian":
                 mask = self._mask_gaussian(hsv, h_blur)
             elif algo == "adaptive":
                 mask = self._mask_adaptive(hsv, h_blur)
-            elif algo == "inrange":
-                mask = self._mask_inrange(hsv)
-            else:  # "all" — 2-of-3 majority vote
-                m1    = self._mask_gaussian(hsv, h_blur)
-                m2    = self._mask_adaptive(hsv, h_blur)
-                m3    = self._mask_inrange(hsv)
-                votes = ((m1 > 0).astype(np.uint8) +
-                         (m2 > 0).astype(np.uint8) +
-                         (m3 > 0).astype(np.uint8))
-                mask  = (votes >= 2).astype(np.uint8) * 233
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
-            mask   = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
-        else:
-            mask = _pink_mask(hsv)
+            else:  # "all" — 2-of-3 majority vote with in-place accumulation
+                m1 = self._mask_gaussian(hsv, h_blur)
+                m2 = self._mask_adaptive(hsv, h_blur)
+                m3 = self._mask_inrange(hsv)
+                # In-place vote: reuse m1 buffer
+                votes = (m1 > 0).view(np.uint8)
+                votes += (m2 > 0).view(np.uint8)
+                votes += (m3 > 0).view(np.uint8)
+                _, mask = cv2.threshold(votes, 1, 255, cv2.THRESH_BINARY)
 
-        return mask
+        # Single CLOSE cheaper than OPEN + DILATE and fills holes too
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kern3)
+        return mask, 1
 
     def track(self, frame: np.ndarray):
         """Run one tracking step.
@@ -354,12 +508,18 @@ class Seeker:
         half-resolution frame to find and confirm the blob.
         """
         h_frame, w_frame = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        out = frame.copy()
+        # Reuse persistent buffers; (re)allocate only when frame shape changes.
+        if self._hsv_buf is None or self._hsv_buf.shape[:2] != (h_frame, w_frame):
+            self._hsv_buf = np.empty((h_frame, w_frame, 3), dtype=np.uint8)
+            self._out_buf = np.empty_like(frame)
+        cv2.cvtColor(frame, cv2.COLOR_BGR2HSV, dst=self._hsv_buf)
+        hsv = self._hsv_buf
+        np.copyto(self._out_buf, frame)
+        out = self._out_buf
 
         if not self._use_camshift:
             # ── Detection-only path (no CamShift) ─────────────────────────────
-            mask = self._detection_mask(hsv)
+            mask, _ = self._detection_mask(hsv)
             if getattr(self, "_mask_window", None):
                 cv2.imshow(self._mask_window, mask)
             rect = _nearest_blob_rect(mask, frame.shape, self._box_filter)
@@ -382,24 +542,53 @@ class Seeker:
             self._update_histogram_window()
             return out, cx, cy
 
-        # Always run the full detection pipeline — used both for acquiring lock
-        # and for validating / correcting CamShift while locked.
-        mask = self._detection_mask(hsv)
-        blob = _nearest_blob_rect(mask, frame.shape, self._box_filter)
-
         locked = (self._roi_hist is not None and
                   self._track_win is not None and
                   self._detect_count >= 3)
 
+        # ── Detection / re-acquisition ────────────────────────────────────────
+        mask = None
+        blob = None
         if not locked:
+            if self._track_win is not None and self._detect_count > 0:
+                # Re-acquiring: restrict search to a padded region around the
+                # last known window — avoids running the full pipeline on the
+                # whole frame every cycle.
+                twx, twy, tww, twh = self._track_win
+                pad = max(tww, twh, 40)
+                sx1 = max(0, twx - pad);      sy1 = max(0, twy - pad)
+                sx2 = min(w_frame, twx + tww + pad)
+                sy2 = min(h_frame, twy + twh + pad)
+                mask_crop, _ = self._detection_mask(hsv[sy1:sy2, sx1:sx2])
+                blob_crop     = _nearest_blob_rect(mask_crop, None, self._box_filter)
+                if blob_crop is not None:
+                    bx, by, bw, bh = blob_crop
+                    blob = (bx + sx1, by + sy1, bw, bh)
+                if getattr(self, "_mask_window", None):
+                    mask = np.zeros((h_frame, w_frame), dtype=np.uint8)
+                    mask[sy1:sy2, sx1:sx2] = mask_crop
+            else:
+                # Cold acquisition: search full frame.
+                mask, _ = self._detection_mask(hsv)
+                blob     = _nearest_blob_rect(mask, frame.shape, self._box_filter)
+
             if blob is not None:
-                self._track_win    = blob
+                bx, by, bw, bh = blob
+                pad = max(8, int(max(bw, bh) * 0.3))
+                ix = max(0, bx - pad)
+                iy = max(0, by - pad)
+                iw = min(w_frame - ix, bw + 2 * pad)
+                ih = min(h_frame - iy, bh + 2 * pad)
+                self._track_win    = (ix, iy, iw, ih)
                 self._detect_count = min(self._detect_count + 1, 3)
+                if self._detect_count == 1:
+                    self._win_w_ema = float(iw)
+                    self._win_h_ema = float(ih)
             else:
                 self._detect_count = 0
                 self._track_win    = None
 
-        if getattr(self, "_mask_window", None):
+        if mask is not None and getattr(self, "_mask_window", None):
             cv2.imshow(self._mask_window, mask)
 
         if self._roi_hist is None or self._track_win is None or self._detect_count < 3:
@@ -408,24 +597,95 @@ class Seeker:
             return out, None, None
 
         # ── CamShift step ─────────────────────────────────────────────────────
+        now_t = time.monotonic()
+        kf_dt = min(now_t - self._kf_last_t, 0.5) if self._kf_initialized else 0.0
+        self._kf_last_t = now_t
+
         back_proj = cv2.calcBackProject([hsv], [0], self._roi_hist, [0, 180], 1)
-        back_proj &= mask
+        # Pre-translate the search window by Kalman-predicted velocity so CamShift
+        # starts near where the target is expected to be this frame.
+        twx, twy, tww, twh = self._track_win
+        if self._kf_initialized and kf_dt > 0:
+            dx = int(round(self._kf_x1 * kf_dt))
+            dy = int(round(self._kf_y1 * kf_dt))
+            twx = max(0, min(twx + dx, w_frame - tww))
+            twy = max(0, min(twy + dy, h_frame - twh))
+            self._track_win = (twx, twy, tww, twh)
+        # Gate to padded search window instead of full-frame mask.
+        pad_x = max(tww // 2, 20);  pad_y = max(twh // 2, 20)
+        bx1 = max(0, twx - pad_x);  by1 = max(0, twy - pad_y)
+        bx2 = min(w_frame, twx + tww + pad_x)
+        by2 = min(h_frame, twy + twh + pad_y)
+        if by1 > 0:        back_proj[:by1, :]       = 0
+        if by2 < h_frame:  back_proj[by2:, :]       = 0
+        if bx1 > 0:        back_proj[by1:by2, :bx1] = 0
+        if bx2 < w_frame:  back_proj[by1:by2, bx2:] = 0
+        cv2.GaussianBlur(back_proj, (3, 3), 0, dst=back_proj)
 
         ret, self._track_win = cv2.CamShift(
             back_proj, self._track_win, self._term_crit
         )
 
-        # ── Validate: drop lock if window collapsed ───────────────────────────
-        _, _, w, h = self._track_win
-        if w < 2 or h < 2:
-            self._track_win    = None
-            self._detect_count = 0
-            self._draw_center_cross(out, w_frame, h_frame)
-            self._update_histogram_window()
-            return out, None, None
+        # ── Clamp window to frame bounds ──────────────────────────────────────
+        twx, twy, tww, twh = self._track_win
+        twx = max(0, min(twx, w_frame - 1))
+        twy = max(0, min(twy, h_frame - 1))
+        tww = max(1, min(tww, w_frame - twx))
+        twh = max(1, min(twh, h_frame - twy))
+        self._track_win = (twx, twy, tww, twh)
 
-        # ── Snap: if blob disagrees with CamShift centre by > half blob size,
-        #    correct the window to the blob to prevent drift ──────────────────
+        # ── Validate: drop lock if window collapsed or exploded ───────────────
+        _, _, w, h = self._track_win
+        camshift_bad = (w < 4 or h < 4 or w > w_frame * 0.9 or h > h_frame * 0.9)
+
+        if not camshift_bad:
+            # ── Signal density check — drop lock if back-proj is mostly empty ─
+            wx, wy, ww, wh = self._track_win
+            roi_bp  = back_proj[wy:wy + wh, wx:wx + ww]
+            density = float(roi_bp.mean()) / 255.0
+            if density < 0.05:
+                camshift_bad = True
+
+        if camshift_bad:
+            if self._kf_initialized and self._miss_count < _KF_MISS_MAX:
+                # ── Predict position for up to _KF_MISS_MAX frames ────────────
+                self._miss_count += 1
+                pred_dt = max(kf_dt, 1.0 / 30.0)
+                self._kf_x0, self._kf_x1, *self._kf_Px = _kf1d_pred(
+                    self._kf_x0, self._kf_x1, *self._kf_Px, pred_dt)
+                self._kf_y0, self._kf_y1, *self._kf_Py = _kf1d_pred(
+                    self._kf_y0, self._kf_y1, *self._kf_Py, pred_dt)
+                pcx = max(0, min(int(round(self._kf_x0)), w_frame - 1))
+                pcy = max(0, min(int(round(self._kf_y0)), h_frame - 1))
+                # Move the search window to the predicted centre so CamShift
+                # can re-acquire on the next frame.
+                tw = int(self._win_w_ema) or 40
+                th = int(self._win_h_ema) or 40
+                self._track_win = (max(0, pcx - tw // 2), max(0, pcy - th // 2),
+                                   min(tw, w_frame), min(th, h_frame))
+                self._draw_center_cross(out, w_frame, h_frame)
+                cv2.circle(out, (pcx, pcy), 5, (0, 165, 255), 2)   # orange = predicting
+                cv2.line(out, (0, pcy), (w_frame, pcy), (0, 165, 255), 1)
+                cv2.line(out, (pcx, 0), (pcx, h_frame), (0, 165, 255), 1)
+                self._update_histogram_window()
+                return out, pcx, pcy
+            else:
+                # Prediction budget exhausted — hard reset
+                self._track_win      = None
+                self._detect_count   = 0
+                self._win_w_ema      = 0.0
+                self._win_h_ema      = 0.0
+                self._kf_initialized = False
+                self._miss_count     = 0
+                self._draw_center_cross(out, w_frame, h_frame)
+                self._update_histogram_window()
+                return out, None, None
+
+        # ── EMA smoothing of window size ──────────────────────────────────────
+        self._win_w_ema = self._EMA_ALPHA * w + (1 - self._EMA_ALPHA) * self._win_w_ema
+        self._win_h_ema = self._EMA_ALPHA * h + (1 - self._EMA_ALPHA) * self._win_h_ema
+
+        # ── Snap: if blob disagrees with CamShift centre, correct to blob ─────
         if blob is not None:
             cs_cx = int(ret[0][0])
             cs_cy = int(ret[0][1])
@@ -434,11 +694,35 @@ class Seeker:
             b_cy = by + bh // 2
             dist  = ((cs_cx - b_cx) ** 2 + (cs_cy - b_cy) ** 2) ** 0.5
             if dist > max(bw, bh) * 0.5:
-                self._track_win    = blob
+                pad = max(8, int(max(bw, bh) * 0.3))
+                self._track_win    = (max(0, bx - pad), max(0, by - pad),
+                                      min(w_frame - max(0, bx - pad), bw + 2 * pad),
+                                      min(h_frame - max(0, by - pad), bh + 2 * pad))
                 self._detect_count = max(self._detect_count - 1, 0)
 
-        cx = int(ret[0][0])
-        cy = int(ret[0][1])
+        raw_cx = float(ret[0][0])
+        raw_cy = float(ret[0][1])
+
+        # ── Track recovered — reset prediction counter ────────────────────────
+        self._miss_count = 0
+
+        # ── Kalman filter on position ─────────────────────────────────────────
+        if not self._kf_initialized:
+            self._kf_x0, self._kf_x1 = raw_cx, 0.0
+            self._kf_y0, self._kf_y1 = raw_cy, 0.0
+            self._kf_Px = [1.0, 0.0, 0.0, 1.0]
+            self._kf_Py = [1.0, 0.0, 0.0, 1.0]
+            self._kf_initialized = True
+            cx, cy = int(round(raw_cx)), int(round(raw_cy))
+        else:
+            self._kf_x0, self._kf_x1, *self._kf_Px = _kf1d(
+                self._kf_x0, self._kf_x1, *self._kf_Px, raw_cx, kf_dt)
+            self._kf_y0, self._kf_y1, *self._kf_Py = _kf1d(
+                self._kf_y0, self._kf_y1, *self._kf_Py, raw_cy, kf_dt)
+            cx = int(round(self._kf_x0))
+            cy = int(round(self._kf_y0))
+        cx = max(0, min(cx, w_frame - 1))
+        cy = max(0, min(cy, h_frame - 1))
 
         # ── Draw rotated bounding box (green when centred, pink otherwise) ────
         ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
@@ -524,8 +808,11 @@ class Seeker:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def read_frame(self):
-        """Return (ok, frame) from the capture device, cropped if configured."""
-        ok, frame = self.cap.read()
+        """Return (ok, frame) from the background capture buffer, cropped if configured."""
+        with self._cap_lock:
+            ok, frame = self._cap_ok, self._cap_frame
+        if frame is None:
+            return False, None
         if ok and self.crop is not None:
             x, y, w, h = self.crop
             fh, fw = frame.shape[:2]
@@ -555,6 +842,8 @@ class Seeker:
                 fps = 1.0 / (sum(frame_times) / len(frame_times))
 
                 ok, frame = self.read_frame()
+                if frame is None:
+                    continue   # capture thread not ready yet
                 if not ok:
                     print("[Seeker] End of stream.")
                     break
@@ -579,6 +868,8 @@ class Seeker:
                 elif key == ord("r"):
                     self._track_win    = None
                     self._detect_count = 0
+                    self._win_w_ema    = 0.0
+                    self._win_h_ema    = 0.0
                     print("[Seeker] Tracker reset.")
         finally:
             self.close()
