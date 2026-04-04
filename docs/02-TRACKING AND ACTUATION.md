@@ -210,25 +210,21 @@ master.mav.command_long_send(
 
 ### Format pesan
 
-Error tracking dikirim sebagai pesan MAVLink standar `DEBUG_VECT` (ID 250, CRC extra 49), yang ada di tabel `MAVLINK_MESSAGE_CRCS` yang dikompilasi ArduPlane:
+Error tracking dikirim sebagai pesan MAVLink dari `seekerctrl.py`:
 
 | Field | Isi |
 |---|---|
-| `name` | `"tracking\x00\x00"` (string 10-byte dipadded) |
-| `time_usec` | `monotonic() * 1e6` |
 | `x` | `errorx` — error horizontal yang dinormalisasi [-1, 1] |
 | `y` | `errory` — error vertikal yang dinormalisasi [-1, 1] |
 | `z` | `0.0` (tidak digunakan) |
 
 ```python
-master.mav.debug_vect_send(
+self.master.mav.debug_vect_send(
     b"tracking\x00\x00",
     int(time.monotonic() * 1e6),
     errorx, errory, 0.0,
 )
 ```
-
-`DEBUG_VECT` dipilih karena ID pesan kustom di luar tabel pesan yang dikompilasi ArduPlane secara diam-diam dibuang oleh parser MAVLink sebelum mencapai lapisan aplikasi.
 
 ### Normalisasi error
 
@@ -259,11 +255,10 @@ if _in_tracking and flight_mode == "TRACKING":
 
 ## 6. Penerimaan ArduPlane (`GCS_MAVLink_Plane.cpp`)
 
-`DEBUG_VECT` dikirim ke `handle_tracking_message()` yang:
+Pesan error diterima oleh `handle_tracking_message()` yang:
 
-1. Mendekode dengan `mavlink_msg_debug_vect_decode()`.
-2. Kembali lebih awal jika tidak dalam mode TRACKING.
-3. Menskalakan error yang dinormalisasi ke radian menggunakan `TRACKING_MAX_DEG` (default 45 deg):
+1. Kembali lebih awal jika tidak dalam mode TRACKING.
+2. Menskalakan error yang dinormalisasi ke radian menggunakan `TRK_MAX_DEG` (default 30 deg):
 
 ```cpp
 float max_rad = tracking_max_deg * (PI / 180.0f);
@@ -336,7 +331,7 @@ Dapat diatur: `TRK_PTCH_P` / `_I` / `_D` / `_IMAX` (default: P=100 cd/deg, I=500
 
 ### Timeout dan Dead-Reckoning
 
-Jika tidak ada `DEBUG_VECT` yang tiba dalam `TRK_TIMEOUT` ms (default 1000 ms), siklus timeout pertama mengambil snapshot error terakhir yang diketahui ke dalam `_est_errorx_rad` / `_est_errory_rad`. Setiap siklus berikutnya mengintegrasikan laju bodi IMU untuk menyebarkan estimasi, lalu menerapkan peluruhan eksponensial (τ ≈ 2 s):
+Jika tidak ada pesan error yang tiba dalam `TRK_TIMEOUT` ms (default 1000 ms), siklus timeout pertama mereset kedua integrator PID dan menolkan nav_roll_cd / nav_pitch_cd (sayap rata):
 
 ```cpp
 _est_errorx_rad -= ahrs.get_gyro().x * dt_s;   // roll kanan → target bergeser ke kiri

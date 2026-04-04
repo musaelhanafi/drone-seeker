@@ -6,18 +6,18 @@ stateDiagram-v2
 
     STABILIZE --> STABILIZE : ch6 RENDAH stabil
 
-    STABILIZE --> AUTO : ch6 naik TINGGI\nBELUM (cukup_dekat DAN wp_terakhir)
+    STABILIZE --> AUTO : ch6 naik TINGGI<br/>BELUM (cukup_dekat DAN wp_terakhir)
 
-    AUTO --> AUTO : ch6 TINGGI\nBELUM cukup_dekat ATAU BUKAN wp_terakhir
+    AUTO --> AUTO : ch6 TINGGI<br/>BELUM cukup_dekat ATAU BUKAN wp_terakhir
 
-    AUTO --> TRACKING : ch6 TINGGI\ncukup_dekat (< 700 m)\nDAN wp_terakhir\nDAN target_terkunci\nentry_count++
+    AUTO --> TRACKING : ch6 TINGGI<br/>cukup_dekat (< 700 m)<br/>DAN wp_terakhir<br/>DAN target_terkunci<br/>entry_count++
 
-    TRACKING --> TRACKING : _in_tracking DAN mode==TRACKING\ntarget terkunci → kirim DEBUG_VECT\ntarget hilang → tahan/level, lost_count++
+    TRACKING --> TRACKING : _in_tracking DAN mode==TRACKING<br/>target terkunci → kirim error tracking<br/>target hilang → tahan/level, lost_count++
 
-    TRACKING --> AUTO : target_terkunci=False\nlost_count >= batas\n(30 jika committed, 10 jika tidak)\n_in_tracking = False
+    TRACKING --> AUTO : target_terkunci=False<br/>lost_count >= batas<br/>(30 jika committed, 10 jika tidak)<br/>_in_tracking = False
 
-    TRACKING --> STABILIZE : ch6 TINGGI→RENDAH\ntepi turun\n_in_tracking = False
+    TRACKING --> STABILIZE : ch6 TINGGI→RENDAH<br/>tepi turun<br/>_in_tracking = False
 
-    AUTO --> STABILIZE : ch6 TINGGI→RENDAH\ntepi turun\n_in_tracking = False
+    AUTO --> STABILIZE : ch6 TINGGI→RENDAH<br/>tepi turun<br/>_in_tracking = False
 
-    STABILIZE --> AUTO : ch6 RENDAH → TINGGI\nBELUM cukup_dekat DAN BUKAN _in_tracking
+    STABILIZE --> AUTO : ch6 RENDAH → TINGGI<br/>BELUM cukup_dekat DAN BUKAN _in_tracking

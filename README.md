@@ -1,62 +1,34 @@
 # Drone Seeker
 
-Autonomous pink-object tracker that feeds normalised error signals to an ArduPlane flight controller over MAVLink.
-When RC channel 6 is armed and a pink target is locked, the system switches the aircraft into **TRACKING mode** and streams `errorx / errory` corrections at video frame rate.
+Pelacak target hot-pink otonom yang mengirim sinyal error ternormalisasi ke flight controller ArduPlane melalui MAVLink.
+Saat RC channel 6 aktif dan target terkunci, sistem memindahkan pesawat ke **mode TRACKING** dan mengalirkan koreksi `errorx / errory` pada kecepatan frame video.
 
 ---
 
-## How It Works
+## Cara Kerja
 
-```mermaid
-flowchart TD
-    A([Camera]) --> B[Detect\npink blob]
-    B --> C{Locked?}
-    C -- No --> B
-    C -- Yes --> D[CamShift\ntrack]
-    D --> E{Window\ncollapsed?}
-    E -- Yes --> B
-    E -- No --> F[Normalise\nerror ±1]
-    F --> G{CH6 armed?}
-    G -- No --> H[Loiter]
-    G -- Yes --> I[MAVLink\nID 230]
-    I --> J[FC: roll/pitch\nvia TRACKING_MAX_DEG]
+```
+Kamera → deteksi warna (3 metode + voting) → CamShift + Kalman
+  → error_xy [-1,1] → prediktor latensi + PN lead
+    → pesan error MAVLink → ArduPlane PID roll/pitch
 ```
 
-### Pink Detection & CamShift Tracking
-
-1. **Colour mask** — each frame is converted to HSV and thresholded across two bands:
-   - Hot-pink / magenta: `H 145–179, S 50–255, V 80–255`
-   - Rose / light-pink:  `H 0–10,   S 50–150, V 80–255`
-   A morphological open + dilate removes noise.
-
-2. **Acquisition** — the largest pink contour above 400 px² is chosen as the initial ROI.  Its hue histogram is stored.
-
-3. **Tracking** — `cv2.CamShift()` runs a back-projection of the hue histogram every frame, refining a rotated bounding box around the target.  If the window collapses the tracker re-acquires automatically.
-
-4. **Error signal** — the box centre `(cx, cy)` is normalised to `[-1, 1]` relative to the frame centre:
-   - `errorx` positive → target is **right** of centre
-   - `errory` positive → target is **above** centre
-
-### MAVLink TRACKING Message
-
-Custom ArduPlane message **ID 230**, CRC extra 250.
-Fields: `errorx (float32)`, `errory (float32)` — both normalised `[-1, 1]`.
-The flight controller scales them by ±3° (`TRACKING_MAX_DELTA_RAD`) to drive roll and pitch.
+Lihat diagram arsitektur lengkap di [`docs/chart_02_architecture.png`](docs/chart_02_architecture.png).
 
 ---
 
-## Files
+## Kalibrasi Warna (Sebelum Terbang)
 
-| File | Description |
-|---|---|
-| `seeker.py` | `Seeker` class — camera/video capture, pink CamShift tracker, `error_xy()` |
-| `seekerctrl.py` | `SeekerCtrl` class — MAVLink connection, RC monitoring, mode management, TRACKING message |
-| `main.py` | Entry point — CLI argument parsing |
-| `requirements.txt` | Python dependencies |
+```bash
+python calibrate_color.py
+```
+
+Arahkan kamera ke target hot-pink, tekan **S** untuk menyimpan histogram ke `color_histogram.txt`.
+Tanpa file ini, sistem menggunakan fallback HSV bawaan (H 130–173).
 
 ---
 
-## Installation
+## Instalasi
 
 ```bash
 pip install -r requirements.txt
@@ -64,63 +36,157 @@ pip install -r requirements.txt
 
 ---
 
-## Running
+## Menjalankan
 
-### Basic (webcam, SITL default port)
+### Dasar (webcam, port SITL default)
 
 ```bash
 python main.py
 ```
 
-### Specific camera index
+### Kamera tertentu
 
 ```bash
 python main.py --source 1
 ```
 
-### Play a video file instead of live camera
+### File video
 
 ```bash
 python main.py --source footage.mp4
 ```
 
-### Serial connection to a real flight controller
+### Koneksi serial ke flight controller nyata
 
 ```bash
-python main.py --connection /dev/ttyUSB0 --baud 57600 --source 0
+python main.py --connection /dev/ttyUSB0 --baud 57600
 ```
 
-### TCP connection (e.g. MAVProxy forwarding)
+### Koneksi UDP / TCP
 
 ```bash
-python main.py --connection tcp:127.0.0.1:5760 --source 0
+python main.py --connection udp:127.0.0.1:14550
+python main.py --connection tcp:127.0.0.1:5760
 ```
 
-### All arguments
+### Mode auto (ikuti misi, masuk TRACKING saat dekat target)
 
-| Argument | Default | Description |
+```bash
+python main.py --auto --connection /dev/ttyUSB0
+```
+
+---
+
+## Semua Argumen
+
+| Argumen | Default | Keterangan |
 |---|---|---|
-| `--connection` | `udpin:0.0.0.0:14560` | MAVLink connection string |
-| `--baud` | `57600` | Baud rate (serial only) |
-| `--source` | `0` | Camera index or video file path |
+| `--connection` | `udpin:0.0.0.0:14560` | String koneksi MAVLink |
+| `--baud` | `57600` | Baud rate (serial saja) |
+| `--source` | `0` | Indeks kamera atau path file video |
+| `--auto` | off | Mode auto: masuk TRACKING saat dalam 700 m dari target dan di waypoint terakhir; ch6 rendah → STABILIZE |
+| `--res W H` | — | Resolusi tangkapan kamera yang diminta (mis. `--res 1280 720`) |
+| `--crop X Y W H` | — | Potong setiap frame ke ROI ini setelah tangkapan |
+| `--mask-algo` | `all` | Algoritma deteksi: `gaussian`, `adaptive`, `inrange`, atau `all` (voting 2-dari-3) |
+| `--no-camshift` | off | Nonaktifkan CamShift; gunakan centroid blob langsung |
+| `--no-box-filter` | off | Nonaktifkan filter bentuk blob (extent/solidity/aspect) |
+| `--no-prediction` | off | Nonaktifkan prediksi latensi + PN lead |
+| `--histogram` | off | Tampilkan histogram kalibrasi di jendela terpisah |
+| `--mask` | off | Tampilkan mask deteksi di jendela terpisah |
+| `--no-hud-pitch` | off | Sembunyikan tangga pitch pada HUD |
+| `--no-hud-yaw` | off | Sembunyikan tape yaw pada HUD |
+| `--debug` | off | Log telemetri tracking ke `tracking.csv` saat mode TRACKING |
+| `--record` | off | Rekam video beranotasi ke `tracking_<timestamp>.avi` saat mode TRACKING |
 
 ---
 
-## Keyboard Controls (during run)
+## Tombol Saat Berjalan
 
-| Key | Action |
+| Tombol | Aksi |
 |---|---|
-| `q` | Quit |
-| `r` | Reset CamShift tracker (force re-acquisition) |
+| `q` | Keluar |
+| `r` | Reset tracker (paksa re-akuisisi) |
 
 ---
 
-## HUD Overlay
+## Pipeline Deteksi
 
-| Label | Meaning |
+Saat tidak terkunci, setiap frame menjalankan tiga metode mask independen lalu memilih dengan **voting mayoritas (≥ 2 dari 3)**:
+
+| Metode | Cara Kerja |
 |---|---|
-| `CH6: <pwm> pwm` | Current RC channel 6 PWM value |
-| `Mode: TRACKING` | Aircraft is in TRACKING mode, errors are being sent |
-| `Mode: NO TARGET` | CH6 is armed but no pink target is detected |
-| `Mode: CH6 OFF` | CH6 switch is below threshold (1700 µs) |
-| `ex=±X  ey=±Y` | Normalised horizontal / vertical tracking error |
+| **Gaussian back-projection** | `calcBackProject` pada histogram kepercayaan (μ ± 3σ) |
+| **Adaptive hue threshold** | `adaptiveThreshold` blockSize=11 + LUT gerbang hue |
+| **Dual inRange** | Band core (bobot penuh) + outer (bobot setengah), menangani wrap hue |
+
+Setelah 3 deteksi berurutan, **CamShift** mengambil alih dengan filter **Kalman** untuk menghaluskan posisi dan memprediksi saat target hilang sesaat (hingga 5 frame).
+
+Lihat: [`docs/chart_01_detection.png`](docs/chart_01_detection.png) · [`docs/chart_02_detection_state.png`](docs/chart_02_detection_state.png)
+
+---
+
+## MAVLink
+
+Error tracking dikirim sebagai pesan MAVLink dari `seekerctrl.py`:
+
+| Field | Isi |
+|---|---|
+| `x` | `errorx` — error horizontal ternormalisasi [-1, 1] |
+| `y` | `errory` — error vertikal ternormalisasi [-1, 1] |
+| `z` | `0.0` |
+
+ArduPlane mengalikan x/y dengan `TRK_MAX_DEG × π/180` lalu menjalankan PID roll dan pitch.
+
+---
+
+## State Machine Mode
+
+**Mode manual** (default):
+
+| Kondisi | Aksi |
+|---|---|
+| ch6 HIGH + target terkunci | Masuk TRACKING |
+| ch6 HIGH → LOW (tepi turun) | Masuk AUTO |
+
+**Mode auto** (`--auto`):
+
+| Kondisi | Aksi |
+|---|---|
+| ch6 rendah | STABILIZE |
+| ch6 tinggi, belum dekat/wp terakhir | AUTO (ikuti misi) |
+| ch6 tinggi, < 700 m, wp terakhir, terkunci | TRACKING |
+| ch6 tinggi → rendah | STABILIZE |
+
+Lihat: [`docs/chart_02_mode_state.png`](docs/chart_02_mode_state.png) · [`docs/chart_03_tracking_logic.png`](docs/chart_03_tracking_logic.png)
+
+---
+
+## Overlay HUD
+
+| Label | Sumber |
+|---|---|
+| `MODE` | Mode terbang dari HEARTBEAT |
+| `LOCK: ON / OFF / NO TARGET` | Status ch6 dan tracking |
+| `v` / `h` / `thr` | Airspeed (km/jam), ketinggian relatif (m), throttle (%) |
+| `FPS` | Frame rate rata-rata 30 frame |
+| `ex` / `ey` | Error yang diprediksi (setelah PN lead) saat terkunci |
+| Tape yaw | Kompas horizontal dari ATTITUDE yaw |
+| Tangga pitch | Sudut pitch dari ATTITUDE |
+
+---
+
+## File
+
+| File | Keterangan |
+|---|---|
+| `seeker.py` | Kelas `Seeker` — tangkapan background thread, deteksi warna, CamShift + Kalman, `error_xy()` |
+| `seekerctrl.py` | Kelas `SeekerCtrl` — koneksi MAVLink, polling RC, state machine mode, prediksi PN lead, loop utama |
+| `main.py` | Entry point — parsing argumen CLI |
+| `calibrate_color.py` | Alat kalibrasi warna — simpan `color_histogram.txt` |
+| `hud_display.py` | Overlay HUD — tape yaw, tangga pitch, indikator roll |
+| `joystick_handler.py` | Handler joystick (opsional) |
+| `tracking_analyse.py` | Analisis CSV log tracking |
+| `pid_analyser.py` | Analisis respons PID dari CSV |
+| `terminal_analyse.py` | Analisis fase terminal dari CSV |
+| `test_camera.py` | Uji tangkapan kamera |
+| `test_detect_color.py` | Uji pipeline deteksi warna |

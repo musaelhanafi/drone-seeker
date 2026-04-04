@@ -18,6 +18,6 @@ flowchart TD
     TEL --> CSV[Logger CSV\nsaat --debug]
 
     SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / AUTO| FC
-    SM -->|DEBUG_VECT x y\nsaat tracking + terkunci| FC
+    SM -->|error tracking x y\nsaat tracking + terkunci| FC
     SM --> HUD
     SM --> CSV
