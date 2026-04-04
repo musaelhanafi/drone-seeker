@@ -1,0 +1,23 @@
+flowchart TD
+    A[Frame Kamera] --> B[BGR → HSV]
+    B --> LK{Terkunci?\n_detect_count ≥ 3}
+
+    LK -- Ya --> D3F[mask3 saja\nDual inRange\nband core + outer]
+    D3F --> MCF[MORPH_CLOSE 3×3\njalur cepat]
+    MCF --> BLF[findContours → blob terbaik terfilter bentuk]
+    BLF --> OUT[Persegi Pembatas\nx  y  w  h]
+
+    LK -- Tidak\nAkuisisi --> C[GaussianBlur kanal H 5×5]
+    B --> D3
+
+    C --> D1[mask1\nBack-projection Gaussian\ncalcBackProject pada conf_hist]
+    C --> D2[mask2\nThreshold Hue Adaptif\nadaptiveThreshold blockSize=11\n+ hue_gate_lut]
+    B --> D3[mask3\nDual inRange\nband core bobot penuh\nband outer bobot setengah]
+
+    D1 --> V{Voting Mayoritas\n≥ 2 dari 3}
+    D2 --> V
+    D3 --> V
+
+    V --> MC[MORPH_CLOSE 3×3 elips\ntutup celah, kurangi noise]
+    MC --> BL[findContours → blob terbaik terfilter bentuk\nskor solidity × extent × area]
+    BL --> OUT

@@ -1,0 +1,20 @@
+flowchart TD
+    UPDATE["update()\ntiap loop ~50 Hz"]
+
+    DB1{errorx dalam\ndeadband?}
+    ROLL_DAMP["Redaman roll gyro\nnav_roll_cd = -laju × 50"]
+    ROLL_PID["PID Roll\nnav_roll_cd = PID(errorx_deg)"]
+
+    DB2{errory dalam\ndeadband?}
+    PITCH_ZERO["nav_pitch_cd = 0"]
+    PITCH_PID["PID Pitch\nnav_pitch_cd = PID(errory_deg - offset)"]
+
+    UPDATE --> DB1
+    DB1 -- ya    --> ROLL_DAMP
+    DB1 -- tidak --> ROLL_PID
+
+    ROLL_DAMP --> DB2
+    ROLL_PID  --> DB2
+
+    DB2 -- ya    --> PITCH_ZERO
+    DB2 -- tidak --> PITCH_PID

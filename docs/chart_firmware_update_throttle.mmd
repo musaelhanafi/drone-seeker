@@ -1,0 +1,36 @@
+flowchart TD
+    UPDATE["update()  ~50 Hz"]
+
+    TO{Timeout sinyal?}
+
+    ZERO["nav_roll_cd = 0\nnav_pitch_cd = 0\nramp = 0\nReset KF"]
+    LIVE["Sinyal aktif\nRamp settle 0→1"]
+
+    ROLL["PID Roll → nav_roll_cd"]
+    PITCH["PID Pitch\n- TRK_PITCH_OFFSET\n- TRK_TERM_PTCH jika terminal"]
+
+    KF_IN["pitch_err = ahrs.pitch - nav_pitch_rad"]
+
+    KF{KF diinisialisasi?}
+    KF_SEED["Inisialisasi KF\nx = pitch_err, laju = 0"]
+    KF_RUN["KF Prediksi + Perbarui\nx = pitch_err, laju_pitch_err"]
+
+    LEAD["pitch_err_pred = x[0] + x[1] × TRK_THR_LEAD"]
+
+    THR_PID["PID Throttle\npid_out = PID(pitch_err_pred)\n× ramp"]
+
+    CLAMP["throttle = constrain(\ncruise + pid_out,\ncruise/2, cruise)"]
+
+    OUT["SRV_Channels throttle"]
+
+    UPDATE --> TO
+    TO -- ya    --> ZERO --> OUT
+    TO -- tidak --> LIVE
+
+    LIVE --> ROLL --> PITCH
+
+    PITCH --> KF_IN --> KF
+    KF -- pertama kali --> KF_SEED --> LEAD
+    KF -- sudah --> KF_RUN --> LEAD
+
+    LEAD --> THR_PID --> CLAMP --> OUT

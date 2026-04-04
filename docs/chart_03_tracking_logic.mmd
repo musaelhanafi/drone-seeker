@@ -1,0 +1,113 @@
+---
+title: Logika Kontrol Tracking — auto_mode=True, loop per-frame
+---
+flowchart TD
+    START(["`**Mulai loop frame**`"])
+
+    START --> READ["`Jalankan tracker seeker.py
+    CamShift + filter Kalman
+    → cx, cy`"]
+
+    READ --> KFPRED{"`seeker hilang?
+    _(cx adalah None)_`"}
+
+    KFPRED -- "`miss_count < 5
+    Kalman prediksi saja`" --> KF_HOLD["`Kembalikan cx, cy terprediksi
+    target_locked = **True**
+    miss_count++`"]
+    KFPRED -- "`miss_count ≥ 5`" --> KF_RESET["`Reset tracker penuh
+    target_locked = **False**`"]
+    KFPRED -- "`Lacak OK`" --> KF_OK["`Perbarui filter Kalman
+    target_locked = **True**
+    miss_count = 0`"]
+
+    KF_HOLD --> POLL
+    KF_RESET --> POLL
+    KF_OK --> POLL
+
+    POLL["`Poll RC / telemetri MAVLink`"]
+    POLL --> CH6{ch6?}
+
+    CH6 -- "`TINGGI → RENDAH
+    _(tepi turun)_`" --> FELL["`_in_tracking = False
+    Set **STABILIZE**`"]
+
+    CH6 -- "RENDAH stabil" --> SET_STAB_LOW["`Set **STABILIZE**`"]
+
+    CH6 -- "TINGGI stabil" --> WPCHECK{"`cukup_dekat < 700 m
+    DAN wp_terakhir
+    DAN target_terkunci
+    DAN BUKAN _in_tracking?`"}
+
+    WPCHECK -- Ya --> ENTER_TRACK["`Set **TRACKING**
+    _in_tracking = True
+    entry_count++`"]
+
+    WPCHECK -- Tidak --> IN_TRACK{_in_tracking?}
+
+    IN_TRACK -- Tidak --> SET_AUTO_MISSION["`Set **AUTO**
+    _(ikuti misi)_`"]
+
+    IN_TRACK -- Ya --> SKIP[ ]
+
+    FELL          --> FEED
+    SET_STAB_LOW  --> FEED
+    ENTER_TRACK   --> FEED
+    SET_AUTO_MISSION --> FEED
+    SKIP          --> FEED
+
+    FEED{"`_in_tracking
+    DAN mode == TRACKING?`"}
+
+    FEED -- Tidak --> ANNOTATE
+    FEED -- Ya --> TGT{target_terkunci?}
+
+    TGT -- Ya --> PN["`Terapkan prediksi PN lead
+    simpan last_errorx, last_errory
+    lost_count = 0`"]
+
+    PN --> SEND_ERR["`Kirim DEBUG_VECT
+    _(errorx, errory)_
+    Log baris CSV`"]
+
+    SEND_ERR --> TERM{"`in_terminal?
+    alt_rel_m ≤ TRK_TERM_ALT`"}
+    TERM -- Ya --> LOG_T["`Log terminal = 1`"]
+    TERM -- Tidak  --> LOG_N["`Log terminal = 0`"]
+
+    TGT -- Tidak --> LOSTCNT["`lost_count++
+    committed = entry_count ≥ 3
+    batas = 30 jika committed, 10 jika tidak`"]
+
+    LOSTCNT --> LOSTLIM{"`lost_count ≥ batas?`"}
+    LOSTLIM -- Ya --> FORCE_AUTO["`lost_count = 0
+    _in_tracking = False
+    Set **AUTO**`"]
+
+    LOSTLIM -- Tidak --> COMMITTED{committed?}
+    COMMITTED -- Ya --> SEND_LAST["`Kirim last_errorx, last_errory
+    _(tahan arah terakhir diketahui)_`"]
+    COMMITTED -- Tidak  --> SEND_ZERO["`Kirim 0.0, 0.0
+    _(sayap rata)_`"]
+
+    LOG_T        --> ANNOTATE
+    LOG_N        --> ANNOTATE
+    FORCE_AUTO   --> ANNOTATE
+    SEND_LAST    --> ANNOTATE
+    SEND_ZERO    --> ANNOTATE
+
+    ANNOTATE(["`Gambar HUD + tampilkan frame`"])
+    ANNOTATE --> START
+
+    %% ── style ────────────────────────────────────────────────────────────────
+    classDef modeCmd    fill:#1a6fb5,color:#fff,stroke:#0d4a80,font-weight:bold
+    classDef decision   fill:#f0c040,color:#222,stroke:#b89000
+    classDef action     fill:#2d8a4e,color:#fff,stroke:#1a5c33
+    classDef term_node  fill:#c0392b,color:#fff,stroke:#922b21,font-weight:bold
+    classDef endpoint   fill:#555,color:#fff,stroke:#333
+
+    class FELL,SET_STAB_LOW,SET_AUTO_MISSION,ENTER_TRACK,FORCE_AUTO modeCmd
+    class CH6,WPCHECK,IN_TRACK,FEED,TGT,LOSTLIM,COMMITTED,TERM,KFPRED decision
+    class PN,SEND_ERR,SEND_LAST,SEND_ZERO,LOG_T,LOG_N,LOSTCNT action
+    class LOG_T,TERM term_node
+    class START,ANNOTATE endpoint

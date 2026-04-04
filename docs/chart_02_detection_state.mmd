@@ -1,0 +1,16 @@
+stateDiagram-v2
+    [*] --> Mencari
+
+    Mencari --> Mencari    : tidak ada blob / _detect_count = 0
+    Mencari --> Menghitung : blob terdeteksi / _detect_count = 1
+
+    Menghitung --> Menghitung : blob terdeteksi / _detect_count < 3
+    Menghitung --> Melacak    : blob terdeteksi / _detect_count == 3
+    Menghitung --> Mencari    : tidak ada blob / _detect_count = 0
+
+    Melacak --> Melacak      : CamShift OK, Kalman diperbarui, miss_count = 0
+    Melacak --> Memprediksi  : CamShift gagal (collapse/explosion/density)
+
+    Memprediksi --> Memprediksi : CamShift gagal, miss_count < 5, Kalman prediksi saja
+    Memprediksi --> Melacak     : CamShift pulih, miss_count = 0
+    Memprediksi --> Mencari     : miss_count >= 5, reset penuh

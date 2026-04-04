@@ -69,7 +69,7 @@ def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
 
 ### 2.2 Histogram Kepercayaan (`_confidence_hist`)
 
-Nolkan setiap bin yang jarak sirkularnya dari μ melebihi **2.5 σ**:
+Nolkan setiap bin yang jarak sirkularnya dari μ melebihi **3.0 σ**:
 
 ```python
 def _confidence_hist(hist: np.ndarray, mean: float, std: float) -> np.ndarray:
@@ -81,7 +81,7 @@ def _confidence_hist(hist: np.ndarray, mean: float, std: float) -> np.ndarray:
     return conf.reshape(hist.shape)
 ```
 
-Hanya nilai hue yang benar-benar milik target (dalam 2.5 standar deviasi) yang berkontribusi pada deteksi. Histogram ini digunakan untuk semua back-projection di tahap selanjutnya.
+Hanya nilai hue yang benar-benar milik target (dalam 3.0 standar deviasi) yang berkontribusi pada deteksi. Histogram ini digunakan untuk semua back-projection di tahap selanjutnya.
 
 ---
 
@@ -89,7 +89,18 @@ Hanya nilai hue yang benar-benar milik target (dalam 2.5 standar deviasi) yang b
 
 Setiap frame menjalankan langkah-langkah berikut:
 
-### Langkah 1 — Blur Hue
+### Langkah 0 — Path Cepat Saat Terkunci
+
+Ketika tracker sudah mengunci target (`locked = True` — `_detect_count >= 3` dan `_track_win` aktif), pipeline penuh dilewati. Hanya **Metode 3 (inRange)** yang dijalankan, diikuti oleh satu operasi `MORPH_CLOSE` 3×3. Ini sekitar 3–4× lebih cepat per frame dan cukup karena target telah dikonfirmasi.
+
+```python
+if locked:
+    mask = self._mask_inrange(hsv)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kern3)
+    return mask, 1
+```
+
+### Langkah 1 — Blur Hue (jalur akuisisi)
 
 Gaussian blur 5×5 pada kanal H menekan noise hue per-piksel dari artefak JPEG, demosaicing, dan sorotan spekuler:
 
@@ -97,47 +108,44 @@ Gaussian blur 5×5 pada kanal H menekan noise hue per-piksel dari artefak JPEG, 
 h_blur = cv2.GaussianBlur(hsv[:, :, 0], (5, 5), 0)
 ```
 
+Blur ini hanya digunakan oleh Metode 1 dan 2. Metode 3 beroperasi langsung pada HSV mentah.
+
 ### Langkah 2 — Tiga Mask Independen
 
 Tiga metode masing-masing menghasilkan mask biner secara independen. Piksel **diterima bila minimal 2 dari 3 metode setuju** (voting mayoritas).
 
 #### Metode 1 — Back-projection Gaussian (`_mask_gaussian`)
 
-Memproyeksikan histogram kepercayaan kembali ke kanal hue yang diblur. Bin yang lebih dekat ke μ memiliki bobot lebih tinggi, sehingga histogram kepercayaan mengkodekan distribusi yang telah dipelajari, bukan hanya gerbang:
+Memproyeksikan histogram kepercayaan kembali ke kanal hue yang diblur. Bin yang lebih dekat ke μ memiliki bobot lebih tinggi, sehingga histogram kepercayaan mengkodekan distribusi yang telah dipelajari, bukan hanya gerbang.  Implementasi menukar channel H sementara di buffer yang sudah dialokasikan (tanpa `copy()`):
 
 ```python
 def _mask_gaussian(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
-    hsv_blur = hsv.copy()
-    hsv_blur[:, :, 0] = h_blur
-    bp     = cv2.calcBackProject([hsv_blur], [0], self._conf_hist, [0, 180], 1)
-    in_sat = (hsv[:, :, 1] >= 100) & (hsv[:, :, 1] <= 255)
-    in_val =  hsv[:, :, 2] >= 80
-    return ((bp > 0) & in_sat & in_val).astype(np.uint8) * 255
+    np.copyto(self._h_buf, hsv[:, :, 0])      # simpan H asli
+    hsv[:, :, 0] = h_blur                      # ganti sementara dengan H yang diblur
+    bp = cv2.calcBackProject([hsv], [0], self._conf_hist, [0, 180], 1)
+    hsv[:, :, 0] = self._h_buf                 # pulihkan H asli
+    sv_ok = self._apply_inrange_band(hsv, "outer")   # gerbang S/V via band precomputed
+    return cv2.bitwise_and(cv2.threshold(bp, 0, 255, cv2.THRESH_BINARY)[1], sv_ok)
 ```
 
-- **S ≥ 100**: menolak warna pink pucat/pastel — hot pink adalah warna yang cerah dan jenuh.
-- **V ≥ 80**: menolak piksel gelap.
+Gerbang S/V menggunakan `"outer"` band (μ ± 3.0σ pada S minimum 40, V minimum 40) yang sudah dihitung sekali saat inisialisasi.
 
 #### Metode 2 — Threshold Hue Adaptif (`_mask_adaptive`)
 
 Menemukan piksel yang hue-nya konsisten secara lokal, menangani iluminasi tidak merata di seluruh frame:
 
-1. Normalisasi `h_blur` ke 0–255.
-2. Terapkan `adaptiveThreshold` (blockSize=21, C=3) — setiap piksel dibandingkan dengan rata-rata berbobot Gaussian dari lingkungan 21×21-nya.
-3. Gate dengan batas jarak hue sirkular: `|jarak_sirkular(H, μ)| < 2.5 σ`.
+1. Terapkan `adaptiveThreshold` (blockSize=11, C=3) langsung pada `h_blur` — setiap piksel dibandingkan dengan rata-rata berbobot Gaussian dari lingkungan 11×11-nya. (`blockSize` diturunkan dari 21 menjadi 11 untuk separuh biaya komputasi.)
+2. Gate dengan LUT yang telah dikalkulasi: `_hue_gate_lut[h_blur]` — True di mana bin hue berada dalam ±3.0σ dari μ.
 
 ```python
 def _mask_adaptive(self, hsv: np.ndarray, h_blur: np.ndarray) -> np.ndarray:
-    h_norm   = cv2.normalize(h_blur, None, 0, 255, cv2.NORM_MINMAX)
     adapt    = cv2.adaptiveThreshold(
-        h_norm, 255,
+        h_blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=21, C=3,
+        blockSize=11, C=3,
     )
-    diff     = np.abs(h_blur.astype(np.float32) - self._gauss_mean)
-    diff     = np.minimum(diff, 180.0 - diff)            # pembungkusan sirkular
-    hue_gate = (diff < _GAUSS_SIGMA * self._gauss_std).astype(np.uint8) * 255
+    hue_gate = self._hue_gate_lut[h_blur]   # LUT precomputed: 255 dalam ±σ*std, 0 lainnya
     return cv2.bitwise_and(adapt, hue_gate)
 ```
 
@@ -145,51 +153,36 @@ Robust terhadap scene di mana satu sisi target lebih terang dari sisi lainnya.
 
 #### Metode 3 — Dual inRange (`_mask_inrange`)
 
-Membangun satu atau dua band HSV `cv2.inRange` dari `[μ − 2.5σ,  μ + 2.5σ]`. Ketika rentang melewati batas wrap hue 0/180, rentang tersebut dibagi otomatis:
+Membangun band HSV dari bounds yang sudah dikalkulasi sebelumnya (`_precomp_bands`). Rentang dibagi menjadi **core** (μ ± 1σ) dan **outer** (μ ± 3.0σ). Piksel outer-only mendapat bobot setengah (128) untuk menyampaikan keyakinan gradual — core dapat penuh (255):
 
 ```python
 def _mask_inrange(self, hsv: np.ndarray) -> np.ndarray:
-    lo_h = self._gauss_mean - _GAUSS_SIGMA * self._gauss_std
-    hi_h = self._gauss_mean + _GAUSS_SIGMA * self._gauss_std
-
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-
-    def _add_range(a, b):
-        a, b = max(0, int(a)), min(179, int(b))
-        if a <= b:
-            mask |= cv2.inRange(hsv,
-                                np.array([a, 100,  80]),
-                                np.array([b, 255, 255]))
-
-    if lo_h < 0:
-        _add_range(lo_h + 180, 179)
-        _add_range(0, hi_h)
-    elif hi_h > 179:
-        _add_range(lo_h, 179)
-        _add_range(0, hi_h - 180)
-    else:
-        _add_range(lo_h, hi_h)
-
-    return mask
+    core  = self._apply_inrange_band(hsv, "core")
+    outer = self._apply_inrange_band(hsv, "outer")
+    # piksel outer-saja mendapat bobot setengah; core tetap 255
+    cv2.subtract(outer, core, dst=outer)       # hanya sisakan outer-tapi-bukan-core
+    outer = cv2.LUT(outer, self._outer_lut)    # 255 → 128, 0 → 0
+    return cv2.bitwise_or(core, outer)
 ```
 
-Pengaman utama untuk warna yang melewati batas seperti hot pink dan magenta.
+Wrap hue (mis. hot pink melewati batas 0/179) ditangani otomatis oleh `_apply_inrange_band` yang mengeluarkan dua panggilan `cv2.inRange` dan melakukan OR jika diperlukan.
 
 ### Langkah 3 — Voting Mayoritas
 
 ```python
-votes = ((m1 > 0).astype(np.uint8) +
-         (m2 > 0).astype(np.uint8) +
-         (m3 > 0).astype(np.uint8))
-mask  = (votes >= 2).astype(np.uint8) * 255
+votes = (m1 > 0).view(np.uint8)
+votes += (m2 > 0).view(np.uint8)
+votes += (m3 > 0).view(np.uint8)
+_, mask = cv2.threshold(votes, 1, 255, cv2.THRESH_BINARY)  # ≥ 2 dari 3
 ```
 
 ### Langkah 4 — Pembersihan Morfologis
 
+Satu operasi `MORPH_CLOSE` dengan kernel 3×3 menggantikan urutan `OPEN + DILATE` sebelumnya. CLOSE lebih hemat (satu operasi vs dua) dan mengisi celah kecil dalam blob sekaligus menekan noise terisolasi:
+
 ```python
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)  # hapus noise terisolasi
-mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)  # isi celah dalam blob
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)   # tutup celah kecil dalam blob
 ```
 
 ### Fallback (tanpa file kalibrasi)
@@ -198,29 +191,68 @@ Jika tidak ada file histogram, deteksi menggunakan satu band hot-pink yang dikod
 
 | H | S | V | Keterangan |
 |---|---|---|---|
-| 150–175 | 100–255 | 80–255 | Hot pink / magenta |
+| 130–173 | 40–233 | 80–233 | Hot pink / magenta |
 
 ---
 
 ## 4. Seleksi Blob (`_nearest_blob_rect`)
 
-`cv2.findContours` mengekstrak semua kontur eksternal dari mask. **Kontur terbesar berdasarkan area** dipilih asalkan memenuhi ambang minimum:
+`cv2.findContours` mengekstrak semua kontur eksternal dari mask. Setiap kandidat diuji dengan **empat filter bentuk** sebelum dinilai:
 
-```python
-_MIN_BLOB_AREA = 50  # px²
+| Konstanta | Nilai | Peran |
+|---|---|---|
+| `_MIN_BLOB_AREA` | 20 px² | Hapus noise terlalu kecil |
+| `_MIN_DIM` | 4 px | Lebar DAN tinggi minimal (menolak garis tipis) |
+| `_MAX_ASPECT` | 6.0 | Rasio sisi panjang/pendek maksimum (menolak sliver) |
+| `_MIN_EXTENT` | 0.45 | `area_kontur / area_bbox` minimum (menolak bentuk L/U) |
+| `_MIN_SOLIDITY` | 0.60 | `area_kontur / area_convex_hull` minimum (menolak bentuk cekung) |
 
-def _nearest_blob_rect(mask: np.ndarray, frame_shape=None):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    valid = [(c, cv2.contourArea(c)) for c in contours if cv2.contourArea(c) >= _MIN_BLOB_AREA]
-    if not valid:
-        return None
-    best, _ = max(valid, key=lambda item: item[1])
-    return cv2.boundingRect(best)
+Kandidat yang lolos filter dinilai dengan:
+
+```
+skor = solidity × extent × area
 ```
 
-Mengembalikan bounding rectangle berorientasi sumbu `(x, y, w, h)`, atau `None` jika tidak ada blob valid yang ditemukan.
+Blob yang paling **kompak, terisi, dan besar** menang. Parameter opsional `prefer_pt=(px, py)` membagi skor dengan `(1 + jarak/100)` sehingga blob yang lebih dekat ke titik referensi menang pada nilai yang seri:
+
+```python
+_MIN_BLOB_AREA = 20   # px²
+_MIN_EXTENT    = 0.45
+_MIN_SOLIDITY  = 0.60
+_MIN_DIM       = 4
+_MAX_ASPECT    = 6.0
+
+def _nearest_blob_rect(mask, frame_shape=None, box_filter=True, prefer_pt=None):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_score, best_rect = -1.0, None
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < _MIN_BLOB_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        if box_filter:
+            if w < _MIN_DIM or h < _MIN_DIM:
+                continue
+            if max(w, h) / min(w, h) > _MAX_ASPECT:
+                continue
+            if area / (w * h) < _MIN_EXTENT:
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            solidity  = area / hull_area if hull_area > 0 else 0.0
+            if solidity < _MIN_SOLIDITY:
+                continue
+            score = solidity * (area / (w * h)) * area
+        else:
+            score = area
+        if prefer_pt is not None:
+            dist = ((x + w*0.5 - prefer_pt[0])**2 + (y + h*0.5 - prefer_pt[1])**2)**0.5
+            score /= (1.0 + dist / 100.0)
+        if score > best_score:
+            best_score, best_rect = score, (x, y, w, h)
+    return best_rect
+```
+
+Mengembalikan bounding rectangle berorientasi sumbu `(x, y, w, h)`, atau `None` jika tidak ada blob valid yang ditemukan. Saat `box_filter=False` (jalur re-akuisisi CamShift), hanya ambang area minimum yang diterapkan.
 
 ---
 

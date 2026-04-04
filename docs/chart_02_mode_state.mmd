@@ -1,0 +1,23 @@
+---
+title: State Machine Mode Terbang — auto_mode=True
+---
+stateDiagram-v2
+    [*] --> STABILIZE : startup / ch6 RENDAH
+
+    STABILIZE --> STABILIZE : ch6 RENDAH stabil
+
+    STABILIZE --> AUTO : ch6 naik TINGGI\nBELUM (cukup_dekat DAN wp_terakhir)
+
+    AUTO --> AUTO : ch6 TINGGI\nBELUM cukup_dekat ATAU BUKAN wp_terakhir
+
+    AUTO --> TRACKING : ch6 TINGGI\ncukup_dekat (< 700 m)\nDAN wp_terakhir\nDAN target_terkunci\nentry_count++
+
+    TRACKING --> TRACKING : _in_tracking DAN mode==TRACKING\ntarget terkunci → kirim DEBUG_VECT\ntarget hilang → tahan/level, lost_count++
+
+    TRACKING --> AUTO : target_terkunci=False\nlost_count >= batas\n(30 jika committed, 10 jika tidak)\n_in_tracking = False
+
+    TRACKING --> STABILIZE : ch6 TINGGI→RENDAH\ntepi turun\n_in_tracking = False
+
+    AUTO --> STABILIZE : ch6 TINGGI→RENDAH\ntepi turun\n_in_tracking = False
+
+    STABILIZE --> AUTO : ch6 RENDAH → TINGGI\nBELUM cukup_dekat DAN BUKAN _in_tracking

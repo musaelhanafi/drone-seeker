@@ -17,39 +17,78 @@ Deteksi saja bersifat noisy. Pencacah deteksi berurutan mengatur masuk ke tracki
 
 ```
 if blob terdeteksi frame ini:
-    _detect_count = min(_detect_count + 1, 5)
+    _detect_count = min(_detect_count + 1, 3)
     _track_win    = blob_rect
 else:
     _detect_count = 0
     _track_win    = None
 
-if _detect_count < 5:
-    return no-lock     # butuh 5 hit berurutan sebelum mengaktifkan tracker
+if _detect_count < 3:
+    return no-lock     # butuh 3 hit berurutan sebelum mengaktifkan tracker
 ```
 
-Lima deteksi berurutan harus berhasil sebelum tracker diaktifkan. Satu false-positive tidak dapat mengaktifkan tracker.
+Tiga deteksi berurutan harus berhasil sebelum tracker diaktifkan. Satu false-positive tidak dapat mengaktifkan tracker.
+
+Saat re-akuisisi (setelah lock sebelumnya hilang), pencarian blob dibatasi pada **ROI yang diperbesar di sekitar jendela terakhir yang diketahui** (`_track_win`), bukan seluruh frame. Area cari = jendela terakhir dipadding sebesar `max(tww, twh, 40)` piksel di setiap sisi. Ini mengurangi beban komputasi dan menghindari salah identifikasi blob yang jauh.
 
 ![State machine deteksi blob](chart_02_detection_state.png)
 
 ### A2. Tracking CamShift
 
-Setelah `_detect_count >= 5`, CamShift berjalan setiap frame:
+Setelah `_detect_count >= 3`, CamShift berjalan setiap frame:
 
 1. Back-project histogram kepercayaan (`_roi_hist = _conf_hist`) ke seluruh frame HSV.
-2. AND hasil back-projection dengan mask deteksi saat ini untuk menekan background.
-3. Jalankan `cv2.CamShift` dari window terakhir yang diketahui.
-4. Jika window menyusut di bawah 2×2 px, lepaskan lock dan reset counter.
+2. **Pre-translate** jendela pencarian berdasarkan kecepatan yang diprediksi Kalman, sehingga CamShift mulai dari dekat posisi target yang diharapkan.
+3. **Gate** back-projection ke jendela yang diperbesar (padding `tww/2` dan `twh/2`) — nolkan piksel di luar area — untuk menekan gangguan di luar ROI.
+4. GaussianBlur 3×3 pada back-projection untuk memperhalus permukaan probabilitas.
+5. Jalankan `cv2.CamShift` dari window terakhir yang diketahui.
+6. Klem output window ke batas frame.
+7. Validasi window: jika gagal salah satu penjaga di bawah, aktifkan `camshift_bad`.
 
 ```
-back_proj = calcBackProject(hsv, roi_hist) AND detection_mask
+back_proj = calcBackProject(hsv, roi_hist)
+back_proj  ← zeroed outside padded search window
+GaussianBlur(back_proj, 3×3)
 _, track_win = CamShift(back_proj, track_win, term_criteria)
 ```
 
 CamShift secara iteratif menggeser dan mengubah ukuran window untuk memaksimalkan probabilitas back-projection di dalamnya, menghasilkan estimasi centroid sub-piksel dan bounding box yang sadar rotasi.
 
-| Penjaga collapse | Aksi |
-|---|---|
-| `w < 2 or h < 2` | Hapus `_track_win`, reset `_detect_count = 0` |
+| Penjaga | Kondisi | Aksi |
+|---|---|---|
+| Collapse | `w < 4 or h < 4` | `camshift_bad = True` |
+| Explosion | `w > 90% lebar frame or h > 90% tinggi frame` | `camshift_bad = True` |
+| Density | `mean(back_proj dalam window) / 255 < 0.05` | `camshift_bad = True` |
+
+### A2a. Prediksi Kalman saat CamShift Gagal
+
+Ketika `camshift_bad = True` tetapi filter Kalman sudah diinisialisasi, tracker **tidak langsung mereset**. Sebagai gantinya, Kalman melakukan langkah *predict-only* (tanpa pengukuran) selama hingga `_KF_MISS_MAX = 5` frame berturut-turut:
+
+```
+miss_count < _KF_MISS_MAX:
+    (kf_x0, kf_x1) ← predict_only(kf_x0, kf_x1, Px, dt)
+    (kf_y0, kf_y1) ← predict_only(kf_y0, kf_y1, Py, dt)
+    pcx, pcy ← kf_x0, kf_y0   (posisi yang diprediksi)
+    track_win ← centred at (pcx, pcy)   (untuk re-akuisisi frame berikutnya)
+    return (out, pcx, pcy)   ← tampilan lingkaran oranye
+
+miss_count ≥ _KF_MISS_MAX:
+    hard reset: track_win = None, detect_count = 0, kf_initialized = False
+    return (out, None, None)
+```
+
+Dari perspektif `seekerctrl.py`, frame predict-only mengembalikan `cx, cy` yang valid (bukan `None`), sehingga `target_locked = True` dipertahankan selama jendela prediksi. Ini mencegah mode timeout yang tidak perlu saat target hilang sejenak (mis. karena oklusi atau glare).
+
+| Parameter KF | Nilai | Peran |
+|---|---|---|
+| `_KF_Q_POS` | 2.0 px²/s | Noise proses — posisi |
+| `_KF_Q_VEL` | 80.0 px²/s³ | Noise proses — kecepatan |
+| `_KF_R` | 30.0 px² | Noise pengukuran |
+| `_KF_MISS_MAX` | 5 frame | Frame predict-only maks sebelum hard reset |
+
+### A2b. Snap Correction
+
+Setelah CamShift berhasil, jika deteksi blob (dari mask) ditemukan dan pusat blob berbeda dari pusat CamShift lebih dari `0.5 × max(bw, bh)`, jendela tracking dikoreksi ke posisi blob. Ini mencegah CamShift "melayang" ke warna serupa di background sementara blob sebenarnya ada di tempat lain.
 
 ### A3. Perhitungan Error (`error_xy`)
 
@@ -194,9 +233,11 @@ master.mav.debug_vect_send(
 ### Normalisasi error
 
 ```
-errorx = (cx - W/2) / (W/2)    positif = target di kanan tengah
-errory = (cy - H/2) / (H/2)    positif = target di bawah tengah
+errorx =  (cx - W/2) / (W/2)    positif = target di kanan tengah
+errory = -(cy - H/2) / (H/2)    positif = target di atas tengah
 ```
+
+**Catatan tanda**: errory **dinegasikan** — koordinat gambar Y mengarah ke bawah, tapi konvensi penerbangan positif = atas. Target di atas crosshair menghasilkan `errory > 0`, yang ArduPlane terjemahkan sebagai "pitch naik untuk mendapatkan target".
 
 ### Kondisi pengiriman
 
@@ -326,19 +367,22 @@ tracking_pitch_pid.reset_I();   tracking_pitch_pid.reset_filter();
 
 ---
 
-## 8. RC Override Joystick (opsional)
+## 8. RC Transmitter dan Receiver
 
-Saat `--joystick` diteruskan, thread khusus membaca gamepad pada `joystick_rate` Hz (default 50 Hz) dan mengirim `RC_CHANNELS_OVERRIDE`:
+Pilot menggunakan **RC transmitter fisik** yang terhubung ke **RC receiver** yang dipasang di pesawat. Receiver mengirimkan sinyal kanal (PWM / SBUS) langsung ke flight controller melalui kabel hardware — tidak ada `RC_CHANNELS_OVERRIDE` dari komputer pendamping.
 
-```python
-master.mav.rc_channels_override_send(
-    target_system, target_component,
-    ch1, ch2, ch3, ch4, ch5, ch6,
-    UINT16_MAX, UINT16_MAX,   # ch7, ch8 = passthrough
-)
+```
+RC Transmitter  ──(2.4 GHz RF)──→  RC Receiver  ──(PWM/SBUS)──→  Flight Controller
 ```
 
-`UINT16_MAX` (65535) = jangan override kanal ini. Saat thread berhenti, semua kanal dilepaskan dengan mengirim 0.
+Flight controller meneruskan nilai PWM kanal sebagai pesan `RC_CHANNELS` MAVLink, yang dipoll oleh `seekerctrl.py` setiap frame untuk membaca status ch6 (saklar tracking):
+
+```python
+msg = master.recv_match(type="RC_CHANNELS", blocking=False)
+ch6_pwm = msg.chan6_raw   # dibaca dari telemetri, bukan di-override
+```
+
+Python **hanya membaca** kanal RC — tidak pernah mengirim `RC_CHANNELS_OVERRIDE`. Kontrol roll/pitch/throttle sepenuhnya ditangani oleh ArduPlane melalui PID tracking internal.
 
 ---
 

@@ -1,0 +1,14 @@
+flowchart TD
+    A[Mulai calibrate_color.py] --> B{color_histogram.txt\nada?}
+    B -- ya --> C[Muat histogram tersimpan\nfitting Gaussian μ σ]
+    B -- tidak --> D[Fallback HSV bawaan\nH 130–173 S 40–233 V 80–233]
+    C --> E[Deteksi blob dalam frame]
+    D --> E
+    E --> F{Blob ditemukan?}
+    F -- ya --> G[Akumulasi histogram hue\npada area blob]
+    F -- tidak --> E
+    G --> H{Tombol ditekan?}
+    H -- S --> I[Simpan histogram ke\ncolor_histogram.txt]
+    H -- R --> D
+    H -- lain --> E
+    I --> E

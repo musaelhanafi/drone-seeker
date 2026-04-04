@@ -1,0 +1,23 @@
+flowchart TD
+    RCTX[Pemancar RC\ninput pilot] -->|2.4 GHz RF| RCRX[Penerima RC\nPWM / SBUS]
+    RCRX -->|kanal hardware| FC
+
+    CAM[Kamera\nOpenCV] -->|frame| SK[Seeker\ndeteksi / lacak]
+    SK -->|cx cy| EXY[error_xy\nerrorx errory ∈ -1..1]
+
+    EXY -->|error mentah| PRED[Prediktor Latensi\n+ PN lead]
+    PRED -->|error terprediksi| SM[State Machine Mode\ndeteksi tepi ch6]
+
+    FC[Flight Controller\npymavlink] -->|telemetri RC_CHANNELS| SM
+    FC -->|HEARTBEAT  mode terbang| SM
+    FC -->|ATTITUDE roll pitch yaw| TEL[Polling Telemetri]
+    FC -->|GLOBAL_POSITION_INT lat lon alt| TEL
+    FC -->|VFR_HUD airspeed throttle| TEL
+
+    TEL --> HUD[HudDisplay\ntape yaw · tangga pitch · roll]
+    TEL --> CSV[Logger CSV\nsaat --debug]
+
+    SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / AUTO| FC
+    SM -->|DEBUG_VECT x y\nsaat tracking + terkunci| FC
+    SM --> HUD
+    SM --> CSV
