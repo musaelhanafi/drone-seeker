@@ -1,23 +1,40 @@
 ---
-title: State Machine Mode Terbang — auto_mode=True
+title: State Machine Mode Terbang
 ---
 stateDiagram-v2
-    [*] --> STABILIZE : startup / ch6 RENDAH
 
-    STABILIZE --> STABILIZE : ch6 RENDAH stabil
+    %% ── Rule 1: auto_mode=True, joystick ON ─────────────────────────────────
+    state "Rule 1 — auto=True, joystick ON" as R1 {
+        [*]    --> STAB1    : startup / ch6 RENDAH
+        STAB1  --> AUTO1    : ch6 TINGGI\nBELUM kondisi TRACKING
+        AUTO1  --> STAB1    : ch6 TINGGI→RENDAH (tepi turun)
+        STAB1  --> TRACK1   : cukup_dekat < 1000 m\nDAN wp_terakhir\nDAN target_terkunci
+        AUTO1  --> TRACK1   : cukup_dekat < 1000 m\nDAN wp_terakhir\nDAN target_terkunci
+        TRACK1 --> TRACK1   : kirim error / tahan arah terakhir
+        TRACK1 --> AUTO1    : lost_count ≥ batas\n_in_tracking = False
+        TRACK1 --> STAB1    : ch6 TINGGI→RENDAH (tepi turun)
+        STAB1  : STABILIZE
+        AUTO1  : AUTO
+        TRACK1 : TRACKING
+    }
 
-    STABILIZE --> AUTO : ch6 naik TINGGI<br/>BELUM (cukup_dekat DAN wp_terakhir)
+    %% ── Rule 2: auto_mode=True, joystick OFF ────────────────────────────────
+    state "Rule 2 — auto=True, joystick OFF" as R2 {
+        [*]    --> AUTO2    : startup (ch6 diabaikan)
+        AUTO2  --> TRACK2   : cukup_dekat < 1000 m\nDAN wp_terakhir\nDAN target_terkunci
+        TRACK2 --> TRACK2   : kirim error / tahan arah terakhir
+        TRACK2 --> AUTO2    : lost_count ≥ batas\n_in_tracking = False
+        AUTO2  : AUTO
+        TRACK2 : TRACKING
+    }
 
-    AUTO --> AUTO : ch6 TINGGI<br/>BELUM cukup_dekat ATAU BUKAN wp_terakhir
-
-    AUTO --> TRACKING : ch6 TINGGI<br/>cukup_dekat (< 700 m)<br/>DAN wp_terakhir<br/>DAN target_terkunci<br/>entry_count++
-
-    TRACKING --> TRACKING : _in_tracking DAN mode==TRACKING<br/>target terkunci → kirim error tracking<br/>target hilang → tahan/level, lost_count++
-
-    TRACKING --> AUTO : target_terkunci=False<br/>lost_count >= batas<br/>(30 jika committed, 10 jika tidak)<br/>_in_tracking = False
-
-    TRACKING --> STABILIZE : ch6 TINGGI→RENDAH<br/>tepi turun<br/>_in_tracking = False
-
-    AUTO --> STABILIZE : ch6 TINGGI→RENDAH<br/>tepi turun<br/>_in_tracking = False
-
-    STABILIZE --> AUTO : ch6 RENDAH → TINGGI<br/>BELUM cukup_dekat DAN BUKAN _in_tracking
+    %% ── Rule 3: auto_mode=False ─────────────────────────────────────────────
+    state "Rule 3 — auto=False (ch6 gerbang TRACKING)" as R3 {
+        [*]    --> FREE3
+        FREE3  --> TRACK3   : ch6 TINGGI\n+ target_terkunci
+        TRACK3 --> TRACK3   : kirim error / tahan arah terakhir
+        TRACK3 --> FREE3    : ch6 TINGGI→RENDAH (tepi turun)
+        TRACK3 --> FREE3    : lost_count ≥ batas\n_in_tracking = False
+        FREE3  : (mode bebas — tidak diubah)
+        TRACK3 : TRACKING
+    }

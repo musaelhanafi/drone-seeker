@@ -1,11 +1,12 @@
 ---
-title: Logika Kontrol Tracking — auto_mode=True, loop per-frame
+title: Logika Kontrol Tracking — loop per-frame
 ---
 flowchart TD
     START(["`**Mulai loop frame**`"])
 
-    START --> READ["`Jalankan tracker seeker.py
-    CamShift + filter Kalman
+    START --> READ["`Jalankan tracker aktif
+    CamShift / MeanShift / MIL / CSRT /
+    DaSiamRPN / Nano / ViT + filter Kalman
     → cx, cy`"]
 
     READ --> KFPRED{"`seeker track?
@@ -26,36 +27,50 @@ flowchart TD
     KF_OK --> POLL
 
     POLL["`Poll RC / telemetri MAVLink`"]
-    POLL --> CH6{ch6?}
+    POLL --> AUTOMODE{auto_mode?}
 
-    CH6 -- "`TINGGI → RENDAH
-    _(tepi turun)_`" --> FELL["`_in_tracking = False
-    Set **STABILIZE**`"]
+    %% ── Rule 3: auto_mode = False ────────────────────────────────────────────
+    AUTOMODE -- Tidak --> CH6_R3{ch6?}
 
-    CH6 -- "RENDAH stabil" --> SET_STAB_LOW["`Set **STABILIZE**`"]
+    CH6_R3 -- "`TINGGI → RENDAH
+    _(tepi turun)_`" --> FELL_R3["`_in_tracking = False
+    Set **AUTO**`"]
 
-    CH6 -- "TINGGI stabil" --> WPCHECK{"`cukup_dekat < 700 m
+    CH6_R3 -- "RENDAH / stabil" --> SKIP_R3[ ]
+
+    CH6_R3 -- "`TINGGI + target_terkunci
+    + BUKAN _in_tracking`" --> ENTER_R3["`Set **TRACKING**
+    _in_tracking = True`"]
+
+    FELL_R3    --> FEED
+    SKIP_R3    --> FEED
+    ENTER_R3   --> FEED
+
+    %% ── Rule 1 & 2: auto_mode = True ────────────────────────────────────────
+    AUTOMODE -- Ya --> WPCHECK{"`cukup_dekat < 1000 m
     DAN wp_terakhir
     DAN target_terkunci
     DAN BUKAN _in_tracking?`"}
 
-    WPCHECK -- Ya --> ENTER_TRACK["`Set **TRACKING**
-    _in_tracking = True
-    entry_count++`"]
+    WPCHECK -- Ya --> ENTER_AUTO["`Set **TRACKING**
+    _in_tracking = True`"]
 
-    WPCHECK -- Tidak --> IN_TRACK{_in_tracking?}
+    WPCHECK -- Tidak --> JOYCHECK{joystick ON?}
 
-    IN_TRACK -- Tidak --> SET_AUTO_MISSION["`Set **AUTO**
-    _(ikuti misi)_`"]
+    JOYCHECK -- "`Ya (Rule 1)
+    ch6 RENDAH`" --> SET_STAB["`Set **STABILIZE**`"]
 
-    IN_TRACK -- Ya --> SKIP[ ]
+    JOYCHECK -- "`Ya (Rule 1)
+    ch6 TINGGI`" --> SET_AUTO["`Set **AUTO**`"]
 
-    FELL          --> FEED
-    SET_STAB_LOW  --> FEED
-    ENTER_TRACK   --> FEED
-    SET_AUTO_MISSION --> FEED
-    SKIP          --> FEED
+    JOYCHECK -- "`Tidak (Rule 2)
+    (ch6 diabaikan)`" --> SET_AUTO
 
+    ENTER_AUTO --> FEED
+    SET_STAB   --> FEED
+    SET_AUTO   --> FEED
+
+    %% ── Feed tracking error ──────────────────────────────────────────────────
     FEED{"`_in_tracking
     DAN mode == TRACKING?`"}
 
@@ -106,8 +121,8 @@ flowchart TD
     classDef term_node  fill:#c0392b,color:#fff,stroke:#922b21,font-weight:bold
     classDef endpoint   fill:#555,color:#fff,stroke:#333
 
-    class FELL,SET_STAB_LOW,SET_AUTO_MISSION,ENTER_TRACK,FORCE_AUTO modeCmd
-    class CH6,WPCHECK,IN_TRACK,FEED,TGT,LOSTLIM,COMMITTED,TERM,KFPRED decision
+    class FELL_R3,SET_STAB,SET_AUTO,ENTER_AUTO,ENTER_R3,FORCE_AUTO modeCmd
+    class AUTOMODE,CH6_R3,WPCHECK,JOYCHECK,FEED,TGT,LOSTLIM,COMMITTED,TERM,KFPRED decision
     class PN,SEND_ERR,SEND_LAST,SEND_ZERO,LOG_T,LOG_N,LOSTCNT action
     class LOG_T,TERM term_node
     class START,ANNOTATE endpoint

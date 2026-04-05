@@ -2,11 +2,13 @@ flowchart TD
     RCTX[Pemancar RC\ninput pilot] -->|2.4 GHz RF| RCRX[Penerima RC\nPWM / SBUS]
     RCRX -->|kanal hardware| FC
 
-    CAM[Kamera\nOpenCV] -->|frame| SK[Seeker\ndeteksi / lacak]
+    JOY[Joystick USB\nopsional] -->|RC_CHANNELS_OVERRIDE\nmelalui MAVLink| FC
+
+    CAM[Kamera\nOpenCV] -->|frame| SK[Seeker\ndeteksi / lacak\nCamShift · MeanShift · MIL · CSRT\nDaSiamRPN · Nano · ViT · Kalman]
     SK -->|cx cy| EXY[error_xy\nerrorx errory ∈ -1..1]
 
     EXY -->|error mentah| PRED[Prediktor Latensi\n+ PN lead]
-    PRED -->|error terprediksi| SM[State Machine Mode\ndeteksi tepi ch6]
+    PRED -->|error terprediksi| SM[State Machine Mode\nRule 1/2/3 · deteksi tepi ch6]
 
     FC[Flight Controller\npymavlink] -->|telemetri RC_CHANNELS| SM
     FC -->|HEARTBEAT  mode terbang| SM
@@ -17,7 +19,7 @@ flowchart TD
     TEL --> HUD[HudDisplay\ntape yaw · tangga pitch · roll]
     TEL --> CSV[Logger CSV\nsaat --debug]
 
-    SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / AUTO| FC
+    SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / AUTO / STABILIZE| FC
     SM -->|error tracking x y\nsaat tracking + terkunci| FC
     SM --> HUD
     SM --> CSV

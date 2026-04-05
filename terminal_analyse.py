@@ -65,8 +65,8 @@ def find_first_lock(d: dict) -> int | None:
     return int(idx[0]) if len(idx) > 0 else None
 
 
-def find_lowest_alt(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
-    """Return (row_index, timestamp) of minimum alt_rel_m during terminal phase.
+def _find_min_col(d: dict, col: str, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
+    """Return (row_index, timestamp) of minimum *col* during terminal phase.
 
     Searches only within rows where terminal==1.  Falls back to the global
     minimum if there is no terminal phase in the data.
@@ -74,17 +74,27 @@ def find_lowest_alt(d: dict, t_entry: float | None) -> tuple[int, float] | tuple
     if t_entry is not None:
         term_idx = np.where(d["terminal"] == 1.0)[0]
         if len(term_idx) > 0:
-            min_local = int(np.nanargmin(d["alt_rel_m"][term_idx]))
+            min_local  = int(np.nanargmin(d[col][term_idx]))
             global_idx = int(term_idx[min_local])
             return global_idx, float(d["timestamp_s"][global_idx])
     # fallback: global minimum
-    idx = int(np.nanargmin(d["alt_rel_m"]))
+    idx = int(np.nanargmin(d[col]))
     return idx, float(d["timestamp_s"][idx])
+
+
+def find_lowest_alt(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
+    """Return (row_index, timestamp) of minimum alt_rel_m during terminal phase."""
+    return _find_min_col(d, "alt_rel_m", t_entry)
+
+
+def find_nearest_dist(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
+    """Return (row_index, timestamp) of minimum dist_m (3-D slant distance) during terminal phase."""
+    return _find_min_col(d, "dist_m", t_entry)
 
 
 
 def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
-                  lowest_idx: int | None = None):
+                  lowest_idx: int | None = None, nearest_idx: int | None = None):
     n       = len(d["timestamp_s"])
     t0, t1  = d["timestamp_s"][0], d["timestamp_s"][-1]
     dur     = t1 - t0
@@ -146,7 +156,42 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
             print(f"\n  ── Last logged frame ──")
             print(f"  Alt             : {alt_t[-1]:.1f} m")
             print(f"  Distance        : {last_dist:.1f} m")
-    else:
+
+    # ── Lowest altitude ───────────────────────────────────────────────────────
+    if lowest_idx is not None:
+        lo_t    = d["timestamp_s"][lowest_idx]
+        lo_alt  = d["alt_rel_m"][lowest_idx]
+        lo_spd  = d["airspeed_ms"][lowest_idx]
+        lo_dist = d["dist_m"][lowest_idx]
+        lo_ex   = d["errorx"][lowest_idx]
+        lo_ey   = d["errory"][lowest_idx]
+        print(f"\n  ── Lowest altitude ──  (magenta line)")
+        print(f"  Time            : t+{lo_t - t0:.1f} s")
+        print(f"  Alt above target: {lo_alt:.1f} m")
+        print(f"  Speed           : {lo_spd * 3.6:.1f} km/h")
+        if np.isfinite(lo_dist):
+            print(f"  Distance        : {lo_dist:.1f} m")
+        if np.isfinite(lo_ex) and np.isfinite(lo_ey):
+            print(f"  errorx / errory : {lo_ex:+.3f} / {lo_ey:+.3f}")
+
+    # ── Nearest distance ──────────────────────────────────────────────────────
+    if nearest_idx is not None:
+        nr_t    = d["timestamp_s"][nearest_idx]
+        nr_alt  = d["alt_rel_m"][nearest_idx]
+        nr_spd  = d["airspeed_ms"][nearest_idx]
+        nr_dist = d["dist_m"][nearest_idx]
+        nr_ex   = d["errorx"][nearest_idx]
+        nr_ey   = d["errory"][nearest_idx]
+        print(f"\n  ── Nearest distance ──  (cyan line)")
+        print(f"  Time            : t+{nr_t - t0:.1f} s")
+        print(f"  Alt above target: {nr_alt:.1f} m")
+        print(f"  Speed           : {nr_spd * 3.6:.1f} km/h")
+        if np.isfinite(nr_dist):
+            print(f"  Distance        : {nr_dist:.1f} m")
+        if np.isfinite(nr_ex) and np.isfinite(nr_ey):
+            print(f"  errorx / errory : {nr_ex:+.3f} / {nr_ey:+.3f}")
+
+    if t_entry is None:
         print("\n  No terminal phase data (terminal column all 0).")
         print("  Set _TRK_TERM_ALT > 0 in seekerctrl.py and re-fly.")
     print(f"{'─'*55}\n")
@@ -166,37 +211,33 @@ def main():
 
     t_entry        = find_terminal_entry(d)
     first_lock_idx = find_first_lock(d)
-    print_summary(d, t_entry, first_lock_idx)
+    lowest_idx,  t_lowest  = find_lowest_alt(d,   t_entry)
+    nearest_idx, t_nearest = find_nearest_dist(d, t_entry)
+    print_summary(d, t_entry, first_lock_idx, lowest_idx, nearest_idx)
 
-    # ── Select window: PRE_TERMINAL_S before entry through end ────────────────
+    # ── Select window: PRE_TERMINAL_S before entry through later of both minima
     t0_full = d["timestamp_s"][0]
     if t_entry is not None:
         t_window_start = t_entry - PRE_TERMINAL_S
     else:
         t_window_start = t0_full
 
-    mask = d["timestamp_s"] >= t_window_start
+    candidates   = [v for v in (t_lowest, t_nearest) if v is not None]
+    t_window_end = max(candidates) if candidates else d["timestamp_s"][-1]
+    mask = (d["timestamp_s"] >= t_window_start) & (d["timestamp_s"] <= t_window_end)
     t    = d["timestamp_s"][mask] - t0_full   # normalise to zero
 
     def s(key):
         return d[key][mask]
 
-    t_entry_rel = (t_entry - t0_full) if t_entry is not None else None
+    t_entry_rel   = (t_entry   - t0_full) if t_entry   is not None else None
+    t_lowest_rel  = (t_lowest  - t0_full) if t_lowest  is not None else None
+    t_nearest_rel = (t_nearest - t0_full) if t_nearest is not None else None
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10))
     fig.suptitle(f"Terminal Phase Analysis — {path}", fontsize=13)
     gs  = gridspec.GridSpec(4, 1, hspace=0.45)
-
-    def vline(ax):
-        if t_entry_rel is not None:
-            ax.axvline(t_entry_rel - (t_entry - t_entry), color="red",
-                       linewidth=1.2, linestyle="--", label="terminal entry")
-
-    def _vline(ax, t_ref):
-        if t_entry_rel is not None:
-            ax.axvline(t_entry_rel, color="red",
-                       linewidth=1.2, linestyle="--", label="terminal entry")
 
     # ── Panel 1: altitude, airspeed, throttle ─────────────────────────────────
     ax1  = fig.add_subplot(gs[0])
@@ -209,6 +250,10 @@ def main():
     ax1c.plot(t, s("throttle_pct"),color="tab:green",   label="throttle (%)",   linestyle=":")
     if t_entry_rel is not None:
         ax1.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--", label="terminal entry")
+    if t_lowest_rel is not None:
+        ax1.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":", label="lowest alt")
+    if t_nearest_rel is not None:
+        ax1.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":", label="nearest dist")
     ax1.set_ylabel("alt rel (m)");  ax1b.set_ylabel("speed (km/h)");  ax1c.set_ylabel("throttle (%)")
     ax1.set_title("Altitude / Airspeed / Throttle")
     lines = (ax1.get_legend_handles_labels()[0] +
@@ -227,6 +272,10 @@ def main():
     ax2.axhline(0, color="grey", linewidth=0.5, linestyle="--")
     if t_entry_rel is not None:
         ax2.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
+    if t_lowest_rel is not None:
+        ax2.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":")
+    if t_nearest_rel is not None:
+        ax2.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":")
     # shade locked / unlocked
     locked = s("target_locked")
     for i in range(len(t) - 1):
@@ -245,6 +294,10 @@ def main():
     ax3.axhline(0, color="grey", linewidth=0.5, linestyle="--")
     if t_entry_rel is not None:
         ax3.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
+    if t_lowest_rel is not None:
+        ax3.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":")
+    if t_nearest_rel is not None:
+        ax3.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":")
     ax3.set_ylabel("degrees")
     ax3.set_title("Aircraft Attitude")
     ax3.legend(fontsize=7, loc="upper right")
@@ -257,6 +310,10 @@ def main():
     ax4.axhline(0, color="grey", linewidth=0.5, linestyle="--")
     if t_entry_rel is not None:
         ax4.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
+    if t_lowest_rel is not None:
+        ax4.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":", label="lowest alt")
+    if t_nearest_rel is not None:
+        ax4.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":", label="nearest dist")
     ax4.set_ylabel("normalised")
     ax4.set_xlabel("time (s)")
     ax4.set_title("Control Surfaces (elevon demix)")

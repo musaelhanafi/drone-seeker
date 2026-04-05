@@ -406,7 +406,7 @@ class SeekerCtrl:
             f"{self._nav_pitch_deg:.3f}",
             "1" if target_locked else "0",
             "1" if terminal else "0",
-            f"{math.sqrt(self._dist_to_target_m()**2 + (self._alt_msl_m - self._target_alt_msl)**2):.1f}",
+            f"{self._dist_to_target_m():.1f}",
         ])
 
     # ── Video recorder ────────────────────────────────────────────────────────
