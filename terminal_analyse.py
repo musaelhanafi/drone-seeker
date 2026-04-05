@@ -65,8 +65,26 @@ def find_first_lock(d: dict) -> int | None:
     return int(idx[0]) if len(idx) > 0 else None
 
 
+def find_lowest_alt(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
+    """Return (row_index, timestamp) of minimum alt_rel_m during terminal phase.
 
-def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
+    Searches only within rows where terminal==1.  Falls back to the global
+    minimum if there is no terminal phase in the data.
+    """
+    if t_entry is not None:
+        term_idx = np.where(d["terminal"] == 1.0)[0]
+        if len(term_idx) > 0:
+            min_local = int(np.nanargmin(d["alt_rel_m"][term_idx]))
+            global_idx = int(term_idx[min_local])
+            return global_idx, float(d["timestamp_s"][global_idx])
+    # fallback: global minimum
+    idx = int(np.nanargmin(d["alt_rel_m"]))
+    return idx, float(d["timestamp_s"][idx])
+
+
+
+def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
+                  lowest_idx: int | None = None):
     n       = len(d["timestamp_s"])
     t0, t1  = d["timestamp_s"][0], d["timestamp_s"][-1]
     dur     = t1 - t0

@@ -2,6 +2,54 @@ import argparse
 
 from seekerctrl import SeekerCtrl
 
+_APPEARANCE_TRACKERS = {"mil", "csrt", "dasiamrpn", "nano", "vit"}
+_SHIFT_ALGOS         = {"camshift", "meanshift"}
+
+
+def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
+    """Parse '--tracker' value into (use_camshift, shift_algo, use_kalman, tracker_name).
+
+    Tokens (comma-separated):
+      camshift / meanshift  — shift-based tracker variant (mutually exclusive)
+      kalman                — enable Kalman filter
+      mil, csrt, dasiamrpn, nano, vit — appearance tracker (mutually exclusive with shift)
+    Examples:
+      camshift,kalman   → CamShift + Kalman  (default)
+      camshift          → CamShift, no Kalman
+      meanshift         → MeanShift, no Kalman
+      meanshift,kalman  → MeanShift + Kalman
+      mil               → MIL tracker, no Kalman
+      mil,kalman        → MIL tracker + Kalman
+    """
+    tokens = {t.strip().lower() for t in value.split(",") if t.strip()}
+    _VALID = {"kalman"} | _SHIFT_ALGOS | _APPEARANCE_TRACKERS
+    unknown = tokens - _VALID
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unknown tracker token(s): {', '.join(sorted(unknown))}. "
+            f"Valid: kalman, {', '.join(sorted(_SHIFT_ALGOS))}, "
+            f"{', '.join(sorted(_APPEARANCE_TRACKERS))}"
+        )
+    shift = tokens & _SHIFT_ALGOS
+    if len(shift) > 1:
+        raise argparse.ArgumentTypeError(
+            "Cannot combine 'camshift' and 'meanshift' — they are mutually exclusive."
+        )
+    appearance = tokens & _APPEARANCE_TRACKERS
+    if len(appearance) > 1:
+        raise argparse.ArgumentTypeError(
+            f"Only one appearance tracker allowed, got: {', '.join(sorted(appearance))}"
+        )
+    tracker_name = next(iter(appearance), "")
+    shift_algo   = next(iter(shift), "camshift")   # default camshift if neither specified
+    use_camshift = bool(shift) and not tracker_name
+    use_kalman   = "kalman" in tokens
+    if tracker_name and shift:
+        raise argparse.ArgumentTypeError(
+            f"Cannot combine '{tracker_name}' with '{shift_algo}' — they are mutually exclusive."
+        )
+    return use_camshift, shift_algo, use_kalman, tracker_name
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Drone Seeker — pink tracking + MAVLink")
@@ -60,10 +108,14 @@ def parse_args():
         help="Show detection mask in a separate window (default: disabled)",
     )
     parser.add_argument(
-        "--no-camshift",
-        action="store_true",
-        default=False,
-        help="Disable CamShift; use blob centroid directly each frame",
+        "--tracker",
+        default="camshift,kalman",
+        metavar="TOKENS",
+        help=(
+            "Comma-separated tracking components (default: camshift,kalman). "
+            "Tokens: camshift  meanshift  kalman  mil  csrt  dasiamrpn  nano  vit. "
+            "Examples: 'meanshift,kalman'  'mil'  'mil,kalman'"
+        ),
     )
     parser.add_argument(
         "--no-box-filter",
@@ -137,6 +189,12 @@ def main():
     args   = parse_args()
     source = _parse_source(args.source)
 
+    try:
+        use_camshift, shift_algo, use_kalman, tracker_name = _parse_tracker_opt(args.tracker)
+    except argparse.ArgumentTypeError as e:
+        print(f"error: --tracker: {e}")
+        raise SystemExit(1)
+
     ctrl = SeekerCtrl(
         connection_string=args.connection,
         baud=args.baud,
@@ -153,8 +211,11 @@ def main():
         record=args.record,
         input_prediction=not args.no_prediction,
         mask_algo=args.mask_algo,
-        use_camshift=not args.no_camshift,
+        use_camshift=use_camshift,
+        shift_algo=shift_algo,
         box_filter=not args.no_box_filter,
+        use_kalman=use_kalman,
+        tracker=tracker_name,
         hud_pitch=not args.no_hud_pitch,
         hud_yaw=not args.no_hud_yaw,
         auto_mode=args.auto,

@@ -25,6 +25,7 @@ _TRK_TERM_ALT        = 0.0         # must match ArduPlane TRK_TERM_ALT (m above 
 _TRK_PITCH_OFFSET    = 3.0         # must match ArduPlane TRK_PITCH_OFFSET (deg) — cruise nose-up bias
 _TRK_TERM_PTCH       = 0.0         # must match ArduPlane TRK_TERM_PTCH (deg)   — extra nose-down in terminal
 _TRK_MAX_DEG         = 30.0        # must match ArduPlane TRK_MAX_DEG — full-scale error angle (deg)
+_TRK_CLOSE_M         = 1000.0           # enter TRACKING only within this slant distance (m)
 _TRK_TARGET_ALT_MSL  = 744.0            # must match ArduPlane TRK_TGT_ALT  (m MSL)
 _TRK_TARGET_LAT      = -6.897367724    # must match ArduPlane TRK_TGT_LAT  (decimal deg)
 _TRK_TARGET_LON      = 107.566559898   # must match ArduPlane TRK_TGT_LON  (decimal deg)
@@ -70,7 +71,10 @@ class SeekerCtrl:
         input_prediction: bool = True,
         mask_algo: str = "all",
         use_camshift: bool = True,
+        shift_algo: str = "camshift",
         box_filter: bool = True,
+        use_kalman: bool = True,
+        tracker: str = "",
         hud_pitch: bool = True,
         hud_yaw: bool = True,
         auto_mode: bool = False,
@@ -128,7 +132,6 @@ class SeekerCtrl:
         self._last_errorx        = 0.0   # last valid errorx (re-sent while lock is lost)
         self._last_errory        = 0.0   # last valid errory (re-sent while lock is lost)
         self._lost_count         = 0     # consecutive target_locked=False frames (after seeker prediction)
-        self._tracking_entry_count = 0   # how many times TRACKING mode has been entered
 
         # ── Latency prediction state ──────────────────────────────────────────
         self._prev_errorx_v  = 0.0   # raw errorx from previous frame
@@ -154,7 +157,10 @@ class SeekerCtrl:
                              show_mask=show_mask,
                              mask_algo=mask_algo,
                              use_camshift=use_camshift,
-                             box_filter=box_filter)
+                             shift_algo=shift_algo,
+                             box_filter=box_filter,
+                             use_kalman=use_kalman,
+                             tracker=tracker)
 
         # ── Joystick ──────────────────────────────────────────────────────────
         self._joystick_enabled    = joystick_enabled
@@ -621,48 +627,34 @@ class SeekerCtrl:
                 ch6_fell = self._prev_ch6_on and not ch6_on  # armed → disarmed edge
 
                 if self._auto_mode:
+                    # Rules 1 & 2: enter TRACKING at last WP when close enough,
+                    # regardless of joystick / ch6 state.
                     dist_to_target_m = self._dist_to_target_m()
-                    close_enough     = dist_to_target_m < 700.0
-                    on_last_wp       = (self._waypoint_count > 0 and
-                                        self._current_wp == self._waypoint_count - 1)
-
-                    # ch6 high → AUTO (or TRACKING when lock conditions are met)
-                    # ch6 low  → STABILIZE
-                    if ch6_fell:
-                        self._in_tracking = False
-                        self.set_mode_stabilize()
-
-                    elif ch6_on:
-                        if close_enough and on_last_wp and target_locked and not self._in_tracking:
-                            # Within 700 m of target AND on final waypoint AND camera locked → enter TRACKING
-                            self.set_mode_tracking()
-                            self._in_tracking = True
-                            self._tracking_entry_count += 1
-                        elif not (close_enough and on_last_wp) and not self._in_tracking:
-                            # Not yet in range or not on last waypoint → follow AUTO mission
-                            # Guard: only send AUTO when not already in tracking, to avoid
-                            # pulling out of TRACKING if distance briefly crosses 700 m.
+                    on_last_wp   = (self._waypoint_count > 0 and
+                                    self._current_wp == self._waypoint_count - 1)
+                    close_enough = dist_to_target_m <= _TRK_CLOSE_M
+                    if on_last_wp and close_enough and target_locked and not self._in_tracking:
+                        self.set_mode_tracking()
+                        self._in_tracking = True
+                    elif not self._in_tracking:
+                        # Rule 1 (joystick on): ch6 high → AUTO, ch6 low → STABILIZE
+                        # Rule 2 (joystick off): always AUTO, ch6 has no effect
+                        if self._joy_handler is not None and not ch6_on:
+                            self.set_mode_stabilize()
+                        else:
                             self.set_mode_auto()
 
-                    else:
-                        # ch6 is low and no edge — hold STABILIZE
-                        self.set_mode_stabilize()
-
                 else:
+                    # Rule 3: ch6 gates TRACKING; no auto-mode logic.
                     dist_to_target_m = None
 
-                    # Rule 5: on falling edge of ch6 → AUTO
                     if ch6_fell:
                         self._in_tracking = False
                         self.set_mode_auto()
-
                     elif ch6_on:
-                        # Rule 3: detected + armed → enter tracking (once)
                         if target_locked and not self._in_tracking:
                             self.set_mode_tracking()
                             self._in_tracking = True
-                            self._tracking_entry_count += 1
-                        # Rules 1,2,4: no change to tracking flag based on detection
 
                 self._prev_ch6_on = ch6_on
 
@@ -718,22 +710,13 @@ class SeekerCtrl:
 
                     else:
                         self._lost_count += 1
-                        committed = self._tracking_entry_count >= 3
-                        limit     = 30 if committed else 10
-                        if self._lost_count >= limit:
-                            # Loss limit reached — return to AUTO.
+                        if self._lost_count >= 50:
                             self._lost_count  = 0
                             self._in_tracking = False
                             self.set_mode_auto()
-                        elif committed:
-                            # 3+ tracking entries: keep sending last known errors
-                            # so ArduPlane stays pointed at the last known direction.
-                            self.send_tracking(self._last_errorx, self._last_errory)
                         else:
-                            # < 3 tracking entries: level off while waiting.
-                            self.send_tracking(0.0, 0.0)
-                        self._log_row(now, self._last_errorx if committed else 0.0,
-                                      self._last_errory if committed else 0.0,
+                            self.send_tracking(self._last_errorx, self._last_errory)
+                        self._log_row(now, self._last_errorx, self._last_errory,
                                       target_locked=False, terminal=in_terminal)
 
                 # ── 6. Annotate HUD ───────────────────────────────────────────
@@ -747,7 +730,7 @@ class SeekerCtrl:
                     alt_dist_m, spd_kmh, self._throttle_pct,
                 )
                 cv2.putText(annotated,
-                            f"FPS: {fps:.1f}  LOCK: {'ON' if ch6_on else 'OFF'}{err_str}",
+                            f"FPS: {fps:.1f}  LOCK: {'ON' if (self._auto_mode or ch6_on) else 'OFF'}{err_str}",
                             (5, h_frame - 40),
                             cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
                 cv2.putText(annotated,

@@ -37,3 +37,23 @@
 [17] N. A. Shneydor, *Missile Guidance and Pursuit: Kinematics, Dynamics and Control*. Woodhead Publishing / Horwood Publishing, 1998. ISBN 978-1-898563-43-6.
 
 [18] P. Zarchan, *Tactical and Strategic Missile Guidance*, edisi ke-6, Progress in Astronautics and Aeronautics, vol. 239. American Institute of Aeronautics and Astronautics (AIAA), 2012. ISBN 978-1-60086-894-9.
+
+[19] R. E. Kalman, "A New Approach to Linear Filtering and Prediction Problems," *Transactions of the ASME–Journal of Basic Engineering*, vol. 82, series D, pp. 35–45, 1960. DOI: [10.1115/1.3662552](https://doi.org/10.1115/1.3662552)
+
+[20] G. Welch dan G. Bishop, "An Introduction to the Kalman Filter," Technical Report TR 95-041, University of North Carolina at Chapel Hill, 1995. URL: [https://www.cs.unc.edu/~welch/media/pdf/kalman_intro.pdf](https://www.cs.unc.edu/~welch/media/pdf/kalman_intro.pdf)
+
+[21] K. Fukunaga dan L. D. Hostetler, "The Estimation of the Gradient of a Density Function, with Applications in Pattern Recognition," *IEEE Transactions on Information Theory*, vol. 21, no. 1, pp. 32–40, Jan. 1975. DOI: [10.1109/TIT.1975.1055330](https://doi.org/10.1109/TIT.1975.1055330)
+
+[22] D. Comaniciu dan P. Meer, "Mean Shift: A Robust Approach toward Feature Space Analysis," *IEEE Transactions on Pattern Analysis and Machine Intelligence*, vol. 24, no. 5, pp. 603–619, Mei 2002. DOI: [10.1109/34.1000236](https://doi.org/10.1109/34.1000236)
+
+[23] B. Babenko, M.-H. Yang, dan S. Belongie, "Robust Object Tracking with Online Multiple Instance Learning," *IEEE Transactions on Pattern Analysis and Machine Intelligence*, vol. 33, no. 8, pp. 1619–1632, 2011. DOI: [10.1109/TPAMI.2010.226](https://doi.org/10.1109/TPAMI.2010.226)
+
+[24] A. Lukežič, T. Vojíř, L. Čehovin Zajc, J. Matas, dan M. Kristan, "Discriminative Correlation Filter with Channel and Spatial Reliability," *Proc. IEEE Conf. Computer Vision and Pattern Recognition (CVPR)*, pp. 6309–6318, 2017. DOI: [10.1109/CVPR.2017.515](https://doi.org/10.1109/CVPR.2017.515)
+
+[25] B. Li, J. Yan, W. Wu, Z. Zhu, dan X. Hu, "High Performance Visual Tracking with Siamese Region Proposal Network," *Proc. IEEE Conf. Computer Vision and Pattern Recognition (CVPR)*, pp. 8971–8980, 2018. DOI: [10.1109/CVPR.2018.00935](https://doi.org/10.1109/CVPR.2018.00935)
+
+[26] Z. Zhu, Q. Wang, B. Li, W. Wu, J. Yan, dan W. Hu, "Distractor-aware Siamese Networks for Visual Object Tracking," *Proc. European Conf. Computer Vision (ECCV)*, pp. 101–117, 2018. DOI: [10.1007/978-3-030-01240-3_7](https://doi.org/10.1007/978-3-030-01240-3_7)
+
+[27] C. Wang, "NanoTrack: An Extremely Lightweight Single Object Tracking Network," *arXiv preprint*, arXiv:2202.06764, 2022. URL: [https://arxiv.org/abs/2202.06764](https://arxiv.org/abs/2202.06764)
+
+[28] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, J. Uszkoreit, dan N. Houlsby, "An Image is Worth 16×16 Words: Transformers for Image Recognition at Scale," *Proc. Int'l Conf. on Learning Representations (ICLR)*, 2021. arXiv: [2010.11929](https://arxiv.org/abs/2010.11929)

@@ -13,7 +13,7 @@ _PINK_RANGES = [
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
-_MIN_BLOB_AREA = 20
+_MIN_BLOB_AREA = 9
 
 # Normalised error threshold (±) within which the target is considered centred
 _CENTER_THRESHOLD = 0.1
@@ -31,9 +31,9 @@ def _pink_mask(hsv: np.ndarray) -> np.ndarray:
     return mask
 
 
-_MIN_EXTENT   = 0.45   # minimum contour/bbox fill ratio
-_MIN_SOLIDITY = 0.60   # minimum contour/convex-hull fill ratio (rejects L-shapes, noise)
-_MIN_DIM      = 4      # minimum blob width AND height in pixels
+_MIN_EXTENT   = 0.30   # minimum contour/bbox fill ratio
+_MIN_SOLIDITY = 0.45   # minimum contour/convex-hull fill ratio (rejects L-shapes, noise)
+_MIN_DIM      = 3      # minimum blob width AND height in pixels
 _MAX_ASPECT   = 6.0    # maximum long/short side ratio (rejects thin slivers)
 
 
@@ -101,13 +101,79 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None,
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 3.0   # confidence window: ±3.0σ
+_GAUSS_SIGMA        = 2.0   # confidence window: ±2.0σ
 
 # ── Kalman filter tuning (position tracking) ──────────────────────────────────
 _KF_Q_POS    = 2.0    # process noise — position  (px^2/s)
 _KF_Q_VEL    = 80.0   # process noise — velocity  (px^2/s^3)
 _KF_R        = 30.0   # measurement noise         (px^2)
 _KF_MISS_MAX = 5      # predict this many frames after lock loss, then give up
+
+
+_TRACKER_NAMES = ("csrt", "mil", "dasiamrpn", "nano", "vit")
+
+# (free_fn_attr, class_attr) per tracker name.
+_TRACKER_ATTRS: dict[str, tuple[str, str]] = {
+    "csrt":      ("TrackerCSRT_create",      "TrackerCSRT"),
+    "mil":       ("TrackerMIL_create",       "TrackerMIL"),
+    "dasiamrpn": ("TrackerDaSiamRPN_create", "TrackerDaSiamRPN"),
+    "nano":      ("TrackerNano_create",      "TrackerNano"),
+    "vit":       ("TrackerVit_create",       "TrackerVit"),
+}
+
+# Model files required by DNN-based trackers (must be in CWD or full path).
+_TRACKER_MODELS: dict[str, list[str]] = {
+    "vit":       ["vitTracker.onnx"],
+    "dasiamrpn": ["dasiamrpn_model.onnx",
+                  "dasiamrpn_kernel_cls1.onnx",
+                  "dasiamrpn_kernel_r1.onnx"],
+    "nano":      ["nanotrack_backbone_sim.onnx",
+                  "nanotrack_head_sim.onnx"],
+}
+
+
+def _make_tracker(name: str):
+    """Create a cv2 tracker by name.
+
+    Handles three API variants across OpenCV versions:
+      - free function  cv2.TrackerXxx_create()      (OpenCV ≤ 4.4 / contrib)
+      - legacy ns      cv2.legacy.TrackerXxx_create()
+      - class method   cv2.TrackerXxx.create()       (OpenCV 4.5+)
+
+    Raises RuntimeError with a helpful message if the tracker is unavailable
+    or required ONNX model files are missing.
+    """
+    name = name.lower()
+    if name not in _TRACKER_ATTRS:
+        raise ValueError(
+            f"Unknown tracker '{name}'. Choose from: {', '.join(_TRACKER_NAMES)}"
+        )
+    fn_attr, cls_attr = _TRACKER_ATTRS[name]
+    try:
+        # Free function (old API or contrib)
+        if hasattr(cv2, fn_attr):
+            return getattr(cv2, fn_attr)()
+        # Legacy namespace (contrib 4.5–4.9)
+        legacy = getattr(cv2, "legacy", None)
+        if legacy and hasattr(legacy, fn_attr):
+            return getattr(legacy, fn_attr)()
+        # Class-based API (main OpenCV 4.5+)
+        if hasattr(cv2, cls_attr):
+            return getattr(cv2, cls_attr).create()
+        raise RuntimeError(
+            f"Tracker '{name}' not available in this OpenCV build "
+            f"(cv2 {cv2.__version__}). "
+            f"Try: pip install opencv-contrib-python"
+        )
+    except cv2.error as exc:
+        models = _TRACKER_MODELS.get(name)
+        if models:
+            raise RuntimeError(
+                f"Tracker '{name}' requires model file(s): {', '.join(models)}\n"
+                f"Download from https://github.com/opencv/opencv_zoo and place "
+                f"in the working directory."
+            ) from exc
+        raise RuntimeError(f"Tracker '{name}' failed to create: {exc}") from exc
 
 
 def _kf1d(x0, x1, P00, P01, P10, P11, meas, dt):
@@ -221,7 +287,10 @@ class Seeker:
         show_mask: bool = False,
         mask_algo: str = "all",
         use_camshift: bool = True,
+        shift_algo: str = "camshift",   # "camshift" | "meanshift"
         box_filter: bool = True,
+        use_kalman: bool = True,
+        tracker: str = "",
     ):
         """
         source          : camera index (int) or video / image file path (str)
@@ -254,7 +323,11 @@ class Seeker:
         self._show_mask      = show_mask
         self._mask_algo      = mask_algo
         self._use_camshift   = use_camshift
+        self._shift_algo     = shift_algo
         self._box_filter     = box_filter
+        self._use_kalman     = use_kalman
+        self._tracker_name   = tracker.lower() if tracker else ""
+        self._tracker_obj    = None
 
         self._cal_hist        = _load_histogram(histogram_file)
         if self._cal_hist is not None:
@@ -263,11 +336,18 @@ class Seeker:
             kept = int((self._conf_hist.flatten() > 0).sum())
             print(f"[Seeker] Confidence hist: mean={self._gauss_mean:.1f}  "
                   f"std={self._gauss_std:.1f}  bins={kept}/180")
+            # Wider histogram for CamShift tracking (3σ) — more signal than 2σ conf_hist
+            # but still selective enough to avoid false positives in back-projection.
+            _roi = self._cal_hist.flatten().copy().astype(np.float32)
+            _d   = np.abs(np.arange(180, dtype=np.float32) - self._gauss_mean)
+            _d   = np.minimum(_d, 180.0 - _d)
+            _roi[_d >= 3.0 * self._gauss_std] = 0.0
+            self._roi_hist = _roi.reshape(180, 1)
         else:
             self._gauss_mean = self._gauss_std = None
             self._conf_hist  = None
+            self._roi_hist   = None
         self.cap              = None
-        self._roi_hist        = self._conf_hist  # fixed: always use conf histogram
         self._track_win       = None   # current CamShift window (x, y, w, h)
         self._detect_count    = 0      # consecutive successful detections
         self._res_logged      = False
@@ -492,8 +572,8 @@ class Seeker:
                 votes += (m3 > 0).view(np.uint8)
                 _, mask = cv2.threshold(votes, 1, 255, cv2.THRESH_BINARY)
 
-        # Single CLOSE cheaper than OPEN + DILATE and fills holes too
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kern3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   self._kern5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, self._kern5)
         return mask, 1
 
     def track(self, frame: np.ndarray):
@@ -584,6 +664,15 @@ class Seeker:
                 if self._detect_count == 1:
                     self._win_w_ema = float(iw)
                     self._win_h_ema = float(ih)
+                if self._tracker_name and self._detect_count == 3:
+                    try:
+                        self._tracker_obj = _make_tracker(self._tracker_name)
+                        self._tracker_obj.init(frame, (ix, iy, iw, ih))
+                    except (RuntimeError, ValueError) as exc:
+                        print(f"[Seeker] {exc}")
+                        print("[Seeker] Falling back to CamShift.")
+                        self._tracker_name = ""
+                        self._tracker_obj  = None
             else:
                 self._detect_count = 0
                 self._track_win    = None
@@ -596,16 +685,95 @@ class Seeker:
             self._update_histogram_window()
             return out, None, None
 
+        # ── CSRT step (replaces CamShift when --csrt is active) ──────────────
+        if self._tracker_name and self._tracker_obj is not None:
+            ok, bbox = self._tracker_obj.update(frame)
+            if ok:
+                x, y, w, h = (int(v) for v in bbox)
+                if w >= 4 and h >= 4:
+                    # ── Color validation: confirm ROI still contains target ─────
+                    x  = max(0, min(x, w_frame - 1))
+                    y  = max(0, min(y, h_frame - 1))
+                    w  = min(w, w_frame - x)
+                    h  = min(h, h_frame - y)
+                    roi_mask, _ = self._detection_mask(hsv[y:y + h, x:x + w])
+                    if cv2.countNonZero(roi_mask) < _MIN_BLOB_AREA:
+                        self._miss_count += 1
+                        if self._miss_count >= _KF_MISS_MAX:
+                            self._track_win      = None
+                            self._detect_count   = 0
+                            self._win_w_ema      = 0.0
+                            self._win_h_ema      = 0.0
+                            self._kf_initialized = False
+                            self._miss_count     = 0
+                            self._tracker_obj    = None
+                        self._draw_center_cross(out, w_frame, h_frame)
+                        self._update_histogram_window()
+                        return out, None, None
+                    self._miss_count = 0
+                    self._track_win = (x, y, w, h)
+                    self._win_w_ema = self._EMA_ALPHA * w + (1 - self._EMA_ALPHA) * self._win_w_ema
+                    self._win_h_ema = self._EMA_ALPHA * h + (1 - self._EMA_ALPHA) * self._win_h_ema
+                    raw_cx = x + w / 2.0
+                    raw_cy = y + h / 2.0
+                    if self._use_kalman:
+                        kf_dt = 0.0
+                        now_t = time.monotonic()
+                        kf_dt = min(now_t - self._kf_last_t, 0.5) if self._kf_initialized else 0.0
+                        self._kf_last_t = now_t
+                        if not self._kf_initialized:
+                            self._kf_x0, self._kf_x1 = raw_cx, 0.0
+                            self._kf_y0, self._kf_y1 = raw_cy, 0.0
+                            self._kf_Px = [1.0, 0.0, 0.0, 1.0]
+                            self._kf_Py = [1.0, 0.0, 0.0, 1.0]
+                            self._kf_initialized = True
+                            cx, cy = int(round(raw_cx)), int(round(raw_cy))
+                        else:
+                            self._kf_x0, self._kf_x1, *self._kf_Px = _kf1d(
+                                self._kf_x0, self._kf_x1, *self._kf_Px, raw_cx, kf_dt)
+                            self._kf_y0, self._kf_y1, *self._kf_Py = _kf1d(
+                                self._kf_y0, self._kf_y1, *self._kf_Py, raw_cy, kf_dt)
+                            cx = int(round(self._kf_x0))
+                            cy = int(round(self._kf_y0))
+                    else:
+                        cx, cy = int(round(raw_cx)), int(round(raw_cy))
+                    cx = max(0, min(cx, w_frame - 1))
+                    cy = max(0, min(cy, h_frame - 1))
+                    ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
+                    ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
+                    centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
+                    box_colour = (0, 233, 0) if centred else (203, 192, 233)
+                    cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
+                    cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
+                    cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
+                    cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
+                    self._draw_center_cross(out, w_frame, h_frame)
+                    self._update_histogram_window()
+                    return out, cx, cy
+            # Tracker update failed or bbox too small — hard reset
+            self._track_win      = None
+            self._detect_count   = 0
+            self._win_w_ema      = 0.0
+            self._win_h_ema      = 0.0
+            self._kf_initialized = False
+            self._miss_count     = 0
+            self._tracker_obj    = None
+            self._draw_center_cross(out, w_frame, h_frame)
+            self._update_histogram_window()
+            return out, None, None
+
         # ── CamShift step ─────────────────────────────────────────────────────
-        now_t = time.monotonic()
-        kf_dt = min(now_t - self._kf_last_t, 0.5) if self._kf_initialized else 0.0
-        self._kf_last_t = now_t
+        kf_dt = 0.0
+        if self._use_kalman:
+            now_t = time.monotonic()
+            kf_dt = min(now_t - self._kf_last_t, 0.5) if self._kf_initialized else 0.0
+            self._kf_last_t = now_t
 
         back_proj = cv2.calcBackProject([hsv], [0], self._roi_hist, [0, 180], 1)
         # Pre-translate the search window by Kalman-predicted velocity so CamShift
         # starts near where the target is expected to be this frame.
         twx, twy, tww, twh = self._track_win
-        if self._kf_initialized and kf_dt > 0:
+        if self._use_kalman and self._kf_initialized and kf_dt > 0:
             dx = int(round(self._kf_x1 * kf_dt))
             dy = int(round(self._kf_y1 * kf_dt))
             twx = max(0, min(twx + dx, w_frame - tww))
@@ -621,10 +789,17 @@ class Seeker:
         if bx1 > 0:        back_proj[by1:by2, :bx1] = 0
         if bx2 < w_frame:  back_proj[by1:by2, bx2:] = 0
         cv2.GaussianBlur(back_proj, (3, 3), 0, dst=back_proj)
+        cv2.dilate(back_proj, back_proj, self._kern5)
 
-        ret, self._track_win = cv2.CamShift(
-            back_proj, self._track_win, self._term_crit
-        )
+        if self._shift_algo == "meanshift":
+            _, self._track_win = cv2.meanShift(
+                back_proj, self._track_win, self._term_crit
+            )
+            ret = None
+        else:
+            ret, self._track_win = cv2.CamShift(
+                back_proj, self._track_win, self._term_crit
+            )
 
         # ── Clamp window to frame bounds ──────────────────────────────────────
         twx, twy, tww, twh = self._track_win
@@ -647,7 +822,7 @@ class Seeker:
                 camshift_bad = True
 
         if camshift_bad:
-            if self._kf_initialized and self._miss_count < _KF_MISS_MAX:
+            if self._use_kalman and self._kf_initialized and self._miss_count < _KF_MISS_MAX:
                 # ── Predict position for up to _KF_MISS_MAX frames ────────────
                 self._miss_count += 1
                 pred_dt = max(kf_dt, 1.0 / 30.0)
@@ -677,6 +852,7 @@ class Seeker:
                 self._win_h_ema      = 0.0
                 self._kf_initialized = False
                 self._miss_count     = 0
+                self._tracker_obj    = None
                 self._draw_center_cross(out, w_frame, h_frame)
                 self._update_histogram_window()
                 return out, None, None
@@ -685,10 +861,12 @@ class Seeker:
         self._win_w_ema = self._EMA_ALPHA * w + (1 - self._EMA_ALPHA) * self._win_w_ema
         self._win_h_ema = self._EMA_ALPHA * h + (1 - self._EMA_ALPHA) * self._win_h_ema
 
-        # ── Snap: if blob disagrees with CamShift centre, correct to blob ─────
+        # ── Snap: if blob disagrees with tracker centre, correct to blob ────────
+        shift_cx = float(ret[0][0]) if ret is not None else (self._track_win[0] + self._track_win[2] / 2.0)
+        shift_cy = float(ret[0][1]) if ret is not None else (self._track_win[1] + self._track_win[3] / 2.0)
         if blob is not None:
-            cs_cx = int(ret[0][0])
-            cs_cy = int(ret[0][1])
+            cs_cx = int(shift_cx)
+            cs_cy = int(shift_cy)
             bx, by, bw, bh = blob
             b_cx = bx + bw // 2
             b_cy = by + bh // 2
@@ -700,27 +878,29 @@ class Seeker:
                                       min(h_frame - max(0, by - pad), bh + 2 * pad))
                 self._detect_count = max(self._detect_count - 1, 0)
 
-        raw_cx = float(ret[0][0])
-        raw_cy = float(ret[0][1])
+        raw_cx = shift_cx
+        raw_cy = shift_cy
 
-        # ── Track recovered — reset prediction counter ────────────────────────
-        self._miss_count = 0
-
-        # ── Kalman filter on position ─────────────────────────────────────────
-        if not self._kf_initialized:
-            self._kf_x0, self._kf_x1 = raw_cx, 0.0
-            self._kf_y0, self._kf_y1 = raw_cy, 0.0
-            self._kf_Px = [1.0, 0.0, 0.0, 1.0]
-            self._kf_Py = [1.0, 0.0, 0.0, 1.0]
-            self._kf_initialized = True
-            cx, cy = int(round(raw_cx)), int(round(raw_cy))
+        if self._use_kalman:
+            # ── Track recovered — reset prediction counter ────────────────────
+            self._miss_count = 0
+            # ── Kalman filter on position ─────────────────────────────────────
+            if not self._kf_initialized:
+                self._kf_x0, self._kf_x1 = raw_cx, 0.0
+                self._kf_y0, self._kf_y1 = raw_cy, 0.0
+                self._kf_Px = [1.0, 0.0, 0.0, 1.0]
+                self._kf_Py = [1.0, 0.0, 0.0, 1.0]
+                self._kf_initialized = True
+                cx, cy = int(round(raw_cx)), int(round(raw_cy))
+            else:
+                self._kf_x0, self._kf_x1, *self._kf_Px = _kf1d(
+                    self._kf_x0, self._kf_x1, *self._kf_Px, raw_cx, kf_dt)
+                self._kf_y0, self._kf_y1, *self._kf_Py = _kf1d(
+                    self._kf_y0, self._kf_y1, *self._kf_Py, raw_cy, kf_dt)
+                cx = int(round(self._kf_x0))
+                cy = int(round(self._kf_y0))
         else:
-            self._kf_x0, self._kf_x1, *self._kf_Px = _kf1d(
-                self._kf_x0, self._kf_x1, *self._kf_Px, raw_cx, kf_dt)
-            self._kf_y0, self._kf_y1, *self._kf_Py = _kf1d(
-                self._kf_y0, self._kf_y1, *self._kf_Py, raw_cy, kf_dt)
-            cx = int(round(self._kf_x0))
-            cy = int(round(self._kf_y0))
+            cx, cy = int(round(raw_cx)), int(round(raw_cy))
         cx = max(0, min(cx, w_frame - 1))
         cy = max(0, min(cy, h_frame - 1))
 
@@ -729,8 +909,12 @@ class Seeker:
         ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
         centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
         box_colour = (0, 233, 0) if centred else (203, 192, 233)
-        pts = cv2.boxPoints(ret).astype(np.intp)
-        cv2.polylines(out, [pts], True, box_colour, 2)
+        if ret is not None:
+            pts = cv2.boxPoints(ret).astype(np.intp)
+            cv2.polylines(out, [pts], True, box_colour, 2)
+        else:
+            twx, twy, tww, twh = self._track_win
+            cv2.rectangle(out, (twx, twy), (twx + tww, twy + twh), box_colour, 2)
 
         # centroid crosshair
         cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)

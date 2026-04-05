@@ -30,11 +30,61 @@ Metode deteksi adaptif dalam drone-seeker dimotivasi oleh keterbatasan threshold
 
 ---
 
-## 5. Tracking CamShift
+## 5. Tracking CamShift dan MeanShift
 
-Setelah target terdeteksi melalui lima frame berturut-turut, drone-seeker bertransisi dari deteksi ke tracking menggunakan algoritma CamShift. CamShift (Continuously Adaptive Mean Shift) diperkenalkan oleh Bradski [9, 10] sebagai perluasan algoritma Mean Shift ke sekuens video. Mean Shift adalah prosedur pencarian modus non-parametrik yang secara iteratif menggeser window menuju maksimum lokal fungsi densitas probabilitas — dalam hal ini, histogram warna yang diproyeksikan kembali. CamShift juga mengadaptasi ukuran dan orientasi window tracking pada setiap frame agar sesuai dengan skala objek yang dilacak saat ini. Fondasi matematika dari pendekatan ini, menggunakan estimasi densitas kernel dengan histogram warna sebagai model probabilitas dasar, diformalisasi secara ketat oleh Comaniciu, Ramesh, dan Meer [11], yang tracker berbasis kernel memberikan landasan teoritis untuk implementasi CamShift praktis yang tersedia sebagai `cv2.CamShift` dalam OpenCV.
+### 5.1 Mean Shift
+
+Mean Shift adalah algoritma pencarian modus non-parametrik yang menjadi fondasi CamShift. Pertama kali diperkenalkan oleh Fukunaga dan Hostetler [21] sebagai metode estimasi gradien fungsi densitas probabilitas, algoritma ini secara iteratif menggeser titik estimasi menuju region densitas tertinggi dalam ruang fitur. Comaniciu dan Meer [22] kemudian memperluas Mean Shift menjadi kerangka analisis ruang fitur yang kuat — termasuk aplikasi untuk segmentasi citra dan tracking objek — dan membuktikan sifat konvergensinya pada distribusi kernel yang umum.
+
+Dalam konteks visual tracking, Mean Shift mempertahankan ukuran window tetap dan hanya memperbarui posisi ke modus lokal dari back-projection warna. Hasilnya adalah `cv2.Rect` axis-aligned tanpa informasi orientasi, berbeda dengan CamShift yang menghasilkan `cv2.RotatedRect`. Dalam drone-seeker, opsi `--tracker meanshift` mengaktifkan varian ini: pipeline identik dengan CamShift (back-projection kepercayaan Gaussian, pre-translate Kalman, gate, GaussianBlur) tetapi pemanggilan algoritma akhir diganti dengan `cv2.meanShift()`. Ini cocok untuk target yang tidak memerlukan estimasi orientasi dan memberikan beban komputasi yang sedikit lebih rendah.
+
+### 5.2 CamShift
+
+CamShift (Continuously Adaptive Mean Shift) diperkenalkan oleh Bradski [9, 10] sebagai perluasan algoritma Mean Shift ke sekuens video. CamShift tidak hanya memperbarui posisi window seperti Mean Shift, tetapi juga mengadaptasi ukuran dan orientasi window pada setiap frame agar sesuai dengan skala dan postur objek yang dilacak saat ini. Fondasi matematika dari pendekatan ini, menggunakan estimasi densitas kernel dengan histogram warna sebagai model probabilitas dasar, diformalisasi secara ketat oleh Comaniciu, Ramesh, dan Meer [11], yang tracker berbasis kernel memberikan landasan teoritis untuk implementasi CamShift praktis yang tersedia sebagai `cv2.CamShift` dalam OpenCV.
 
 Dalam drone-seeker, CamShift diinisialisasi dengan bounding rectangle yang dikembalikan oleh langkah deteksi terakhir yang berhasil. Tracker berjalan pada peta back-projection kepercayaan Gaussian yang sama yang digunakan untuk deteksi, memastikan pemodelan warna yang konsisten antara dua tahap. Jika window tracker menyusut di bawah area minimum atau peta kepercayaan kehilangan sinyal, sistem kembali ke mode deteksi.
+
+---
+
+## 5a. Filter Kalman untuk Prediksi Posisi
+
+Filter Kalman adalah estimator rekursif yang optimal dalam artian Mean Square Error untuk sistem linear dengan noise Gaussian. Diperkenalkan oleh Kalman [19] pada 1960, filter ini mempropagasi distribusi posterior state (posisi dan kecepatan) secara rekursif melalui dua tahap: *predict* — memajukan estimasi sesuai model dinamika — dan *update* — mengoreksi estimasi menggunakan pengukuran baru berbobot invers kovarians. Welch dan Bishop [20] menyediakan derivasi yang dapat diakses dalam konteks computer vision dan robotika.
+
+Dalam drone-seeker, filter Kalman 1D diterapkan secara terpisah pada sumbu x dan y centroid yang dilacak. State vektor masing-masing adalah `[posisi, kecepatan]`, dengan parameter proses dan pengukuran:
+
+| Parameter | Nilai | Peran |
+|---|---|---|
+| `_KF_Q_POS` | 2.0 px²/s | Noise proses — posisi |
+| `_KF_Q_VEL` | 80.0 px²/s³ | Noise proses — kecepatan |
+| `_KF_R` | 30.0 px² | Noise pengukuran |
+
+Ketika CamShift atau tracker penampilan kehilangan target (`camshift_bad = True` atau miss_count meningkat), filter Kalman melanjutkan dengan langkah *predict-only* — memproyeksikan posisi berdasarkan kecepatan yang diestimasi terakhir — selama hingga `_KF_MISS_MAX = 5` frame sebelum hard reset. Ini memungkinkan sistem mempertahankan lock sementara selama oklusi singkat atau saturasi cahaya tanpa memicu perubahan mode yang tidak perlu.
+
+---
+
+## 5b. Tracker Berbasis Penampilan (Appearance-Based Trackers)
+
+Selain tracker berbasis histogram (CamShift/MeanShift), drone-seeker mendukung tracker penampilan pilihan yang diaktifkan melalui `--tracker [mil|csrt|dasiamrpn|nano|vit]`. Setelah target terkunci tiga frame berturut-turut, tracker penampilan diinisialisasi dengan bounding box deteksi dan berjalan setiap frame setelahnya. Karena tracker penampilan tidak secara inheren mengetahui warna target, drone-seeker menambahkan lapisan validasi warna: mask deteksi dijalankan pada ROI yang dikembalikan tracker setiap frame; jika `countNonZero(roi_mask) < _MIN_BLOB_AREA` selama `_KF_MISS_MAX` frame berurutan, tracker direset.
+
+### MIL (Multiple Instance Learning)
+
+MIL [23] merumuskan tracking sebagai klasifikasi online. Alih-alih memberi label positif tunggal ke patch target, MIL menggunakan "bag" instance — sekumpulan patch dari sekitar posisi target — sebagai bag positif. Aturan MIL: sebuah bag positif jika *setidaknya satu* instancenya positif. Ini memberikan toleransi terhadap inaccurate labeling yang disebabkan oleh drift posisi tracker. Kelemahannya: classifier MIL selalu mengembalikan `ok=True` — ia tidak memiliki mekanisme bawaan untuk mendeteksi target yang hilang, sehingga validasi warna eksternal diperlukan.
+
+### CSRT (Channel and Spatial Reliability Tracking)
+
+CSRT [24] memperluas Discriminative Correlation Filter (DCF) dengan dua inovasi utama: (1) bobot spasial per-kanal yang mengestimasi bagian mana dari ROI yang dapat diandalkan untuk tracking, dan (2) filter yang dioptimalkan pada *multiple channel* fitur (HOG + color names). Bobot spasial memungkinkan tracker mengabaikan region latar belakang yang masuk ke dalam window tracking, meningkatkan akurasi secara signifikan pada target non-rectangular. CSRT umumnya memberikan akurasi lebih tinggi dari MIL tetapi dengan biaya komputasi yang lebih besar. Catatan: CSRT tidak tersedia di build OpenCV 4.10+ melalui paket inti; diperlukan modul `opencv-contrib`.
+
+### DaSiamRPN (Distractor-aware Siamese RPN)
+
+DaSiamRPN [26] dibangun di atas SiamRPN [25], yang menggunakan dua cabang Siamese network untuk mengekstrak fitur dari template target dan patch pencarian, lalu melakukan cross-correlation untuk menghasilkan proposal bounding box secara efisien. DaSiamRPN menambahkan strategi pelatihan *distractor-aware*: jaringan secara eksplisit dilatih pada pasangan negatif semantically-similar (misalnya, orang lain selain orang target), sehingga lebih tahan terhadap pengalihan perhatian ke distractor. Tracker ini membutuhkan tiga file model ONNX yang harus diunduh terpisah: `dasiamrpn_kernel_cls1.onnx`, `dasiamrpn_kernel_r1.onnx`, `dasiamrpn_model.onnx`.
+
+### NanoTrack
+
+NanoTrack [27] adalah tracker Siamese yang dirancang untuk perangkat edge dengan sumber daya terbatas. Arsitekturnya menggunakan backbone berparameter sangat rendah dan head pelacak yang disederhanakan, mencapai kecepatan inferensi tinggi dengan akurasi yang dapat diterima untuk aplikasi real-time pada hardware tertanam. Tracker ini membutuhkan dua file model ONNX: `nanotrack_backbone_sim.onnx` dan `nanotrack_head_sim.onnx`.
+
+### ViT (Vision Transformer) Tracker
+
+Tracker ViT [28] memanfaatkan arsitektur Vision Transformer yang membagi gambar input menjadi patch berukuran tetap dan memodelkan hubungan antar patch melalui mekanisme *self-attention*. Berbeda dengan tracker berbasis CNN yang menangkap fitur lokal secara hierarkis, ViT menangkap dependensi jarak jauh dalam satu blok attention, menghasilkan representasi yang lebih diskriminatif pada variasi skala dan tekstur yang luas. Membutuhkan satu file model ONNX: `vitTracker.onnx`.
 
 ---
 

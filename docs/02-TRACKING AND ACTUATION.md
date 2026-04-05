@@ -33,9 +33,16 @@ Saat re-akuisisi (setelah lock sebelumnya hilang), pencarian blob dibatasi pada 
 
 ![State machine deteksi blob](chart_02_detection_state.png)
 
-### A2. Tracking CamShift
+### A2. Tracking CamShift dan MeanShift
 
-Setelah `_detect_count >= 3`, CamShift berjalan setiap frame:
+Setelah `_detect_count >= 3`, tracker shift berjalan setiap frame. Dua varian tersedia melalui `--tracker camshift` (default) dan `--tracker meanshift`:
+
+- **CamShift** [9, 10, 11] — mengadaptasi posisi, ukuran, dan orientasi window; mengembalikan `cv2.RotatedRect` dan kotak miring yang digambar dengan `cv2.polylines`.
+- **MeanShift** [21, 22] — memperbarui posisi saja; ukuran window tetap; mengembalikan `cv2.Rect` axis-aligned dan kotak tegak lurus yang digambar dengan `cv2.rectangle`. Biaya komputasi sedikit lebih rendah.
+
+Pipeline kedua varian identik hingga pemanggilan algoritma akhir:
+
+Setelah `_detect_count >= 3`, tracker shift berjalan setiap frame:
 
 1. Back-project histogram kepercayaan (`_roi_hist = _conf_hist`) ke seluruh frame HSV.
 2. **Pre-translate** jendela pencarian berdasarkan kecepatan yang diprediksi Kalman, sehingga CamShift mulai dari dekat posisi target yang diharapkan.
@@ -60,9 +67,9 @@ CamShift secara iteratif menggeser dan mengubah ukuran window untuk memaksimalka
 | Explosion | `w > 90% lebar frame or h > 90% tinggi frame` | `camshift_bad = True` |
 | Density | `mean(back_proj dalam window) / 255 < 0.05` | `camshift_bad = True` |
 
-### A2a. Prediksi Kalman saat CamShift Gagal
+### A2a. Prediksi Kalman saat Tracker Gagal
 
-Ketika `camshift_bad = True` tetapi filter Kalman sudah diinisialisasi, tracker **tidak langsung mereset**. Sebagai gantinya, Kalman melakukan langkah *predict-only* (tanpa pengukuran) selama hingga `_KF_MISS_MAX = 5` frame berturut-turut:
+Filter Kalman [19, 20] digunakan sebagai estimator posisi sekunder. Ketika `camshift_bad = True` (atau miss_count meningkat pada tracker penampilan) tetapi filter Kalman sudah diinisialisasi, tracker **tidak langsung mereset**. Sebagai gantinya, Kalman melakukan langkah *predict-only* (tanpa pengukuran) selama hingga `_KF_MISS_MAX = 5` frame berturut-turut:
 
 ```
 miss_count < _KF_MISS_MAX:
@@ -89,6 +96,34 @@ Dari perspektif `seekerctrl.py`, frame predict-only mengembalikan `cx, cy` yang 
 ### A2b. Snap Correction
 
 Setelah CamShift berhasil, jika deteksi blob (dari mask) ditemukan dan pusat blob berbeda dari pusat CamShift lebih dari `0.5 × max(bw, bh)`, jendela tracking dikoreksi ke posisi blob. Ini mencegah CamShift "melayang" ke warna serupa di background sementara blob sebenarnya ada di tempat lain.
+
+### A2c. Tracker Berbasis Penampilan (Appearance-Based Trackers)
+
+Sebagai alternatif CamShift/MeanShift, drone-seeker mendukung tracker penampilan pilihan melalui `--tracker [mil|csrt|dasiamrpn|nano|vit]`. Ketika diaktifkan, tracker penampilan diinisialisasi saat `_detect_count == 3` dengan bounding box deteksi, lalu berjalan setiap frame menggantikan CamShift.
+
+| Opsi | Algoritma | Referensi | File model |
+|---|---|---|---|
+| `mil` | Multiple Instance Learning | [23] | — |
+| `csrt` | Channel & Spatial Reliability | [24] | — |
+| `dasiamrpn` | Distractor-aware Siamese RPN | [25, 26] | `dasiamrpn_kernel_cls1.onnx`, `dasiamrpn_kernel_r1.onnx`, `dasiamrpn_model.onnx` |
+| `nano` | NanoTrack (Siamese ringan) | [27] | `nanotrack_backbone_sim.onnx`, `nanotrack_head_sim.onnx` |
+| `vit` | Vision Transformer tracker | [28] | `vitTracker.onnx` |
+
+Karena tracker penampilan tidak mengetahui warna target secara inheren, lapisan **validasi warna** ditambahkan: mask deteksi dijalankan pada ROI yang dikembalikan tracker setiap frame. Jika `countNonZero(roi_mask) < _MIN_BLOB_AREA` untuk `_KF_MISS_MAX` frame berurutan, tracker direset ke mode deteksi.
+
+```
+ok, bbox = tracker.update(frame)
+if ok:
+    roi_mask = detection_mask(frame[bbox])
+    if countNonZero(roi_mask) < _MIN_BLOB_AREA:
+        miss_count++
+        if miss_count >= _KF_MISS_MAX: hard_reset()
+        return predict_only()
+    miss_count = 0
+    # EMA + Kalman update + draw
+```
+
+---
 
 ### A3. Perhitungan Error (`error_xy`)
 
@@ -489,7 +524,7 @@ Kondisi `0 < dt < 0.5 s` melindungi dari estimasi derivatif yang basi pada frame
 
 ### 11.2 Proportional Navigation Lead
 
-Komponen kedua, `T_PN` (≈ 300 ms), mengimplementasikan hukum panduan **proportional navigation (PN)** yang disederhanakan. PN klasik memerintahkan akselerasi lateral proporsional terhadap laju LOS (line-of-sight) [15, 16]:
+Komponen kedua, `T_PN` (≈ 300 ms), mengimplementasikan hukum panduan **proportional navigation (PN)** yang disederhanakan. PN klasik memerintahkan akselerasi lateral proporsional terhadap laju LOS (line-of-sight) [16, 17]:
 
 ```
 a_c = N · V_c · λ̇
