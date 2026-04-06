@@ -110,70 +110,30 @@ _KF_R        = 30.0   # measurement noise         (px^2)
 _KF_MISS_MAX = 5      # predict this many frames after lock loss, then give up
 
 
-_TRACKER_NAMES = ("csrt", "mil", "dasiamrpn", "nano", "vit")
-
-# (free_fn_attr, class_attr) per tracker name.
-_TRACKER_ATTRS: dict[str, tuple[str, str]] = {
-    "csrt":      ("TrackerCSRT_create",      "TrackerCSRT"),
-    "mil":       ("TrackerMIL_create",       "TrackerMIL"),
-    "dasiamrpn": ("TrackerDaSiamRPN_create", "TrackerDaSiamRPN"),
-    "nano":      ("TrackerNano_create",      "TrackerNano"),
-    "vit":       ("TrackerVit_create",       "TrackerVit"),
-}
-
-# Model files required by DNN-based trackers (must be in CWD or full path).
-_TRACKER_MODELS: dict[str, list[str]] = {
-    "vit":       ["vitTracker.onnx"],
-    "dasiamrpn": ["dasiamrpn_model.onnx",
-                  "dasiamrpn_kernel_cls1.onnx",
-                  "dasiamrpn_kernel_r1.onnx"],
-    "nano":      ["nanotrack_backbone_sim.onnx",
-                  "nanotrack_head_sim.onnx"],
-}
-
-
 def _make_tracker(name: str):
-    """Create a cv2 tracker by name.
+    """Create a cv2 MIL tracker.
 
     Handles three API variants across OpenCV versions:
-      - free function  cv2.TrackerXxx_create()      (OpenCV ≤ 4.4 / contrib)
-      - legacy ns      cv2.legacy.TrackerXxx_create()
-      - class method   cv2.TrackerXxx.create()       (OpenCV 4.5+)
-
-    Raises RuntimeError with a helpful message if the tracker is unavailable
-    or required ONNX model files are missing.
+      - free function  cv2.TrackerMIL_create()  (OpenCV ≤ 4.4 / contrib)
+      - legacy ns      cv2.legacy.TrackerMIL_create()
+      - class method   cv2.TrackerMIL.create()  (OpenCV 4.5+)
     """
-    name = name.lower()
-    if name not in _TRACKER_ATTRS:
-        raise ValueError(
-            f"Unknown tracker '{name}'. Choose from: {', '.join(_TRACKER_NAMES)}"
-        )
-    fn_attr, cls_attr = _TRACKER_ATTRS[name]
+    if name.lower() != "mil":
+        raise ValueError(f"Unknown tracker '{name}'. Only 'mil' is supported.")
     try:
-        # Free function (old API or contrib)
-        if hasattr(cv2, fn_attr):
-            return getattr(cv2, fn_attr)()
-        # Legacy namespace (contrib 4.5–4.9)
+        if hasattr(cv2, "TrackerMIL_create"):
+            return cv2.TrackerMIL_create()
         legacy = getattr(cv2, "legacy", None)
-        if legacy and hasattr(legacy, fn_attr):
-            return getattr(legacy, fn_attr)()
-        # Class-based API (main OpenCV 4.5+)
-        if hasattr(cv2, cls_attr):
-            return getattr(cv2, cls_attr).create()
+        if legacy and hasattr(legacy, "TrackerMIL_create"):
+            return legacy.TrackerMIL_create()
+        if hasattr(cv2, "TrackerMIL"):
+            return cv2.TrackerMIL.create()
         raise RuntimeError(
-            f"Tracker '{name}' not available in this OpenCV build "
-            f"(cv2 {cv2.__version__}). "
+            f"TrackerMIL not available in this OpenCV build (cv2 {cv2.__version__}). "
             f"Try: pip install opencv-contrib-python"
         )
     except cv2.error as exc:
-        models = _TRACKER_MODELS.get(name)
-        if models:
-            raise RuntimeError(
-                f"Tracker '{name}' requires model file(s): {', '.join(models)}\n"
-                f"Download from https://github.com/opencv/opencv_zoo and place "
-                f"in the working directory."
-            ) from exc
-        raise RuntimeError(f"Tracker '{name}' failed to create: {exc}") from exc
+        raise RuntimeError(f"TrackerMIL failed to create: {exc}") from exc
 
 
 def _kf1d(x0, x1, P00, P01, P10, P11, meas, dt):
@@ -685,7 +645,7 @@ class Seeker:
             self._update_histogram_window()
             return out, None, None
 
-        # ── CSRT step (replaces CamShift when --csrt is active) ──────────────
+        # ── MIL step (replaces CamShift when --tracker mil is active) ────────
         if self._tracker_name and self._tracker_obj is not None:
             ok, bbox = self._tracker_obj.update(frame)
             if ok:

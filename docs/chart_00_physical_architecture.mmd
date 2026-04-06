@@ -1,0 +1,44 @@
+---
+title: Physical Architecture — HITL Setup
+---
+%%{init: {"flowchart": {"defaultRenderer": "elk"}}}%%
+flowchart LR
+    subgraph GROUND["🖥️ Ground"]
+        direction LR
+        RCTX["🎮 RC Transmitter"]
+        subgraph LAPTOP["💻 Laptop"]
+            direction LR
+            QGC[QGroundControl]
+            XP[X-Plane] --> MON[🖥️ Monitor]
+        end
+    end
+
+    subgraph AIRFRAME["✈️ AtomRC Mobula 650mm"]
+        direction TB
+        FC["Flight Controller\n(ArduPlane)"] --- RCRX["RC Receiver\n(SBUS/PWM)"]
+        subgraph COMPANION["💻 Companion Computer"]
+            direction TB
+            CAM[Kamera] --> SK[Seeker]
+            SK -->|MAVLink UDP| MAVP[MAVProxy]
+        end
+        MAVP -->|serial| FC
+    end
+
+    RCTX -->|2.4 GHz RF| RCRX
+    MON -.->|visual| CAM
+    FC <-->|pppd / Telem3| XP
+    MAVP -->|WiFi| QGC
+
+    style AIRFRAME  fill:#fff8ec,stroke:#b85c1a,color:#333
+    style GROUND    fill:#eef4fb,stroke:#2c6fad,color:#333
+    style LAPTOP    fill:#f0faf5,stroke:#1d7a68,color:#333
+    style COMPANION fill:#fef9e7,stroke:#d4ac0d,color:#333
+    style RCTX  fill:#4A90D9,stroke:#2c6fad,color:#fff
+    style FC    fill:#E07B39,stroke:#b85c1a,color:#fff
+    style RCRX  fill:#5BA3E0,stroke:#2c6fad,color:#fff
+    style CAM   fill:#F0C040,stroke:#c89a10,color:#333
+    style SK    fill:#E05C5C,stroke:#b83030,color:#fff
+    style MAVP  fill:#3A9E8A,stroke:#1d7a68,color:#fff
+    style QGC   fill:#2ECC71,stroke:#1a9e52,color:#fff
+    style XP    fill:#7B5EA7,stroke:#5a3d87,color:#fff
+    style MON   fill:#5B7FD4,stroke:#3558b0,color:#fff

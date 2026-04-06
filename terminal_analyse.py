@@ -1,19 +1,27 @@
 """terminal_analyse.py — Analyse the terminal phase of a tracking run.
 
-Loads tracking.csv (written by seekerctrl.py with --debug) and produces
-four panels focused on the terminal phase (terminal == 1) and the seconds
-just before it:
+Loads a raw tracking.csv (written by seekerctrl.py with --debug) and produces
+four panels focused on the terminal phase.  Before plotting the script applies
+a two-stage cut to the raw data:
 
-  1. Altitude + airspeed + throttle vs time
-  2. errorx / errory (camera error) vs time
-  3. pitch_deg + roll_deg vs time
-  4. Elevator + aileron (surface) vs time
+  Stage 1 — first pass only
+    Scan from the first target-lock forward tracking the running minimum of
+    dist_m.  Stop at the last row before dist_m first rises significantly
+    (> max(2 m, 20 % of minimum)) above that minimum.  This isolates the first
+    approach pass and discards any overshoot / second pass.
 
-A vertical dashed line marks the terminal phase entry.
+  Stage 2 — trim trailing climb
+    Within the stage-1 window find the global minimum of alt_rel_m and discard
+    everything after it.
+
+The figure shows four panels (altitude, camera error, attitude, surfaces) over
+the stage-2 window.  Vertical lines mark terminal-phase entry (red), nearest
+distance (cyan), and lowest altitude (magenta).
 
 Usage
 -----
     python3 terminal_analyse.py [tracking.csv]
+    python3 terminal_analyse.py original_tracking.csv
 """
 
 import sys
@@ -22,9 +30,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-# How many seconds before terminal phase to include in the overview window.
-PRE_TERMINAL_S = 10.0
 
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 def load(path: str) -> dict[str, np.ndarray]:
     cols = [
@@ -44,20 +51,16 @@ def load(path: str) -> dict[str, np.ndarray]:
         for row in reader:
             for k in cols:
                 v = row.get(k, "").strip()
-                if v == "":
-                    data[k].append(float("nan"))
-                else:
-                    data[k].append(float(v))
+                data[k].append(float("nan") if v == "" else float(v))
     return {k: np.array(v) for k, v in data.items()}
 
 
-def find_terminal_entry(d: dict) -> float | None:
-    """Return timestamp of first terminal==1 sample, or None."""
-    idx = np.where(d["terminal"] == 1.0)[0]
-    if len(idx) == 0:
-        return None
-    return float(d["timestamp_s"][idx[0]])
+def slice_data(d: dict, start: int, end: int) -> dict[str, np.ndarray]:
+    """Return a new dict with every array sliced to [start:end+1]."""
+    return {k: v[start:end + 1] for k, v in d.items()}
 
+
+# ── Cut algorithm ─────────────────────────────────────────────────────────────
 
 def find_first_lock(d: dict) -> int | None:
     """Return row index of first target_locked==1 sample, or None."""
@@ -65,45 +68,100 @@ def find_first_lock(d: dict) -> int | None:
     return int(idx[0]) if len(idx) > 0 else None
 
 
-def _find_min_col(d: dict, col: str, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
-    """Return (row_index, timestamp) of minimum *col* during terminal phase.
+def find_first_pass_end(d: dict, first_lock_idx: int,
+                        threshold_abs: float = 2.0,
+                        threshold_rel: float = 0.20) -> int:
+    """Stage 1: last row of the first approach pass.
 
-    Searches only within rows where terminal==1.  Falls back to the global
-    minimum if there is no terminal phase in the data.
+    Scans forward from first_lock_idx tracking the running minimum of dist_m.
+    Returns the index of that minimum the first time dist_m rises above it by
+    more than max(threshold_abs, running_min * threshold_rel).
     """
-    if t_entry is not None:
-        term_idx = np.where(d["terminal"] == 1.0)[0]
-        if len(term_idx) > 0:
-            min_local  = int(np.nanargmin(d[col][term_idx]))
-            global_idx = int(term_idx[min_local])
-            return global_idx, float(d["timestamp_s"][global_idx])
-    # fallback: global minimum
+    dist = d["dist_m"]
+    running_min = float("inf")
+    running_min_idx = first_lock_idx
+
+    for i in range(first_lock_idx, len(dist)):
+        v = dist[i]
+        if np.isnan(v):
+            continue
+        if v <= running_min:
+            running_min = v
+            running_min_idx = i
+        elif v > running_min + max(threshold_abs, running_min * threshold_rel):
+            return running_min_idx
+
+    return running_min_idx   # never rose — use last minimum (end of data)
+
+
+def find_lowest_alt_idx(d: dict) -> int:
+    """Stage 2: last row index at the global minimum alt_rel_m."""
+    alt = d["alt_rel_m"]
+    min_val = np.nanmin(alt)
+    last_idx = int(np.where(alt == min_val)[0][-1])
+    return last_idx
+
+
+def apply_cuts(d: dict) -> tuple[dict, int, int]:
+    """Apply stage-1 and stage-2 cuts.  Returns (cut_data, pass_end_idx, lowest_alt_idx).
+
+    Both returned indices are relative to the *cut* dataset (row 0 = original row 0).
+    """
+    first_lock_idx = find_first_lock(d)
+    if first_lock_idx is None:
+        # No lock at all — return full data unchanged
+        return d, len(d["timestamp_s"]) - 1, int(np.nanargmin(d["alt_rel_m"]))
+
+    # Stage 1: isolate first approach pass
+    pass_end_idx = find_first_pass_end(d, first_lock_idx)
+
+    # Stage 2: trim trailing climb — keep up to lowest alt within stage-1 window
+    d_stage1  = slice_data(d, 0, pass_end_idx)
+    lowest_in_stage1 = find_lowest_alt_idx(d_stage1)
+
+    # Final cut: rows 0 … lowest_in_stage1 (inclusive)
+    d_cut = slice_data(d_stage1, 0, lowest_in_stage1)
+
+    # pass_end and lowest_alt indices within d_cut
+    pass_end_in_cut  = min(pass_end_idx,      len(d_cut["timestamp_s"]) - 1)
+    lowest_in_cut    = lowest_in_stage1       # already trimmed to this
+
+    return d_cut, pass_end_in_cut, lowest_in_cut
+
+
+# ── Statistics helpers ────────────────────────────────────────────────────────
+
+def find_terminal_entry(d: dict) -> float | None:
+    """Return timestamp of first terminal==1 sample, or None."""
+    idx = np.where(d["terminal"] == 1.0)[0]
+    return float(d["timestamp_s"][idx[0]]) if len(idx) > 0 else None
+
+
+def _find_min_col(d: dict, col: str) -> tuple[int, float]:
     idx = int(np.nanargmin(d[col]))
     return idx, float(d["timestamp_s"][idx])
 
 
-def find_lowest_alt(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
-    """Return (row_index, timestamp) of minimum alt_rel_m during terminal phase."""
-    return _find_min_col(d, "alt_rel_m", t_entry)
+def find_lowest_alt(d: dict) -> tuple[int, float]:
+    return _find_min_col(d, "alt_rel_m")
 
 
-def find_nearest_dist(d: dict, t_entry: float | None) -> tuple[int, float] | tuple[None, None]:
-    """Return (row_index, timestamp) of minimum dist_m (3-D slant distance) during terminal phase."""
-    return _find_min_col(d, "dist_m", t_entry)
+def find_nearest_dist(d: dict) -> tuple[int, float]:
+    return _find_min_col(d, "dist_m")
 
 
+# ── Terminal output ───────────────────────────────────────────────────────────
 
-def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
-                  lowest_idx: int | None = None, nearest_idx: int | None = None):
-    n       = len(d["timestamp_s"])
-    t0, t1  = d["timestamp_s"][0], d["timestamp_s"][-1]
-    dur     = t1 - t0
-    locked  = int(np.nansum(d["target_locked"]))
-    term    = int(np.nansum(d["terminal"]))
+def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
+    n      = len(d["timestamp_s"])
+    t0, t1 = d["timestamp_s"][0], d["timestamp_s"][-1]
+    dur    = t1 - t0
+    locked = int(np.nansum(d["target_locked"]))
+    term   = int(np.nansum(d["terminal"]))
 
-    unlocked      = n - locked
-    pct_locked    = 100.0 * locked   / n if n else 0.0
-    pct_unlocked  = 100.0 * unlocked / n if n else 0.0
+    unlocked     = n - locked
+    pct_locked   = 100.0 * locked   / n if n else 0.0
+    pct_unlocked = 100.0 * unlocked / n if n else 0.0
 
     print(f"\n{'─'*55}")
     print(f"  File duration   : {dur:.1f} s  ({n} rows)")
@@ -111,7 +169,6 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
     print(f"  Track lost      : {unlocked} rows  ({pct_unlocked:.1f}%)")
     print(f"  Terminal phase  : {term} rows  ({100*term/n:.0f}%)")
 
-    # ── First track acquisition ───────────────────────��───────────────────────
     if first_lock_idx is not None:
         fl_t    = d["timestamp_s"][first_lock_idx]
         fl_alt  = d["alt_rel_m"][first_lock_idx]
@@ -124,7 +181,6 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
         if np.isfinite(fl_dist):
             print(f"  Distance        : {fl_dist:.1f} m")
 
-    # ── Terminal phase ─────────────────────────────────���──────────────────────
     if t_entry is not None:
         mask_t    = d["terminal"] == 1.0
         alt_t     = d["alt_rel_m"][mask_t]
@@ -132,11 +188,11 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
         ex_t      = d["errorx"][mask_t]
         ey_t      = d["errory"][mask_t]
         locked_t  = d["target_locked"][mask_t]
+        dist_t    = d["dist_m"][mask_t]
         n_t       = len(locked_t)
         lost_t    = int(np.nansum(locked_t == 0.0))
         pct_lost_t = 100.0 * lost_t / n_t if n_t else 0.0
 
-        dist_t = d["dist_m"][mask_t]
         print(f"\n  ── Terminal phase entry ──")
         print(f"  Entry time      : t+{t_entry - t0:.1f} s")
         print(f"  Alt above target: {alt_t[0]:.1f} m")
@@ -150,93 +206,31 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None,
         print(f"  Speed range     : {np.nanmin(spd_t) * 3.6:.1f} – {np.nanmax(spd_t) * 3.6:.1f} km/h")
         print(f"  |errorx| mean   : {np.nanmean(np.abs(ex_t)):.3f}  max: {np.nanmax(np.abs(ex_t)):.3f}")
         print(f"  |errory| mean   : {np.nanmean(np.abs(ey_t)):.3f}  max: {np.nanmax(np.abs(ey_t)):.3f}")
-
-        last_dist = dist_t[-1]
-        if np.isfinite(last_dist):
-            print(f"\n  ── Last logged frame ──")
-            print(f"  Alt             : {alt_t[-1]:.1f} m")
-            print(f"  Distance        : {last_dist:.1f} m")
-
-    # ── Lowest altitude ───────────────────────────────────────────────────────
-    if lowest_idx is not None:
-        lo_t    = d["timestamp_s"][lowest_idx]
-        lo_alt  = d["alt_rel_m"][lowest_idx]
-        lo_spd  = d["airspeed_ms"][lowest_idx]
-        lo_dist = d["dist_m"][lowest_idx]
-        lo_ex   = d["errorx"][lowest_idx]
-        lo_ey   = d["errory"][lowest_idx]
-        print(f"\n  ── Lowest altitude ──  (magenta line)")
-        print(f"  Time            : t+{lo_t - t0:.1f} s")
-        print(f"  Alt above target: {lo_alt:.1f} m")
-        print(f"  Speed           : {lo_spd * 3.6:.1f} km/h")
-        if np.isfinite(lo_dist):
-            print(f"  Distance        : {lo_dist:.1f} m")
-        if np.isfinite(lo_ex) and np.isfinite(lo_ey):
-            print(f"  errorx / errory : {lo_ex:+.3f} / {lo_ey:+.3f}")
-
-    # ── Nearest distance ──────────────────────────────────────────────────────
-    if nearest_idx is not None:
-        nr_t    = d["timestamp_s"][nearest_idx]
-        nr_alt  = d["alt_rel_m"][nearest_idx]
-        nr_spd  = d["airspeed_ms"][nearest_idx]
-        nr_dist = d["dist_m"][nearest_idx]
-        nr_ex   = d["errorx"][nearest_idx]
-        nr_ey   = d["errory"][nearest_idx]
-        print(f"\n  ── Nearest distance ──  (cyan line)")
-        print(f"  Time            : t+{nr_t - t0:.1f} s")
-        print(f"  Alt above target: {nr_alt:.1f} m")
-        print(f"  Speed           : {nr_spd * 3.6:.1f} km/h")
-        if np.isfinite(nr_dist):
-            print(f"  Distance        : {nr_dist:.1f} m")
-        if np.isfinite(nr_ex) and np.isfinite(nr_ey):
-            print(f"  errorx / errory : {nr_ex:+.3f} / {nr_ey:+.3f}")
-
-    if t_entry is None:
+    else:
         print("\n  No terminal phase data (terminal column all 0).")
-        print("  Set _TRK_TERM_ALT > 0 in seekerctrl.py and re-fly.")
+
     print(f"{'─'*55}\n")
 
 
-def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "tracking.csv"
-    try:
-        d = load(path)
-    except FileNotFoundError:
-        print(f"File not found: {path}")
-        sys.exit(1)
+# ── Plot ──────────────────────────────────────────────────────────────────────
 
-    if len(d["timestamp_s"]) < 5:
-        print("Not enough data rows.")
-        sys.exit(1)
-
-    t_entry        = find_terminal_entry(d)
-    first_lock_idx = find_first_lock(d)
-    lowest_idx,  t_lowest  = find_lowest_alt(d,   t_entry)
-    nearest_idx, t_nearest = find_nearest_dist(d, t_entry)
-    print_summary(d, t_entry, first_lock_idx, lowest_idx, nearest_idx)
-
-    # ── Select window: PRE_TERMINAL_S before entry through later of both minima
-    t0_full = d["timestamp_s"][0]
-    if t_entry is not None:
-        t_window_start = t_entry - PRE_TERMINAL_S
-    else:
-        t_window_start = t0_full
-
-    candidates   = [v for v in (t_lowest, t_nearest) if v is not None]
-    t_window_end = max(candidates) if candidates else d["timestamp_s"][-1]
-    mask = (d["timestamp_s"] >= t_window_start) & (d["timestamp_s"] <= t_window_end)
-    t    = d["timestamp_s"][mask] - t0_full   # normalise to zero
+def _plot_figure(d: dict, path: str,
+                 t0_full: float,
+                 t_entry: float | None,
+                 t_lowest: float | None,
+                 t_nearest: float | None):
+    t = d["timestamp_s"] - t0_full
 
     def s(key):
-        return d[key][mask]
+        return d[key]
 
-    t_entry_rel   = (t_entry   - t0_full) if t_entry   is not None else None
-    t_lowest_rel  = (t_lowest  - t0_full) if t_lowest  is not None else None
-    t_nearest_rel = (t_nearest - t0_full) if t_nearest is not None else None
+    def vline(ax, ts, color, ls, label=None):
+        if ts is not None:
+            ax.axvline(ts - t0_full, color=color, linewidth=1.2,
+                       linestyle=ls, label=label)
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10))
-    fig.suptitle(f"Terminal Phase Analysis — {path}", fontsize=13)
+    fig.suptitle(f"Terminal Phase — {path}", fontsize=13)
     gs  = gridspec.GridSpec(4, 1, hspace=0.45)
 
     # ── Panel 1: altitude, airspeed, throttle ─────────────────────────────────
@@ -245,20 +239,17 @@ def main():
     ax1c = ax1.twinx()
     ax1c.spines["right"].set_position(("axes", 1.12))
 
-    ax1.plot(t, s("alt_rel_m"),    color="tab:blue",   label="alt rel (m)")
-    ax1b.plot(t, s("airspeed_ms") * 3.6, color="tab:orange",  label="airspeed (km/h)", linestyle="--")
-    ax1c.plot(t, s("throttle_pct"),color="tab:green",   label="throttle (%)",   linestyle=":")
-    if t_entry_rel is not None:
-        ax1.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--", label="terminal entry")
-    if t_lowest_rel is not None:
-        ax1.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":", label="lowest alt")
-    if t_nearest_rel is not None:
-        ax1.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":", label="nearest dist")
-    ax1.set_ylabel("alt rel (m)");  ax1b.set_ylabel("speed (km/h)");  ax1c.set_ylabel("throttle (%)")
+    ax1.plot(t, s("alt_rel_m"),          color="tab:blue",   label="alt rel (m)")
+    ax1b.plot(t, s("airspeed_ms") * 3.6, color="tab:orange", label="airspeed (km/h)", linestyle="--")
+    ax1c.plot(t, s("throttle_pct"),       color="tab:green",  label="throttle (%)",    linestyle=":")
+    vline(ax1, t_entry,   "red",     "--", "terminal entry")
+    vline(ax1, t_nearest, "cyan",    ":",  "nearest dist")
+    vline(ax1, t_lowest,  "magenta", ":",  "lowest alt")
+    ax1.set_ylabel("alt rel (m)"); ax1b.set_ylabel("speed (km/h)"); ax1c.set_ylabel("throttle (%)")
     ax1.set_title("Altitude / Airspeed / Throttle")
-    lines = (ax1.get_legend_handles_labels()[0] +
-             ax1b.get_legend_handles_labels()[0] +
-             ax1c.get_legend_handles_labels()[0])
+    lines  = (ax1.get_legend_handles_labels()[0] +
+              ax1b.get_legend_handles_labels()[0] +
+              ax1c.get_legend_handles_labels()[0])
     labels = (ax1.get_legend_handles_labels()[1] +
               ax1b.get_legend_handles_labels()[1] +
               ax1c.get_legend_handles_labels()[1])
@@ -270,17 +261,13 @@ def main():
     ax2.plot(t, s("errorx"), color="tab:blue",   label="errorx")
     ax2.plot(t, s("errory"), color="tab:orange",  label="errory")
     ax2.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    if t_entry_rel is not None:
-        ax2.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
-    if t_lowest_rel is not None:
-        ax2.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":")
-    if t_nearest_rel is not None:
-        ax2.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":")
-    # shade locked / unlocked
+    vline(ax2, t_entry,   "red",     "--")
+    vline(ax2, t_nearest, "cyan",    ":")
+    vline(ax2, t_lowest,  "magenta", ":")
     locked = s("target_locked")
     for i in range(len(t) - 1):
         if locked[i] == 0:
-            ax2.axvspan(t[i], t[i+1], color="grey", alpha=0.15)
+            ax2.axvspan(t[i], t[i + 1], color="grey", alpha=0.15)
     ax2.set_ylabel("normalised [-1,1]")
     ax2.set_title("Camera Error  (grey = lock lost)")
     ax2.legend(fontsize=7, loc="upper right")
@@ -292,12 +279,9 @@ def main():
     ax3.plot(t, s("roll_deg"),      color="tab:orange",  label="roll (deg)")
     ax3.plot(t, s("nav_pitch_deg"), color="tab:green",   label="nav_pitch (deg)", linestyle="--")
     ax3.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    if t_entry_rel is not None:
-        ax3.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
-    if t_lowest_rel is not None:
-        ax3.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":")
-    if t_nearest_rel is not None:
-        ax3.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":")
+    vline(ax3, t_entry,   "red",     "--")
+    vline(ax3, t_nearest, "cyan",    ":")
+    vline(ax3, t_lowest,  "magenta", ":")
     ax3.set_ylabel("degrees")
     ax3.set_title("Aircraft Attitude")
     ax3.legend(fontsize=7, loc="upper right")
@@ -308,12 +292,9 @@ def main():
     ax4.plot(t, s("elevator"), color="tab:blue",   label="elevator")
     ax4.plot(t, s("aileron"),  color="tab:orange",  label="aileron")
     ax4.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    if t_entry_rel is not None:
-        ax4.axvline(t_entry_rel, color="red", linewidth=1.2, linestyle="--")
-    if t_lowest_rel is not None:
-        ax4.axvline(t_lowest_rel,  color="magenta", linewidth=1.2, linestyle=":", label="lowest alt")
-    if t_nearest_rel is not None:
-        ax4.axvline(t_nearest_rel, color="cyan",    linewidth=1.2, linestyle=":", label="nearest dist")
+    vline(ax4, t_entry,   "red",     "--")
+    vline(ax4, t_nearest, "cyan",    ":",  "nearest dist")
+    vline(ax4, t_lowest,  "magenta", ":",  "lowest alt")
     ax4.set_ylabel("normalised")
     ax4.set_xlabel("time (s)")
     ax4.set_title("Control Surfaces (elevon demix)")
@@ -321,6 +302,35 @@ def main():
     ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "tracking.csv"
+    try:
+        d_raw = load(path)
+    except FileNotFoundError:
+        print(f"File not found: {path}")
+        sys.exit(1)
+
+    if len(d_raw["timestamp_s"]) < 5:
+        print("Not enough data rows.")
+        sys.exit(1)
+
+    # Apply stage-1 (first pass) and stage-2 (lowest alt) cuts
+    d, _pass_end, _lowest = apply_cuts(d_raw)
+
+    t_entry        = find_terminal_entry(d)
+    first_lock_idx = find_first_lock(d)
+    _, t_lowest    = find_lowest_alt(d)
+    _, t_nearest   = find_nearest_dist(d)
+
+    print_summary(d, t_entry, first_lock_idx)
+
+    t0_full = d_raw["timestamp_s"][0]
+    _plot_figure(d, path, t0_full=t0_full,
+                 t_entry=t_entry, t_lowest=t_lowest, t_nearest=t_nearest)
     plt.show()
 
 

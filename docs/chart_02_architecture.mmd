@@ -1,25 +1,35 @@
-flowchart TD
-    RCTX[Pemancar RC\ninput pilot] -->|2.4 GHz RF| RCRX[Penerima RC\nPWM / SBUS]
-    RCRX -->|kanal hardware| FC
+flowchart LR
+    RCTX[RC Transmitter] -->|2.4 GHz RF| RCRX[RC Receiver\nPWM/SBUS]
+    RCRX --> FC
 
-    JOY[Joystick USB\nopsional] -->|RC_CHANNELS_OVERRIDE\nmelalui MAVLink| FC
+    XP[X-Plane] -->|pppd| FC[Flight Controller]
+    FC -->|USB serial| MAVP[MAVProxy]
+    MAVP -->|MAVLink UDP| QGC[QGroundControl]
+    MAVP -->|MAVLink UDP| SK
 
-    CAM[Kamera\nOpenCV] -->|frame| SK[Seeker\ndeteksi / lacak\nCamShift · MeanShift · MIL · CSRT\nDaSiamRPN · Nano · ViT · Kalman]
-    SK -->|cx cy| EXY[error_xy\nerrorx errory ∈ -1..1]
+    CAM[Kamera] -->|frame| SK[Seeker\ndeteksi / lacak]
+    SK -->|error xy| PRED[Prediktor\nLatensi]
+    PRED --> SM[State Machine]
 
-    EXY -->|error mentah| PRED[Prediktor Latensi\n+ PN lead]
-    PRED -->|error terprediksi| SM[State Machine Mode\nRule 1/2/3 · deteksi tepi ch6]
+    FC -->|telemetri| SM
+    SM -->|mode / tracking cmd| FC
 
-    FC[Flight Controller\npymavlink] -->|telemetri RC_CHANNELS| SM
-    FC -->|HEARTBEAT  mode terbang| SM
-    FC -->|ATTITUDE roll pitch yaw| TEL[Polling Telemetri]
-    FC -->|GLOBAL_POSITION_INT lat lon alt| TEL
-    FC -->|VFR_HUD airspeed throttle| TEL
-
-    TEL --> HUD[HudDisplay\ntape yaw · tangga pitch · roll]
-    TEL --> CSV[Logger CSV\nsaat --debug]
-
-    SM -->|MAV_CMD_DO_SET_MODE\nTRACKING / AUTO / STABILIZE| FC
-    SM -->|error tracking x y\nsaat tracking + terkunci| FC
+    FC -->|telemetri| TEL[Telemetri]
+    TEL --> HUD[HudDisplay]
+    TEL --> CSV[Logger CSV]
     SM --> HUD
     SM --> CSV
+
+    style RCTX  fill:#4A90D9,stroke:#2c6fad,color:#fff
+    style RCRX  fill:#5BA3E0,stroke:#2c6fad,color:#fff
+    style XP    fill:#7B5EA7,stroke:#5a3d87,color:#fff
+    style FC    fill:#E07B39,stroke:#b85c1a,color:#fff
+    style MAVP  fill:#3A9E8A,stroke:#1d7a68,color:#fff
+    style QGC   fill:#2ECC71,stroke:#1a9e52,color:#fff
+    style CAM   fill:#F0C040,stroke:#c89a10,color:#333
+    style SK    fill:#E05C5C,stroke:#b83030,color:#fff
+    style PRED  fill:#E8963A,stroke:#c07010,color:#fff
+    style SM    fill:#5B7FD4,stroke:#3558b0,color:#fff
+    style TEL   fill:#7D8B9A,stroke:#56687a,color:#fff
+    style HUD   fill:#58B09C,stroke:#358070,color:#fff
+    style CSV   fill:#9E9E9E,stroke:#6e6e6e,color:#fff

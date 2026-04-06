@@ -5,12 +5,12 @@ stateDiagram-v2
     Mencari --> Menghitung : blob terdeteksi / _detect_count = 1
 
     Menghitung --> Menghitung : blob terdeteksi / _detect_count < 3
-    Menghitung --> Melacak    : blob terdeteksi / _detect_count == 3\ninisialisasi tracker aktif
+    Menghitung --> Melacak    : blob terdeteksi / _detect_count == 3<br/>inisialisasi tracker aktif
     Menghitung --> Mencari    : tidak ada blob / _detect_count = 0
 
-    Melacak --> Melacak      : Tracker OK (CamShift / MeanShift / Appearance)\nvalidasi warna lulus\nKalman diperbarui, miss_count = 0
-    Melacak --> Memprediksi  : Tracker gagal (collapse/explosion/density)\natau validasi warna gagal
+    Melacak --> Melacak      : Tracker OK (CamShift / MeanShift / Appearance)<br/>validasi warna lulus<br/>Kalman diperbarui, miss_count = 0
+    Melacak --> Memprediksi  : Tracker gagal (collapse/explosion/density)<br/>atau validasi warna gagal
 
-    Memprediksi --> Memprediksi : Tracker gagal, miss_count < 5\nKalman prediksi saja
+    Memprediksi --> Memprediksi : Tracker gagal, miss_count < 5<br/>Kalman prediksi saja
     Memprediksi --> Melacak     : Tracker pulih, miss_count = 0
     Memprediksi --> Mencari     : miss_count >= 5, reset penuh

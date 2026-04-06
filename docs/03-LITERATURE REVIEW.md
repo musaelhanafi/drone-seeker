@@ -62,29 +62,46 @@ Ketika CamShift atau tracker penampilan kehilangan target (`camshift_bad = True`
 
 ---
 
-## 5b. Tracker Berbasis Penampilan (Appearance-Based Trackers)
+## 5b. Tracker Berbasis Penampilan — MIL
 
-Selain tracker berbasis histogram (CamShift/MeanShift), drone-seeker mendukung tracker penampilan pilihan yang diaktifkan melalui `--tracker [mil|csrt|dasiamrpn|nano|vit]`. Setelah target terkunci tiga frame berturut-turut, tracker penampilan diinisialisasi dengan bounding box deteksi dan berjalan setiap frame setelahnya. Karena tracker penampilan tidak secara inheren mengetahui warna target, drone-seeker menambahkan lapisan validasi warna: mask deteksi dijalankan pada ROI yang dikembalikan tracker setiap frame; jika `countNonZero(roi_mask) < _MIN_BLOB_AREA` selama `_KF_MISS_MAX` frame berurutan, tracker direset.
+Selain tracker berbasis histogram (CamShift/MeanShift), drone-seeker mendukung tracker penampilan MIL yang diaktifkan melalui `--tracker mil`. Setelah target terkunci tiga frame berturut-turut, tracker MIL diinisialisasi dengan bounding box deteksi dan berjalan setiap frame setelahnya. Karena tracker penampilan tidak secara inheren mengetahui warna target, drone-seeker menambahkan lapisan validasi warna: mask deteksi dijalankan pada ROI yang dikembalikan tracker setiap frame; jika `countNonZero(roi_mask) < _MIN_BLOB_AREA` selama `_KF_MISS_MAX` frame berurutan, tracker direset dan sistem kembali ke mode deteksi warna.
 
 ### MIL (Multiple Instance Learning)
 
-MIL [23] merumuskan tracking sebagai klasifikasi online. Alih-alih memberi label positif tunggal ke patch target, MIL menggunakan "bag" instance — sekumpulan patch dari sekitar posisi target — sebagai bag positif. Aturan MIL: sebuah bag positif jika *setidaknya satu* instancenya positif. Ini memberikan toleransi terhadap inaccurate labeling yang disebabkan oleh drift posisi tracker. Kelemahannya: classifier MIL selalu mengembalikan `ok=True` — ia tidak memiliki mekanisme bawaan untuk mendeteksi target yang hilang, sehingga validasi warna eksternal diperlukan.
+MIL diperkenalkan oleh Babenko et al. [23] sebagai kerangka kerja generalisasi dari klasifikasi online konvensional yang diterapkan pada visual object tracking. Pendekatan konvensional memberi label positif tunggal pada patch yang tepat di posisi target — namun dalam tracking video, posisi yang diestimasi selalu memiliki ketidakpastian inheren akibat noise pengukuran dan drift gradual. Akibatnya, patch berlabel positif seringkali tidak benar-benar berada pada objek target, yang secara bertahap meracuni classifier online dan menyebabkan drift tracking.
 
-### CSRT (Channel and Spatial Reliability Tracking)
+MIL mengatasinya dengan merumuskan masalah dalam kerangka Multiple Instance Learning (Dietterich et al. [29]): alih-alih satu patch positif, setiap update training menggunakan sebuah "bag" yang berisi beberapa patch kandidat yang disampling dari lingkungan sekitar posisi target yang diestimasi. Aturan MIL menyatakan bahwa sebuah bag positif jika *setidaknya satu* instance di dalamnya adalah positif. Kondisi lemah ini cukup untuk memastikan bahwa — meskipun posisi estimasi agak meleset — patch yang benar-benar berada pada target tetap memperoleh label positif secara implisit.
 
-CSRT [24] memperluas Discriminative Correlation Filter (DCF) dengan dua inovasi utama: (1) bobot spasial per-kanal yang mengestimasi bagian mana dari ROI yang dapat diandalkan untuk tracking, dan (2) filter yang dioptimalkan pada *multiple channel* fitur (HOG + color names). Bobot spasial memungkinkan tracker mengabaikan region latar belakang yang masuk ke dalam window tracking, meningkatkan akurasi secara signifikan pada target non-rectangular. CSRT umumnya memberikan akurasi lebih tinggi dari MIL tetapi dengan biaya komputasi yang lebih besar. Catatan: CSRT tidak tersedia di build OpenCV 4.10+ melalui paket inti; diperlukan modul `opencv-contrib`.
+Secara teknis, Babenko et al. menggunakan classifier berbasis **MILBoost**: sebuah prosedur boosting yang meminimalkan likelihood negatif di bawah model generatif MIL. Pada setiap frame, representasi fitur Haar-like diekstraksi dari patch dalam bag positif (dekat target) dan bag negatif (jauh dari target), dan boostingclassifier diperbarui secara online. Posisi target baru diestimasi sebagai patch dengan respons klasifier tertinggi dalam jendela pencarian.
 
-### DaSiamRPN (Distractor-aware Siamese RPN)
+Dalam implementasi OpenCV (`cv2.TrackerMIL_create()` / `cv2.legacy.TrackerMIL_create()`), classifier MILBoost ini dijalankan sepenuhnya pada CPU tanpa dependensi model eksternal. Properti kunci yang relevan untuk drone-seeker:
 
-DaSiamRPN [26] dibangun di atas SiamRPN [25], yang menggunakan dua cabang Siamese network untuk mengekstrak fitur dari template target dan patch pencarian, lalu melakukan cross-correlation untuk menghasilkan proposal bounding box secara efisien. DaSiamRPN menambahkan strategi pelatihan *distractor-aware*: jaringan secara eksplisit dilatih pada pasangan negatif semantically-similar (misalnya, orang lain selain orang target), sehingga lebih tahan terhadap pengalihan perhatian ke distractor. Tracker ini membutuhkan tiga file model ONNX yang harus diunduh terpisah: `dasiamrpn_kernel_cls1.onnx`, `dasiamrpn_kernel_r1.onnx`, `dasiamrpn_model.onnx`.
+- **Tidak memerlukan file model** — tidak ada bobot jaringan yang perlu diunduh; tracker diinisialisasi ulang dari awal setiap kali target dikunci kembali.
+- **Kompatibilitas OpenCV** — tersedia di OpenCV inti (tidak memerlukan `opencv-contrib`), sehingga dapat dikompilasi dan dijalankan di companion computer ARM tanpa dependensi tambahan.
+- **Keterbatasan deteksi kehilangan** — MIL tidak memiliki mekanisme bawaan untuk mendeteksi bahwa target telah hilang dari frame; classifier selalu mengembalikan bounding box dengan skor tertinggi terlepas dari apakah objek yang benar masih terlihat. Ini adalah alasan utama mengapa drone-seeker mewajibkan lapisan validasi warna eksternal yang dijelaskan di bawah.
 
-### NanoTrack
+### Workaround: Validasi Warna sebagai Pengganti Confidence Score
 
-NanoTrack [27] adalah tracker Siamese yang dirancang untuk perangkat edge dengan sumber daya terbatas. Arsitekturnya menggunakan backbone berparameter sangat rendah dan head pelacak yang disederhanakan, mencapai kecepatan inferensi tinggi dengan akurasi yang dapat diterima untuk aplikasi real-time pada hardware tertanam. Tracker ini membutuhkan dua file model ONNX: `nanotrack_backbone_sim.onnx` dan `nanotrack_head_sim.onnx`.
+Karena MIL tidak mengekspos ukuran keyakinan per-frame yang dapat diandalkan, drone-seeker mengimplementasikan deteksi kehilangan dua-lapis yang berjalan paralel dengan MIL setiap frame:
 
-### ViT (Vision Transformer) Tracker
+**Lapis 1 — Gate blob warna (per-frame):**
+Setelah `TrackerMIL.update()` mengembalikan bounding box `(x, y, w, h)`, pipeline menjalankan `_detection_mask()` (tiga metode deteksi HSV yang sama yang digunakan untuk akuisisi target) pada crop `hsv[y:y+h, x:x+w]`. Jika `cv2.countNonZero(roi_mask) < _MIN_BLOB_AREA` (9 px²), frame ini dihitung sebagai *miss* — MIL tidak dipercaya dan tidak ada sinyal error yang dikirim ke flight controller.
 
-Tracker ViT [28] memanfaatkan arsitektur Vision Transformer yang membagi gambar input menjadi patch berukuran tetap dan memodelkan hubungan antar patch melalui mekanisme *self-attention*. Berbeda dengan tracker berbasis CNN yang menangkap fitur lokal secara hierarkis, ViT menangkap dependensi jarak jauh dalam satu blok attention, menghasilkan representasi yang lebih diskriminatif pada variasi skala dan tekstur yang luas. Membutuhkan satu file model ONNX: `vitTracker.onnx`.
+**Lapis 2 — Counter toleransi (`miss_count`):**
+Miss tunggal tidak langsung mereset tracker, karena oklusi singkat dan saturasi cahaya sesaat bersifat sementara. Counter `_miss_count` diinkremen setiap frame yang gagal gate warna. Jika `_miss_count >= _KF_MISS_MAX` (5 frame berurutan ≈ 150 ms pada 30 fps), tracker dianggap telah drift sepenuhnya dan direset:
+
+```
+_track_win      = None      # lepaskan window tracking
+_detect_count   = 0         # kembali ke fase akuisisi
+_kf_initialized = False     # reset filter Kalman
+_miss_count     = 0
+_tracker_obj    = None      # hancurkan objek MIL
+```
+
+**Filter Kalman selama periode miss:**
+Selama `_miss_count < _KF_MISS_MAX`, filter Kalman tetap berjalan dalam mode *predict-only* (tanpa langkah koreksi pengukuran). Ini memproyeksikan posisi centroid berdasarkan kecepatan yang diestimasi terakhir, sehingga sinyal error yang dikirim ke flight controller tetap kontinu dan halus selama oklusi singkat — bukan lompatan atau gap yang akan menyebabkan osilasi aktuator.
+
+Secara keseluruhan, MIL menyediakan estimasi posisi yang tahan-drift, sedangkan mask HSV menyediakan keputusan biner *ada/tidak-ada objek*. Kombinasi ini menyelesaikan keterbatasan terbesar MIL tanpa memerlukan threshold kepercayaan yang tidak tersedia di API OpenCV.
 
 ---
 

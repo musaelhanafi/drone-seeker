@@ -48,12 +48,4 @@
 
 [23] B. Babenko, M.-H. Yang, dan S. Belongie, "Robust Object Tracking with Online Multiple Instance Learning," *IEEE Transactions on Pattern Analysis and Machine Intelligence*, vol. 33, no. 8, pp. 1619–1632, 2011. DOI: [10.1109/TPAMI.2010.226](https://doi.org/10.1109/TPAMI.2010.226)
 
-[24] A. Lukežič, T. Vojíř, L. Čehovin Zajc, J. Matas, dan M. Kristan, "Discriminative Correlation Filter with Channel and Spatial Reliability," *Proc. IEEE Conf. Computer Vision and Pattern Recognition (CVPR)*, pp. 6309–6318, 2017. DOI: [10.1109/CVPR.2017.515](https://doi.org/10.1109/CVPR.2017.515)
-
-[25] B. Li, J. Yan, W. Wu, Z. Zhu, dan X. Hu, "High Performance Visual Tracking with Siamese Region Proposal Network," *Proc. IEEE Conf. Computer Vision and Pattern Recognition (CVPR)*, pp. 8971–8980, 2018. DOI: [10.1109/CVPR.2018.00935](https://doi.org/10.1109/CVPR.2018.00935)
-
-[26] Z. Zhu, Q. Wang, B. Li, W. Wu, J. Yan, dan W. Hu, "Distractor-aware Siamese Networks for Visual Object Tracking," *Proc. European Conf. Computer Vision (ECCV)*, pp. 101–117, 2018. DOI: [10.1007/978-3-030-01240-3_7](https://doi.org/10.1007/978-3-030-01240-3_7)
-
-[27] C. Wang, "NanoTrack: An Extremely Lightweight Single Object Tracking Network," *arXiv preprint*, arXiv:2202.06764, 2022. URL: [https://arxiv.org/abs/2202.06764](https://arxiv.org/abs/2202.06764)
-
-[28] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, J. Uszkoreit, dan N. Houlsby, "An Image is Worth 16×16 Words: Transformers for Image Recognition at Scale," *Proc. Int'l Conf. on Learning Representations (ICLR)*, 2021. arXiv: [2010.11929](https://arxiv.org/abs/2010.11929)
+[29] T. G. Dietterich, R. H. Lathrop, dan T. Lozano-Pérez, "Solving the Multiple Instance Problem with Axis-Parallel Rectangles," *Artificial Intelligence*, vol. 89, no. 1–2, pp. 31–71, 1997. DOI: [10.1016/S0004-3702(96)00034-3](https://doi.org/10.1016/S0004-3702(96)00034-3)

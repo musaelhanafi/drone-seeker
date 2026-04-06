@@ -1,0 +1,24 @@
+%%{init: {"flowchart": {"defaultRenderer": "elk"}}}%%
+flowchart LR
+    subgraph GROUND["🖥️ Darat"]
+        direction TB
+        RCTX["🎮 RC Transmitter"]
+        subgraph LAPTOP["💻 Laptop"]
+            XP["X-Plane\n(Simulator HITL)"]
+        end
+    end
+
+    subgraph AIRFRAME["✈️ Pesawat"]
+        direction TB
+        RCRX["RC Receiver\n(SBUS/PWM)"]
+        FC["Flight Controller\n(ArduPlane)"]
+        RCRX --> FC
+    end
+
+    RCTX -->|"2.4 GHz RF"| RCRX
+    XP <-->|"pppd / Telem"| FC
+
+    style RCTX   fill:#4A90D9,stroke:#2c6fad,color:#fff
+    style RCRX   fill:#5BA3E0,stroke:#2c6fad,color:#fff
+    style XP     fill:#7B5EA7,stroke:#5a3d87,color:#fff
+    style FC     fill:#E07B39,stroke:#b85c1a,color:#fff

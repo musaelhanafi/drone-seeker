@@ -2,8 +2,8 @@ import argparse
 
 from seekerctrl import SeekerCtrl
 
-_APPEARANCE_TRACKERS = {"mil", "csrt", "dasiamrpn", "nano", "vit"}
 _SHIFT_ALGOS         = {"camshift", "meanshift"}
+_APPEARANCE_TRACKERS = {"mil"}
 
 
 def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
@@ -12,11 +12,10 @@ def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
     Tokens (comma-separated):
       camshift / meanshift  — shift-based tracker variant (mutually exclusive)
       kalman                — enable Kalman filter
-      mil, csrt, dasiamrpn, nano, vit — appearance tracker (mutually exclusive with shift)
+      mil                   — MIL appearance tracker (mutually exclusive with shift)
     Examples:
       camshift,kalman   → CamShift + Kalman  (default)
       camshift          → CamShift, no Kalman
-      meanshift         → MeanShift, no Kalman
       meanshift,kalman  → MeanShift + Kalman
       mil               → MIL tracker, no Kalman
       mil,kalman        → MIL tracker + Kalman
@@ -27,26 +26,20 @@ def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
     if unknown:
         raise argparse.ArgumentTypeError(
             f"Unknown tracker token(s): {', '.join(sorted(unknown))}. "
-            f"Valid: kalman, {', '.join(sorted(_SHIFT_ALGOS))}, "
-            f"{', '.join(sorted(_APPEARANCE_TRACKERS))}"
+            f"Valid: kalman, {', '.join(sorted(_SHIFT_ALGOS))}, mil"
         )
     shift = tokens & _SHIFT_ALGOS
     if len(shift) > 1:
         raise argparse.ArgumentTypeError(
             "Cannot combine 'camshift' and 'meanshift' — they are mutually exclusive."
         )
-    appearance = tokens & _APPEARANCE_TRACKERS
-    if len(appearance) > 1:
-        raise argparse.ArgumentTypeError(
-            f"Only one appearance tracker allowed, got: {', '.join(sorted(appearance))}"
-        )
-    tracker_name = next(iter(appearance), "")
-    shift_algo   = next(iter(shift), "camshift")   # default camshift if neither specified
+    tracker_name = "mil" if "mil" in tokens else ""
+    shift_algo   = next(iter(shift), "camshift")
     use_camshift = bool(shift) and not tracker_name
     use_kalman   = "kalman" in tokens
     if tracker_name and shift:
         raise argparse.ArgumentTypeError(
-            f"Cannot combine '{tracker_name}' with '{shift_algo}' — they are mutually exclusive."
+            f"Cannot combine 'mil' with '{shift_algo}' — they are mutually exclusive."
         )
     return use_camshift, shift_algo, use_kalman, tracker_name
 
@@ -113,8 +106,8 @@ def parse_args():
         metavar="TOKENS",
         help=(
             "Comma-separated tracking components (default: camshift,kalman). "
-            "Tokens: camshift  meanshift  kalman  mil  csrt  dasiamrpn  nano  vit. "
-            "Examples: 'meanshift,kalman'  'mil'  'mil,kalman'"
+            "Tokens: camshift  meanshift  kalman  mil. "
+            "Examples: 'camshift,kalman'  'meanshift,kalman'  'mil'  'mil,kalman'"
         ),
     )
     parser.add_argument(
