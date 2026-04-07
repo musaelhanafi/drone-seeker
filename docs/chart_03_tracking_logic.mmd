@@ -5,8 +5,7 @@ flowchart TD
     START(["`**Mulai loop frame**`"])
 
     START --> READ["`Jalankan tracker aktif
-    CamShift / MeanShift / MIL / CSRT /
-    DaSiamRPN / Nano / ViT + filter Kalman
+    CamShift / MeanShift / MIL + filter Kalman
     → cx, cy`"]
 
     READ --> KFPRED{"`seeker track?
@@ -27,27 +26,9 @@ flowchart TD
     KF_OK --> POLL
 
     POLL["`Poll RC / telemetri MAVLink`"]
-    POLL --> AUTOMODE{auto_mode?}
 
-    %% ── Rule 3: auto_mode = False ────────────────────────────────────────────
-    AUTOMODE -- Tidak --> CH6_R3{ch6?}
-
-    CH6_R3 -- "`TINGGI → RENDAH
-    _(tepi turun)_`" --> FELL_R3["`_in_tracking = False
-    Set **AUTO**`"]
-
-    CH6_R3 -- "RENDAH / stabil" --> SKIP_R3[ ]
-
-    CH6_R3 -- "`TINGGI + target_terkunci
-    + BUKAN _in_tracking`" --> ENTER_R3["`Set **TRACKING**
-    _in_tracking = True`"]
-
-    FELL_R3    --> FEED
-    SKIP_R3    --> FEED
-    ENTER_R3   --> FEED
-
-    %% ── Rule 1 & 2: auto_mode = True ────────────────────────────────────────
-    AUTOMODE -- Ya --> WPCHECK{"`cukup_dekat < 1000 m
+    %% ── auto_mode = True (selalu) ────────────────────────────────────────────
+    POLL --> WPCHECK{"`cukup_dekat < 1000 m
     DAN wp_terakhir
     DAN target_terkunci
     DAN BUKAN _in_tracking?`"}
@@ -55,19 +36,9 @@ flowchart TD
     WPCHECK -- Ya --> ENTER_AUTO["`Set **TRACKING**
     _in_tracking = True`"]
 
-    WPCHECK -- Tidak --> JOYCHECK{joystick ON?}
-
-    JOYCHECK -- "`Ya (Rule 1)
-    ch6 RENDAH`" --> SET_STAB["`Set **STABILIZE**`"]
-
-    JOYCHECK -- "`Ya (Rule 1)
-    ch6 TINGGI`" --> SET_AUTO["`Set **AUTO**`"]
-
-    JOYCHECK -- "`Tidak (Rule 2)
-    (ch6 diabaikan)`" --> SET_AUTO
+    WPCHECK -- Tidak --> SET_AUTO["`Set **AUTO**`"]
 
     ENTER_AUTO --> FEED
-    SET_STAB   --> FEED
     SET_AUTO   --> FEED
 
     %% ── Feed tracking error ──────────────────────────────────────────────────
@@ -90,26 +61,20 @@ flowchart TD
     TERM -- Ya --> LOG_T["`Log terminal = 1`"]
     TERM -- Tidak  --> LOG_N["`Log terminal = 0`"]
 
-    TGT -- Tidak --> LOSTCNT["`lost_count++
-    committed = entry_count ≥ 3
-    batas = 30 jika committed, 10 jika tidak`"]
+    TGT -- Tidak --> LOSTCNT["`lost_count++`"]
 
-    LOSTCNT --> LOSTLIM{"`lost_count ≥ batas?`"}
+    LOSTCNT --> LOSTLIM{"`lost_count ≥ 50?`"}
     LOSTLIM -- Ya --> FORCE_AUTO["`lost_count = 0
     _in_tracking = False
     Set **AUTO**`"]
 
-    LOSTLIM -- Tidak --> COMMITTED{committed?}
-    COMMITTED -- Ya --> SEND_LAST["`Kirim last_errorx, last_errory
+    LOSTLIM -- Tidak --> SEND_LAST["`Kirim last_errorx, last_errory
     _(tahan arah terakhir diketahui)_`"]
-    COMMITTED -- Tidak  --> SEND_ZERO["`Kirim 0.0, 0.0
-    _(sayap rata)_`"]
 
     LOG_T        --> ANNOTATE
     LOG_N        --> ANNOTATE
     FORCE_AUTO   --> ANNOTATE
     SEND_LAST    --> ANNOTATE
-    SEND_ZERO    --> ANNOTATE
 
     ANNOTATE(["`Gambar HUD + tampilkan frame`"])
     ANNOTATE --> START
@@ -121,8 +86,8 @@ flowchart TD
     classDef term_node  fill:#c0392b,color:#fff,stroke:#922b21,font-weight:bold
     classDef endpoint   fill:#555,color:#fff,stroke:#333
 
-    class FELL_R3,SET_STAB,SET_AUTO,ENTER_AUTO,ENTER_R3,FORCE_AUTO modeCmd
-    class AUTOMODE,CH6_R3,WPCHECK,JOYCHECK,FEED,TGT,LOSTLIM,COMMITTED,TERM,KFPRED decision
-    class PN,SEND_ERR,SEND_LAST,SEND_ZERO,LOG_T,LOG_N,LOSTCNT action
+    class SET_STAB,SET_AUTO,ENTER_AUTO,FORCE_AUTO modeCmd
+    class WPCHECK,FEED,TGT,LOSTLIM,TERM,KFPRED decision
+    class PN,SEND_ERR,SEND_LAST,LOG_T,LOG_N,LOSTCNT action
     class LOG_T,TERM term_node
     class START,ANNOTATE endpoint

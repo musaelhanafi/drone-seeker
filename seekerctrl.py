@@ -11,9 +11,9 @@ from hud_display import HudDisplay
 from joystick_handler import JoystickHandler
 from seeker import Seeker
 
-# Tracking errors are sent as DEBUG_VECT (MAVLink ID 250, standard message).
-# x = errorx, y = errory, z unused.
-# ArduPlane decodes them in handle_message (case MAVLINK_MSG_ID_DEBUG_VECT).
+# Tracking errors are sent as TRACKING_MESSAGE (MAVLink ID 11045, ardupilotmega dialect).
+# Fields: errorx, errory, both normalised to [-1, 1].
+# ArduPlane decodes them in handle_message (case MAVLINK_MSG_ID_TRACKING_MESSAGE).
 
 # RC channel 6 PWM threshold to consider the switch "active"
 _CH6_ACTIVE_PWM = 1400
@@ -551,14 +551,13 @@ class SeekerCtrl:
     # ── TRACKING MAVLink message ──────────────────────────────────────────────
 
     def send_tracking(self, errorx: float, errory: float):
-        """Send tracking errors via DEBUG_VECT (ID 250).
+        """Send tracking errors via TRACKING_MESSAGE (ID 11045).
 
-        errorx → x field, errory → y field, both normalised [-1, 1].
+        errorx/errory are normalised [-1, 1].
         """
-        self.master.mav.debug_vect_send(
-            b"tracking\x00\x00",
+        self.master.mav.tracking_message_send(
             int(time.monotonic() * 1e6),
-            errorx, errory, 0.0,
+            errorx, errory,
         )
 
     # ── Standalone RC monitor (blocking, for debugging) ───────────────────────

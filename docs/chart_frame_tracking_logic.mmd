@@ -1,0 +1,48 @@
+---
+title: Tracking Logic — per-frame
+---
+flowchart TD
+    START([Frame Baru])
+
+    START --> HASCAL{Sudah kalibrasi?}
+    HASCAL -- Belum --> CALIB([Tampilkan UI kalibrasi])
+
+    HASCAL -- Ya --> HASTRK{Tracker aktif\nAND detect ≥ 3?}
+
+    HASTRK -- Belum --> DETECT[Deteksi blob\nHSV mask + vote]
+    DETECT --> BLOBFOUND{Blob ditemukan?}
+    BLOBFOUND -- Tidak --> NOTLOCKED([Belum terkunci])
+    BLOBFOUND -- Ya --> INCCOUNT[detect_count++\nInisialisasi tracker]
+    INCCOUNT --> NOTLOCKED
+
+    HASTRK -- Ya --> TRACK[Jalankan tracker\nCamShift / MeanShift / MIL]
+    TRACK --> TRACKOK{Hasil valid\ndan warna OK?}
+
+    TRACKOK -- Tidak --> MISSUP[miss_count++]
+    MISSUP --> MISSMAX{miss_count ≥ 5?}
+    MISSMAX -- Ya --> RESET([Hard reset])
+    MISSMAX -- Tidak --> COAST([Kalman predict saja\ncx,cy = prediksi])
+
+    TRACKOK -- Ya --> KF[miss_count = 0\nKalman update\n→ cx, cy]
+
+    KF --> ERROR[Hitung errorx, errory\nnormalisasi ke ±1]
+    COAST --> ERROR
+
+    ERROR --> PN{Input prediction\naktif?}
+    PN -- Ya --> PNLEAD[Terapkan PN lead\nerror += ė·τ]
+    PN -- Tidak --> SEND
+    PNLEAD --> SEND
+
+    SEND([Kirim cx,cy + error\nke Flight Controller])
+
+    classDef ok     fill:#2d8a4e,color:#fff,stroke:#1a5c33
+    classDef warn   fill:#e67e22,color:#fff,stroke:#b05c10
+    classDef err    fill:#c0392b,color:#fff,stroke:#922b21
+    classDef grey   fill:#888,color:#fff,stroke:#555
+    classDef decide fill:#f0c040,color:#222,stroke:#b89000
+
+    class SEND,KF ok
+    class COAST,MISSUP warn
+    class RESET err
+    class CALIB,NOTLOCKED grey
+    class HASCAL,HASTRK,BLOBFOUND,TRACKOK,MISSMAX,PN decide

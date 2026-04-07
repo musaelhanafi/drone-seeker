@@ -7,18 +7,12 @@ classDiagram
     class SeekerCtrl
     class Seeker
     class HudDisplay
-    class JoystickHandler
-    class seeker_helpers { <<module>> }
     class pymavlink { <<external>> }
     class OpenCV { <<external>> }
-    class pygame { <<external>> }
 
-    main            ..>  SeekerCtrl      : creates
-    SeekerCtrl      *--  Seeker          : owns
-    SeekerCtrl      *--  HudDisplay      : owns
-    SeekerCtrl      o--  JoystickHandler : owns (optional)
-    SeekerCtrl      ..>  pymavlink       : uses
-    SeekerCtrl      ..>  OpenCV          : uses
-    Seeker          ..>  seeker_helpers  : uses
-    Seeker          ..>  OpenCV          : uses
-    JoystickHandler ..>  pygame          : uses
+    main       ..>  SeekerCtrl : creates
+    SeekerCtrl *--  Seeker     : owns
+    SeekerCtrl *--  HudDisplay : owns
+    SeekerCtrl ..>  pymavlink  : uses
+    SeekerCtrl ..>  OpenCV     : uses
+    Seeker     ..>  OpenCV     : uses

@@ -34,6 +34,14 @@ Tanpa file ini, sistem menggunakan fallback HSV bawaan (H 130–173).
 pip install -r requirements.txt
 ```
 
+Setelah instalasi, terapkan patch pymavlink untuk menambahkan pesan `TRACKING_MESSAGE` (ID 11045):
+
+```bash
+python3 pymavlink_patch/apply_patch.py
+```
+
+Jalankan ulang perintah ini setiap kali pymavlink di-upgrade. Script bersifat idempotent — aman dijalankan berkali-kali.
+
 ---
 
 ## Menjalankan
@@ -127,15 +135,17 @@ Lihat: [`docs/chart_01_detection.png`](docs/chart_01_detection.png) · [`docs/ch
 
 ## MAVLink
 
-Error tracking dikirim sebagai pesan MAVLink dari `seekerctrl.py`:
+Error tracking dikirim sebagai pesan **`TRACKING_MESSAGE`** (MAVLink ID 11045, dialect ardupilotmega) dari `seekerctrl.py`:
 
 | Field | Isi |
 |---|---|
-| `x` | `errorx` — error horizontal ternormalisasi [-1, 1] |
-| `y` | `errory` — error vertikal ternormalisasi [-1, 1] |
-| `z` | `0.0` |
+| `time_usec` | Timestamp monotonic (µs) |
+| `errorx` | Error horizontal ternormalisasi [-1, 1] |
+| `errory` | Error vertikal ternormalisasi [-1, 1] |
 
-ArduPlane mengalikan x/y dengan `TRK_MAX_DEG × π/180` lalu menjalankan PID roll dan pitch.
+ArduPlane mengalikan `errorx`/`errory` dengan `TRK_MAX_DEG × π/180` lalu menjalankan PID roll dan pitch.
+
+> **Catatan:** Pesan ini tidak ada di pymavlink bawaan. Jalankan `python3 pymavlink_patch/apply_patch.py` setelah instalasi (lihat bagian Instalasi).
 
 ---
 
