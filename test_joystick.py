@@ -130,7 +130,7 @@ def main():
           f"component {master.target_component}")
 
     # --- Joystick ---
-    joy = JoystickHandler(joy_index=args.joy)
+    joy = JoystickHandler(joy_index=args.joy, thr_invert=False)
     joy.open()
 
     # --- Graceful shutdown on Ctrl-C / SIGTERM ---

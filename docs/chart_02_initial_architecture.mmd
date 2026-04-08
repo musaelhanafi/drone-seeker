@@ -5,6 +5,8 @@ flowchart LR
         RCTX["🎮 RC Transmitter"]
         subgraph LAPTOP["💻 Laptop"]
             XP["X-Plane\n(Simulator HITL)"]
+            MAV["MAVProxy"]
+            QGC["QGroundControl"]
         end
     end
 
@@ -17,8 +19,12 @@ flowchart LR
 
     RCTX -->|"2.4 GHz RF"| RCRX
     XP <-->|"pppd / Telem"| FC
+    FC -->|"USB"| MAV
+    MAV -->|"TCP/UDP"| QGC
 
     style RCTX   fill:#4A90D9,stroke:#2c6fad,color:#fff
     style RCRX   fill:#5BA3E0,stroke:#2c6fad,color:#fff
     style XP     fill:#7B5EA7,stroke:#5a3d87,color:#fff
     style FC     fill:#E07B39,stroke:#b85c1a,color:#fff
+    style MAV    fill:#3A7D44,stroke:#1f5c2e,color:#fff
+    style QGC    fill:#D4A017,stroke:#a07800,color:#fff
