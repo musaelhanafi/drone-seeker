@@ -144,8 +144,9 @@ class SeekerCtrl:
         self._csv_writer = None
 
         # ── Video recorder ────────────────────────────────────────────────────
-        self._record     = record
-        self._vwriter    = None   # cv2.VideoWriter, open only during TRACKING
+        self._record      = record
+        self._vwriter     = None   # cv2.VideoWriter, open only during TRACKING
+        self._measured_fps = 25.0  # actual camera FPS measured during warmup
 
         self._hud = HudDisplay(show_pitch=hud_pitch, show_yaw=hud_yaw)
 
@@ -417,7 +418,7 @@ class SeekerCtrl:
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"tracking_{ts}.avi"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        self._vwriter = cv2.VideoWriter(path, fourcc, 25.0, (w, h))
+        self._vwriter = cv2.VideoWriter(path, fourcc, self._measured_fps, (w, h))
         print(f"[REC] recording → {path}")
 
     def _close_video(self):
@@ -589,6 +590,18 @@ class SeekerCtrl:
             raise RuntimeError("Not connected. Call connect() first.")
 
         self.seeker.open()
+
+        if self._record:
+            _WARMUP_FRAMES = 30
+            _WARMUP_MIN_S  = 1.0
+            print(f"[REC] Measuring camera FPS ({_WARMUP_FRAMES} frames)...")
+            t0 = time.monotonic()
+            for _ in range(_WARMUP_FRAMES):
+                self.seeker.read_frame()
+            elapsed = max(time.monotonic() - t0, _WARMUP_MIN_S)
+            self._measured_fps = _WARMUP_FRAMES / elapsed
+            print(f"[REC] Measured FPS: {self._measured_fps:.2f}")
+
         frame_times: collections.deque = collections.deque(maxlen=30)
         prev_time       = time.monotonic()
         prev_in_tracking = False
