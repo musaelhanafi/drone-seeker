@@ -44,6 +44,9 @@ def send_rc_override(master, ch: dict):
         UINT16_MAX,   # ch6 — not overridden, handled via mode command
         UINT16_MAX,   # ch7 unused
         UINT16_MAX,   # ch8 unused
+        UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX,  # ch9-12 unused
+        UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX,  # ch13-16 unused
+        UINT16_MAX, UINT16_MAX,                          # ch17-18 unused
     )
 
 
@@ -126,6 +129,7 @@ def main():
     print(f"[MAV] Connecting to {args.connect} ...")
     master = mavutil.mavlink_connection(args.connect, baud=args.baud)
     master.wait_heartbeat()
+    master.mav.srcSystem = 255  # GCS sysid — required for ArduPlane to accept RC override
     print(f"[MAV] Heartbeat from system {master.target_system} "
           f"component {master.target_component}")
 
