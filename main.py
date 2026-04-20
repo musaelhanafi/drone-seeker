@@ -158,6 +158,7 @@ def parse_args():
         default=False,
         help="Auto mode: enter TRACKING when within 1 km of target; ch6 keeps FC in AUTO otherwise",
     )
+
     parser.add_argument(
         "--crop",
         type=str,

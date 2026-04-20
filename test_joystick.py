@@ -31,6 +31,7 @@ _MODE_AUTOTUNE  = 8
 _MODE_NAMES     = {_MODE_STABILIZE: "STABILIZE", _MODE_AUTOTUNE: "AUTOTUNE"}
 
 
+
 def send_rc_override(master, ch: dict):
     """Send ch1-ch5 as RC override; ch6 is handled as a mode command instead."""
     master.mav.rc_channels_override_send(
@@ -63,13 +64,14 @@ def set_mode(master, custom_mode: int):
     print(f"\n[MODE] → {_MODE_NAMES.get(custom_mode, custom_mode)}")
 
 
-def print_channels(ch: dict, mode_label: str):
+def print_channels(ch: dict, mode_label: str, airframe: str):
     keys  = ("ch1", "ch2", "ch3", "ch4", "ch5")
     parts = "  ".join(f"{k.upper()}:{ch[k]:4d}" for k in keys if k in ch)
-    print(f"\r{parts}  CH6-MODE:{mode_label:<10}", end="", flush=True)
+    print(f"\r{parts}  CH6-MODE:{mode_label:<10}  [{airframe}]", end="", flush=True)
 
 
-def joystick_loop(master, joy: JoystickHandler, rate: float, stop: threading.Event):
+def joystick_loop(master, joy: JoystickHandler, rate: float, stop: threading.Event,
+                  airframe: str = "PLANE"):
     interval   = 1.0 / rate
     prev_ch    = {}
     last_send  = 0.0
@@ -100,7 +102,7 @@ def joystick_loop(master, joy: JoystickHandler, rate: float, stop: threading.Eve
 
         if changed or (now - last_send) >= interval:
             send_rc_override(master, rc_ch)
-            print_channels(rc_ch, mode_label)
+            print_channels(rc_ch, mode_label, airframe)
             prev_ch   = ch
             last_send = now
 
@@ -123,6 +125,9 @@ def main():
                         help="Joystick index (default: 0)")
     parser.add_argument("--rate",    type=float, default=20.0,
                         help="Minimum send rate in Hz even without change (default: 20)")
+    parser.add_argument("--airframe", default="plane",
+                        choices=["plane", "vtail", "elevon"],
+                        help="Airframe type for display (default: plane)")
     args = parser.parse_args()
 
     # --- MAVLink connection ---
@@ -132,6 +137,8 @@ def main():
     master.mav.srcSystem = 255  # GCS sysid — required for ArduPlane to accept RC override
     print(f"[MAV] Heartbeat from system {master.target_system} "
           f"component {master.target_component}")
+
+    airframe = args.airframe.upper()
 
     # --- Joystick ---
     joy = JoystickHandler(joy_index=args.joy, thr_invert=False)
@@ -147,11 +154,11 @@ def main():
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    print(f"[JOY] Sending RC override at up to {args.rate:.0f} Hz  (Ctrl-C to quit)")
+    print(f"[JOY] Airframe: {airframe}  |  Sending RC override at up to {args.rate:.0f} Hz  (Ctrl-C to quit)")
     print("[JOY] CH6 high=AUTOTUNE  CH6 low=STABILIZE\n")
 
     try:
-        joystick_loop(master, joy, args.rate, stop)
+        joystick_loop(master, joy, args.rate, stop, airframe)
     finally:
         joy.close()
         print("[JOY] Joystick closed")

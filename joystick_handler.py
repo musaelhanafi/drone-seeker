@@ -10,7 +10,7 @@ Channel mapping:
   Axis 1 → CH2 elevator  (centred 1000-2000)
   Axis 2 → CH3 throttle  (full-range 1000-2000)
   Axis 3 → CH4 rudder    (centred 1000-2000)
-  Button 6 or 7 → CH5    (2000 pressed, 1000 released)
+  Button 6 → CH5 1000, Button 7 → CH5 2000, neither → CH5 1500 (3-pos switch)
   Button 4 or 5, or axis 4/5 > 0.5 → CH6  (2000 active, 1000 released)
 
 Run standalone to test:
@@ -130,10 +130,13 @@ class JoystickHandler:
         n_buttons = self._joy.get_numbuttons()
         n_axes    = self._joy.get_numaxes()
 
-        # CH5: button 6 or 7 pressed → 2000, both released → 1000
-        ch5 = 2000 if any(
-            i < n_buttons and self._joy.get_button(i) for i in (6, 7)
-        ) else 1000
+        # CH5: 3-position switch
+        #   button 6 pressed → 1000 (low)
+        #   button 7 pressed → 2000 (high)
+        #   neither pressed  → 1500 (middle)
+        btn6 = 6 < n_buttons and self._joy.get_button(6)
+        btn7 = 7 < n_buttons and self._joy.get_button(7)
+        ch5 = 1000 if btn6 else (2000 if btn7 else 1500)
 
         # CH6: button 4 or 5, OR axis 4 or 5 > 0.5 (triggers mapped as axes)
         btn46 = any(i < n_buttons and self._joy.get_button(i) for i in (4, 5))

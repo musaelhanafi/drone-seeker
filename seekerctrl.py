@@ -1,6 +1,7 @@
 import collections
 import csv
 import math
+import subprocess
 import threading
 import time
 
@@ -21,9 +22,7 @@ _CH6_ACTIVE_PWM = 1400
 # ── Tracking control tuning ───────────────────────────────────────────────────
 _LATENCY_S     = 0.08   # pipeline latency to compensate (s)
 _PN_LEAD_S     = 0.30   # proportional navigation lead time (s) — increase for faster aircraft
-_TRK_TERM_ALT        = 0.0         # must match ArduPlane TRK_TERM_ALT (m above target MSL); 0 = disabled
 _TRK_PITCH_OFFSET    = 3.0         # must match ArduPlane TRK_PITCH_OFFSET (deg) — cruise nose-up bias
-_TRK_TERM_PTCH       = 0.0         # must match ArduPlane TRK_TERM_PTCH (deg)   — extra nose-down in terminal
 _TRK_MAX_DEG         = 30.0        # must match ArduPlane TRK_MAX_DEG — full-scale error angle (deg)
 _TRK_CLOSE_M         = 1000.0           # enter TRACKING only within this slant distance (m)
 _TRK_TARGET_ALT_MSL  = 744.0            # must match ArduPlane TRK_TGT_ALT  (m MSL)
@@ -90,6 +89,7 @@ class SeekerCtrl:
         self._flight_mode    = "?"     # last known flight mode name from HEARTBEAT
         self._prev_ch6_on    = False   # previous ch6 armed state for edge detection
         self._commanded_mode = -1      # last custom_mode we sent a command for
+        self._wp_takeoff_sent = False  # WP-0 reset sent only once at startup
 
         # ── MAVLink telemetry state ───────────────────────────────────────────
         self._srv1_raw      = 0        # SERVO_OUTPUT_RAW servo1 (µs)
@@ -113,7 +113,8 @@ class SeekerCtrl:
         self._pid_pitch_des = 0.0      # pitch desired (deg)
         self._rel_alt_m  = 0.0        # GLOBAL_POSITION_INT relative_alt (m, AGL)
         self._alt_msl_m  = 0.0        # GLOBAL_POSITION_INT alt (m, MSL)
-        self._airspeed_ms = 0.0       # VFR_HUD airspeed (m/s)
+        self._airspeed_ms    = 0.0     # VFR_HUD airspeed (m/s)
+        self._groundspeed_ms = 0.0    # VFR_HUD groundspeed (m/s)
         self._throttle_pct = 0        # VFR_HUD throttle (0-100 %)
         self._home_lat   = None       # HOME_POSITION lat (deg)
         self._home_lon   = None       # HOME_POSITION lon (deg)
@@ -122,11 +123,14 @@ class SeekerCtrl:
         self._target_alt_msl = _TRK_TARGET_ALT_MSL   # TRK_TGT_ALT (m MSL)
         self._target_lat     = _TRK_TARGET_LAT        # TRK_TGT_LAT (decimal deg)
         self._target_lon     = _TRK_TARGET_LON        # TRK_TGT_LON (decimal deg)
-        self._term_alt       = _TRK_TERM_ALT          # TRK_TERM_ALT (m above target MSL)
+        self._pitch_offset   = _TRK_PITCH_OFFSET      # TRK_PITCH_OFFSET (deg)
 
         # ── Mission state ─────────────────────────────────────────────────────
         self._waypoint_count = 0    # total mission items (from MISSION_COUNT)
         self._current_wp     = 0    # current waypoint seq (from MISSION_CURRENT)
+        self._prev_wp        = -1   # previous WP for transition detection
+        self._prev_flight_mode  = ""    # previous flight mode for transition detection
+        self._pending_video_open = False  # waiting for FPS warmup before opening video
 
         # ── Lock-loss hold state ──────────────────────────────────────────────
         self._last_errorx        = 0.0   # last valid errorx (re-sent while lock is lost)
@@ -143,10 +147,10 @@ class SeekerCtrl:
         self._csv_file   = None
         self._csv_writer = None
 
-        # ── Video recorder ────────────────────────────────────────────────────
+        # ── Video recorder (FFmpeg pipe) ──────────────────────────────────────
         self._record      = record
-        self._vwriter     = None   # cv2.VideoWriter, open only during TRACKING
-        self._measured_fps = 25.0  # actual camera FPS measured during warmup
+        self._ffmpeg      = None   # subprocess.Popen for TRACKING phase
+        self._ffmpeg_tkof = None   # subprocess.Popen for takeoff (WP 1)
 
         self._hud = HudDisplay(show_pitch=hud_pitch, show_yaw=hud_yaw)
 
@@ -161,7 +165,8 @@ class SeekerCtrl:
                              shift_algo=shift_algo,
                              box_filter=box_filter,
                              use_kalman=use_kalman,
-                             tracker=tracker)
+                             tracker=tracker,
+                             pitch_offset_norm=self._pitch_offset / _TRK_MAX_DEG)
 
         # ── Joystick ──────────────────────────────────────────────────────────
         self._joystick_enabled    = joystick_enabled
@@ -183,6 +188,12 @@ class SeekerCtrl:
             f"Heartbeat received (system {self.master.target_system}, "
             f"component {self.master.target_component})"
         )
+        self.master.mav.rc_channels_override_send(
+            self.master.target_system,
+            self.master.target_component,
+            *([0] * 18),
+        )
+        print("[RC] All overrides released")
         self._request_data_streams()
         self._fetch_tracking_params()
         self._fetch_mission_count()
@@ -192,10 +203,10 @@ class SeekerCtrl:
     # ── Parameter fetch ───────────────────────────────────────────────────────
 
     _TRACKED_PARAMS = {
-        "TRK_TGT_ALT":  "_target_alt_msl",
-        "TRK_TGT_LAT":  "_target_lat",
-        "TRK_TGT_LON":  "_target_lon",
-        "TRK_TERM_ALT": "_term_alt",
+        "TRK_TGT_ALT":      "_target_alt_msl",
+        "TRK_TGT_LAT":      "_target_lat",
+        "TRK_TGT_LON":      "_target_lon",
+        "TRK_PITCH_OFFSET": "_pitch_offset",
     }
 
     def _fetch_tracking_params(self):
@@ -221,6 +232,7 @@ class SeekerCtrl:
                 print(f"[Param] {pname} = {msg.param_value}")
         for pname in remaining:
             print(f"[Param] {pname} not received — using default")
+        self.seeker.pitch_offset_norm = self._pitch_offset / _TRK_MAX_DEG
 
     def _fetch_mission_count(self):
         """Request mission item count, reset current WP to 0, store count."""
@@ -310,8 +322,9 @@ class SeekerCtrl:
 
         msg = self.master.messages.get("VFR_HUD")
         if msg:
-            self._airspeed_ms  = msg.airspeed
-            self._throttle_pct = msg.throttle
+            self._airspeed_ms    = msg.airspeed
+            self._groundspeed_ms = msg.groundspeed
+            self._throttle_pct   = msg.throttle
 
         msg = self.master.messages.get("HOME_POSITION")
         if msg:
@@ -361,9 +374,9 @@ class SeekerCtrl:
             "roll_deg", "pitch_deg", "roll_rate_dps", "pitch_rate_dps",
             "pid_roll_desired", "pid_roll_P", "pid_roll_I", "pid_roll_D",
             "pid_pitch_desired", "pid_pitch_P", "pid_pitch_I", "pid_pitch_D",
-            "alt_rel_m", "airspeed_ms", "throttle_pct",
+            "alt_rel_m", "groundspeed_ms", "throttle_pct",
             "nav_pitch_deg",
-            "target_locked", "terminal",
+            "target_locked",
             "dist_m",
         ])
         print("[LOG] tracking.csv opened")
@@ -377,7 +390,7 @@ class SeekerCtrl:
             print("[LOG] tracking.csv closed")
 
     def _log_row(self, timestamp: float, errorx, errory,
-                 target_locked: bool = True, terminal: bool = False):
+                 target_locked: bool = True):
         if self._csv_writer is None:
             return
         # Elevon demix: srv1/srv2 centred at 1500 µs
@@ -402,34 +415,60 @@ class SeekerCtrl:
             f"{self._pid_pitch_I:.4f}",
             f"{self._pid_pitch_D:.4f}",
             f"{self._alt_msl_m - self._target_alt_msl:.2f}",
-            f"{self._airspeed_ms:.2f}",
+            f"{self._groundspeed_ms:.2f}",
             f"{self._throttle_pct}",
             f"{self._nav_pitch_deg:.3f}",
             "1" if target_locked else "0",
-            "1" if terminal else "0",
             f"{self._dist_to_target_m():.1f}",
         ])
 
     # ── Video recorder ────────────────────────────────────────────────────────
 
-    def _open_video(self, frame_shape):
+    def _open_video(self, frame_shape, fps: float, label: str = "tracking"):
         import datetime
         h, w = frame_shape[:2]
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"tracking_{ts}.avi"
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        self._vwriter = cv2.VideoWriter(path, fourcc, self._measured_fps, (w, h))
-        print(f"[REC] recording → {path}")
+        path = f"{label}_{ts}.mp4"
+        cmd  = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            path,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if label == "takeoff":
+            self._ffmpeg_tkof = proc
+        else:
+            self._ffmpeg = proc
+        print(f"[REC] {label} recording → {path}  fps={fps:.1f}")
 
-    def _close_video(self):
-        if self._vwriter is not None:
-            self._vwriter.release()
-            self._vwriter = None
-            print("[REC] recording stopped")
+    def _close_video(self, label: str = "tracking"):
+        proc = self._ffmpeg_tkof if label == "takeoff" else self._ffmpeg
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=5.0)
+        except Exception:
+            proc.kill()
+        if label == "takeoff":
+            self._ffmpeg_tkof = None
+        else:
+            self._ffmpeg = None
+        print(f"[REC] {label} recording stopped")
 
     def _write_frame(self, frame):
-        if self._vwriter is not None:
-            self._vwriter.write(frame)
+        raw = frame.tobytes()
+        for proc in (self._ffmpeg_tkof, self._ffmpeg):
+            if proc is not None:
+                try:
+                    proc.stdin.write(raw)
+                except BrokenPipeError:
+                    pass
 
     # ── Joystick thread ───────────────────────────────────────────────────────
 
@@ -543,7 +582,21 @@ class SeekerCtrl:
     def set_mode_loiter(self):
         self._set_mode(_LOITER_MODE, "LOITER")
 
+    def _force_wp_takeoff(self):
+        """Reset mission to WP 0 so ArduPlane executes the takeoff waypoint."""
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT,
+            0,
+            0,   # WP index 0 (takeoff)
+            0, 0, 0, 0, 0, 0,
+        )
+
     def set_mode_auto(self):
+        if not self._wp_takeoff_sent:
+            self._force_wp_takeoff()
+            self._wp_takeoff_sent = True
         self._set_mode(_AUTO_MODE, "AUTO")
 
     def set_mode_stabilize(self):
@@ -591,17 +644,6 @@ class SeekerCtrl:
 
         self.seeker.open()
 
-        if self._record:
-            _WARMUP_FRAMES = 30
-            _WARMUP_MIN_S  = 1.0
-            print(f"[REC] Measuring camera FPS ({_WARMUP_FRAMES} frames)...")
-            t0 = time.monotonic()
-            for _ in range(_WARMUP_FRAMES):
-                self.seeker.read_frame()
-            elapsed = max(time.monotonic() - t0, _WARMUP_MIN_S)
-            self._measured_fps = _WARMUP_FRAMES / elapsed
-            print(f"[REC] Measured FPS: {self._measured_fps:.2f}")
-
         frame_times: collections.deque = collections.deque(maxlen=30)
         prev_time       = time.monotonic()
         prev_in_tracking = False
@@ -638,14 +680,17 @@ class SeekerCtrl:
                 # ── 3. Mode management ────────────────────────────────────────
                 ch6_fell = self._prev_ch6_on and not ch6_on  # armed → disarmed edge
 
-                if self._auto_mode:
-                    # Rules 1 & 2: enter TRACKING at last WP when close enough,
-                    # regardless of joystick / ch6 state.
-                    dist_to_target_m = self._dist_to_target_m()
-                    on_last_wp   = (self._waypoint_count > 0 and
+                dist_to_target_m = self._dist_to_target_m()
+                close_enough     = dist_to_target_m <= _TRK_CLOSE_M
+                in_auto          = (self._flight_mode == "AUTO")
+                on_last_wp       = (self._waypoint_count > 0 and
                                     self._current_wp == self._waypoint_count - 1)
-                    close_enough = dist_to_target_m <= _TRK_CLOSE_M
-                    if on_last_wp and close_enough and target_locked and not self._in_tracking:
+
+                if self._auto_mode:
+                    # Enter TRACKING only when in AUTO mode, on the last waypoint,
+                    # and within close-enough range.
+                    if (in_auto and on_last_wp and close_enough and
+                            target_locked and not self._in_tracking):
                         self.set_mode_tracking()
                         self._in_tracking = True
                     elif not self._in_tracking:
@@ -658,24 +703,37 @@ class SeekerCtrl:
 
                 else:
                     # Rule 3: ch6 gates TRACKING; no auto-mode logic.
-                    dist_to_target_m = None
-
                     if ch6_fell:
                         self._in_tracking = False
                         self.set_mode_auto()
-                    elif ch6_on:
-                        if target_locked and not self._in_tracking:
-                            self.set_mode_tracking()
-                            self._in_tracking = True
+                    elif ch6_on and target_locked and not self._in_tracking:
+                        self.set_mode_tracking()
+                        self._in_tracking = True
 
                 self._prev_ch6_on = ch6_on
 
                 # ── 4. CSV / video lifecycle ──────────────────────────────────
+                # Takeoff file: open on WP 1 entry, close when WP leaves 1.
+                if self._record:
+                    if in_auto and self._current_wp == 1 and self._prev_wp != 1:
+                        if self._ffmpeg_tkof is None:
+                            self._pending_video_open = True
+                            print("[REC] WP1 takeoff — warming up FPS before recording")
+                    elif self._current_wp != 1 and self._prev_wp == 1:
+                        self._pending_video_open = False
+                        self._close_video("takeoff")
+
+                # Open takeoff video once frame_times buffer is full.
+                if (self._pending_video_open and self._ffmpeg_tkof is None and
+                        len(frame_times) >= frame_times.maxlen):
+                    self._open_video(frame.shape, fps, "takeoff")
+                    self._pending_video_open = False
+
                 if self._in_tracking and not prev_in_tracking:
                     if self._debug_log:
                         self._open_csv()
                     if self._record:
-                        self._open_video(frame.shape)
+                        self._open_video(frame.shape, fps, "tracking")
                 elif not self._in_tracking and prev_in_tracking:
                     # Tracking just stopped — send a final zero error so
                     # ArduPlane does not act on any stale error still in flight.
@@ -683,12 +741,14 @@ class SeekerCtrl:
                     if self._debug_log:
                         self._close_csv()
                     if self._record:
-                        self._close_video()
-                prev_in_tracking = self._in_tracking
+                        self._close_video("tracking")
+                prev_in_tracking       = self._in_tracking
+                self._prev_wp          = self._current_wp
+                self._prev_flight_mode = self._flight_mode
 
                 # ── 5. Feed TRACKING error while active ───────────────────────
                 alt_dist_m  = self._alt_msl_m - self._target_alt_msl
-                in_terminal = (self._term_alt > 0.0 and alt_dist_m <= self._term_alt)
+                self.seeker.pitch_offset_norm = self._pitch_offset / _TRK_MAX_DEG
 
                 if self._in_tracking and self._flight_mode == "TRACKING":
                     if target_locked:
@@ -710,31 +770,27 @@ class SeekerCtrl:
                         self._last_errorx = errorx
                         self._last_errory = errory
                         self._lost_count  = 0
-                        self.send_tracking(errorx, errory)
-                        # Log effective errory: subtract pitch offsets so the CSV
-                        # reflects the actual PID setpoint ArduPlane is driving to.
-                        offset_norm = _TRK_PITCH_OFFSET / _TRK_MAX_DEG
-                        if in_terminal:
-                            offset_norm += _TRK_TERM_PTCH / _TRK_MAX_DEG
-                        log_ey = errory - offset_norm
-                        self._log_row(now, errorx, log_ey,
-                                      target_locked=True, terminal=in_terminal)
+                        _ey_adj = errory  - self._pitch_offset / _TRK_MAX_DEG
+                        self.send_tracking(errorx, _ey_adj)
+                        self._log_row(now, errorx, _ey_adj, target_locked=True)
 
                     else:
                         self._lost_count += 1
-                        if self._lost_count >= 50:
+                        if self._auto_mode and self._lost_count >= 50:
+                            # In auto mode: revert to AUTO after sustained track loss.
                             self._lost_count  = 0
                             self._in_tracking = False
                             self.set_mode_auto()
                         else:
-                            self.send_tracking(self._last_errorx, self._last_errory)
-                        self._log_row(now, self._last_errorx, self._last_errory,
-                                      target_locked=False, terminal=in_terminal)
+                            _ey_adj = self._last_errory - self._pitch_offset / _TRK_MAX_DEG
+                        self.send_tracking(self._last_errorx, _ey_adj)
+                        self._log_row(now, self._last_errorx, _ey_adj,
+                                      target_locked=False)
 
                 # ── 6. Annotate HUD ───────────────────────────────────────────
                 h_frame  = annotated.shape[0]
                 dist_tgt_m = dist_to_target_m if dist_to_target_m is not None else self._dist_to_target_m()
-                spd_kmh  = self._airspeed_ms * 3.6
+                spd_kmh  = self._groundspeed_ms * 3.6
                 err_str  = f"  ex={errorx:+.3f} ey={errory:+.3f}" if target_locked else ""
                 mode_wp  = "%s:%d" % (self._flight_mode, self._current_wp)
                 desc = "%s, dist %.3f km, alt %+.0f m, v %.2f km/jam, throttle %.0f%%." % (
@@ -754,7 +810,7 @@ class SeekerCtrl:
                                    self._lat, self._lon,
                                    self._yaw_deg, self._pitch_deg, self._roll_deg)
 
-                if self._record and self._in_tracking:
+                if self._record:
                     self._write_frame(annotated)
                 cv2.imshow(self.seeker.window_name, annotated)
 
@@ -769,7 +825,8 @@ class SeekerCtrl:
 
         finally:
             self._close_csv()
-            self._close_video()
+            self._close_video("takeoff")
+            self._close_video("tracking")
             self.seeker.close()
             if self._joystick_enabled:
                 self._stop_joystick_thread()

@@ -251,6 +251,7 @@ class Seeker:
         box_filter: bool = True,
         use_kalman: bool = True,
         tracker: str = "",
+        pitch_offset_norm: float = 0.0,
     ):
         """
         source          : camera index (int) or video / image file path (str)
@@ -286,8 +287,9 @@ class Seeker:
         self._shift_algo     = shift_algo
         self._box_filter     = box_filter
         self._use_kalman     = use_kalman
-        self._tracker_name   = tracker.lower() if tracker else ""
-        self._tracker_obj    = None
+        self._tracker_name      = tracker.lower() if tracker else ""
+        self._tracker_obj       = None
+        self.pitch_offset_norm  = pitch_offset_norm
 
         self._cal_hist        = _load_histogram(histogram_file)
         if self._cal_hist is not None:
@@ -564,7 +566,7 @@ class Seeker:
                 cv2.imshow(self._mask_window, mask)
             rect = _nearest_blob_rect(mask, frame.shape, self._box_filter)
             if rect is None:
-                self._draw_center_cross(out, w_frame, h_frame)
+                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 self._update_histogram_window()
                 return out, None, None
             x, y, w, h = rect
@@ -573,12 +575,12 @@ class Seeker:
             ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
             ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
             centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-            box_colour = (0, 233, 0) if centred else (203, 192, 233)
+            box_colour = (0, 233, 0) if centred else (0, 0, 255)
             cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
             cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
             cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
             cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
-            self._draw_center_cross(out, w_frame, h_frame)
+            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, cx, cy
 
@@ -641,7 +643,7 @@ class Seeker:
             cv2.imshow(self._mask_window, mask)
 
         if self._roi_hist is None or self._track_win is None or self._detect_count < 3:
-            self._draw_center_cross(out, w_frame, h_frame)
+            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, None, None
 
@@ -667,7 +669,7 @@ class Seeker:
                             self._kf_initialized = False
                             self._miss_count     = 0
                             self._tracker_obj    = None
-                        self._draw_center_cross(out, w_frame, h_frame)
+                        self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                         self._update_histogram_window()
                         return out, None, None
                     self._miss_count = 0
@@ -702,12 +704,12 @@ class Seeker:
                     ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
                     ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
                     centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-                    box_colour = (0, 233, 0) if centred else (203, 192, 233)
+                    box_colour = (0, 233, 0) if centred else (0, 0, 255)
                     cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
                     cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
                     cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
                     cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
-                    self._draw_center_cross(out, w_frame, h_frame)
+                    self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                     self._update_histogram_window()
                     return out, cx, cy
             # Tracker update failed or bbox too small — hard reset
@@ -718,7 +720,7 @@ class Seeker:
             self._kf_initialized = False
             self._miss_count     = 0
             self._tracker_obj    = None
-            self._draw_center_cross(out, w_frame, h_frame)
+            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, None, None
 
@@ -798,7 +800,7 @@ class Seeker:
                 th = int(self._win_h_ema) or 40
                 self._track_win = (max(0, pcx - tw // 2), max(0, pcy - th // 2),
                                    min(tw, w_frame), min(th, h_frame))
-                self._draw_center_cross(out, w_frame, h_frame)
+                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 cv2.circle(out, (pcx, pcy), 5, (0, 165, 255), 2)   # orange = predicting
                 cv2.line(out, (0, pcy), (w_frame, pcy), (0, 165, 255), 1)
                 cv2.line(out, (pcx, 0), (pcx, h_frame), (0, 165, 255), 1)
@@ -813,7 +815,7 @@ class Seeker:
                 self._kf_initialized = False
                 self._miss_count     = 0
                 self._tracker_obj    = None
-                self._draw_center_cross(out, w_frame, h_frame)
+                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 self._update_histogram_window()
                 return out, None, None
 
@@ -864,11 +866,11 @@ class Seeker:
         cx = max(0, min(cx, w_frame - 1))
         cy = max(0, min(cy, h_frame - 1))
 
-        # ── Draw rotated bounding box (green when centred, pink otherwise) ────
+        # ── Draw rotated bounding box (green when centred, red otherwise) ──────
         ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
         ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
         centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-        box_colour = (0, 233, 0) if centred else (203, 192, 233)
+        box_colour = (0, 233, 0) if centred else (0, 0, 255)
         if ret is not None:
             pts = cv2.boxPoints(ret).astype(np.intp)
             cv2.polylines(out, [pts], True, box_colour, 2)
@@ -881,7 +883,7 @@ class Seeker:
         cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
         cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
 
-        self._draw_center_cross(out, w_frame, h_frame)
+        self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
         self._update_histogram_window()
         return out, cx, cy
 
@@ -916,9 +918,15 @@ class Seeker:
         cv2.imshow(self._hist_window, self._render_histogram(self._cal_hist))
 
     @staticmethod
-    def _draw_center_cross(frame, w, h, box=80, arm=16, color=(0, 0, 233), thickness=3):
-        """Draw a corner-bracket crosshair (L-shapes at 4 corners of a box) with a small center cross."""
-        cx, cy = w // 2, h // 2
+    def _draw_center_cross(frame, w, h, pitch_offset_norm=0.0,
+                           box=80, arm=16, color=(0, 0, 233), thickness=3):
+        """Draw corner-bracket crosshair at the effective pitch-offset aim point.
+
+        pitch_offset_norm shifts the aim point upward by offset_norm * h/2 pixels,
+        matching the error normalization scale (positive = aim above centre).
+        """
+        cx = w // 2
+        cy = h // 2 - int(round(pitch_offset_norm * h / 2))
         corners = [
             (cx - box, cy - box, +1, +1),
             (cx + box, cy - box, -1, +1),
@@ -928,10 +936,9 @@ class Seeker:
         for x, y, dx, dy in corners:
             cv2.line(frame, (x, y), (x + arm * dx, y), color, thickness)
             cv2.line(frame, (x, y), (x, y + arm * dy), color, thickness)
-        # center cross
         cs = 24
-        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), (0, 0, 233), 3)
-        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), (0, 0, 233), 3)
+        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), color, thickness)
+        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), color, thickness)
 
     # ── Error computation ─────────────────────────────────────────────────────
 

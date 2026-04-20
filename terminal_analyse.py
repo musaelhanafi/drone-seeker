@@ -15,8 +15,8 @@ a two-stage cut to the raw data:
     everything after it.
 
 The figure shows four panels (altitude, camera error, attitude, surfaces) over
-the stage-2 window.  Vertical lines mark terminal-phase entry (red), nearest
-distance (cyan), and lowest altitude (magenta).
+the stage-2 window.  Vertical lines mark terminal-phase entry (red) and nearest
+distance (cyan).
 
 Usage
 -----
@@ -40,9 +40,9 @@ def load(path: str) -> dict[str, np.ndarray]:
         "roll_deg", "pitch_deg", "roll_rate_dps", "pitch_rate_dps",
         "pid_roll_desired", "pid_roll_P", "pid_roll_I", "pid_roll_D",
         "pid_pitch_desired", "pid_pitch_P", "pid_pitch_I", "pid_pitch_D",
-        "alt_rel_m", "airspeed_ms", "throttle_pct",
+        "alt_rel_m", "groundspeed_ms", "throttle_pct",
         "nav_pitch_deg",
-        "target_locked", "terminal",
+        "target_locked",
         "dist_m",
     ]
     data = {k: [] for k in cols}
@@ -131,12 +131,6 @@ def apply_cuts(d: dict) -> tuple[dict, int, int]:
 
 # ── Statistics helpers ────────────────────────────────────────────────────────
 
-def find_terminal_entry(d: dict) -> float | None:
-    """Return timestamp of first terminal==1 sample, or None."""
-    idx = np.where(d["terminal"] == 1.0)[0]
-    return float(d["timestamp_s"][idx[0]]) if len(idx) > 0 else None
-
-
 def _find_min_col(d: dict, col: str) -> tuple[int, float]:
     idx = int(np.nanargmin(d[col]))
     return idx, float(d["timestamp_s"][idx])
@@ -152,12 +146,11 @@ def find_nearest_dist(d: dict) -> tuple[int, float]:
 
 # ── Terminal output ───────────────────────────────────────────────────────────
 
-def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
+def print_summary(d: dict, first_lock_idx: int | None, nearest_idx: int | None = None):
     n      = len(d["timestamp_s"])
     t0, t1 = d["timestamp_s"][0], d["timestamp_s"][-1]
     dur    = t1 - t0
     locked = int(np.nansum(d["target_locked"]))
-    term   = int(np.nansum(d["terminal"]))
 
     unlocked     = n - locked
     pct_locked   = 100.0 * locked   / n if n else 0.0
@@ -167,12 +160,11 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
     print(f"  File duration   : {dur:.1f} s  ({n} rows)")
     print(f"  Target locked   : {locked} rows  ({pct_locked:.1f}%)")
     print(f"  Track lost      : {unlocked} rows  ({pct_unlocked:.1f}%)")
-    print(f"  Terminal phase  : {term} rows  ({100*term/n:.0f}%)")
 
     if first_lock_idx is not None:
         fl_t    = d["timestamp_s"][first_lock_idx]
         fl_alt  = d["alt_rel_m"][first_lock_idx]
-        fl_spd  = d["airspeed_ms"][first_lock_idx]
+        fl_spd  = d["groundspeed_ms"][first_lock_idx]
         fl_dist = d["dist_m"][first_lock_idx]
         print(f"\n  ── First track acquisition ──")
         print(f"  Time            : t+{fl_t - t0:.1f} s")
@@ -181,33 +173,51 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
         if np.isfinite(fl_dist):
             print(f"  Distance        : {fl_dist:.1f} m")
 
-    if t_entry is not None:
-        mask_t    = d["terminal"] == 1.0
-        alt_t     = d["alt_rel_m"][mask_t]
-        spd_t     = d["airspeed_ms"][mask_t]
-        ex_t      = d["errorx"][mask_t]
-        ey_t      = d["errory"][mask_t]
-        locked_t  = d["target_locked"][mask_t]
-        dist_t    = d["dist_m"][mask_t]
-        n_t       = len(locked_t)
-        lost_t    = int(np.nansum(locked_t == 0.0))
-        pct_lost_t = 100.0 * lost_t / n_t if n_t else 0.0
+    # ── Hit / nearest point ───────────────────────────────────────────────────
+    if nearest_idx is not None:
+        hit_dist  = float(d["dist_m"][nearest_idx])
+        hit_spd   = float(d["groundspeed_ms"][nearest_idx])
+        hit_alt   = float(d["alt_rel_m"][nearest_idx])
+        hit_t     = float(d["timestamp_s"][nearest_idx])
+        print(f"\n  ── Nearest point (hit) ──")
+        print(f"  Time            : t+{hit_t - t0:.1f} s")
+        print(f"  Distance        : {hit_dist:.1f} m")
+        print(f"  Speed at hit    : {hit_spd * 3.6:.1f} km/h  ({hit_spd:.1f} m/s)")
+        print(f"  Alt at hit      : {hit_alt:.1f} m")
 
-        print(f"\n  ── Terminal phase entry ──")
-        print(f"  Entry time      : t+{t_entry - t0:.1f} s")
-        print(f"  Alt above target: {alt_t[0]:.1f} m")
-        print(f"  Speed at entry  : {spd_t[0] * 3.6:.1f} km/h")
-        if np.isfinite(dist_t[0]):
-            print(f"  Distance        : {dist_t[0]:.1f} m")
-        print(f"\n  ── Terminal phase stats ──")
-        print(f"  Duration        : {n_t} rows")
-        print(f"  Track lost      : {lost_t} rows  ({pct_lost_t:.1f}%)")
-        print(f"  Alt range       : {np.nanmin(alt_t):.1f} – {np.nanmax(alt_t):.1f} m")
-        print(f"  Speed range     : {np.nanmin(spd_t) * 3.6:.1f} – {np.nanmax(spd_t) * 3.6:.1f} km/h")
-        print(f"  |errorx| mean   : {np.nanmean(np.abs(ex_t)):.3f}  max: {np.nanmax(np.abs(ex_t)):.3f}")
-        print(f"  |errory| mean   : {np.nanmean(np.abs(ey_t)):.3f}  max: {np.nanmax(np.abs(ey_t)):.3f}")
+    # ── Descent rate ──────────────────────────────────────────────────────────
+    alt = d["alt_rel_m"]
+    ts  = d["timestamp_s"]
+    dt  = np.diff(ts)
+    dalt = np.diff(alt)
+    valid = (dt > 0) & np.isfinite(dalt)
+    if valid.any():
+        rates = dalt[valid] / dt[valid]          # positive = climbing
+        descent_rates = -rates                   # positive = descending
+        mean_desc  = float(np.mean(descent_rates))
+        peak_desc  = float(np.max(descent_rates))
+        print(f"\n  ── Descent ──")
+        print(f"  Mean descent    : {mean_desc:.2f} m/s")
+        print(f"  Peak descent    : {peak_desc:.2f} m/s")
+        total_alt_drop = float(alt[0] - np.nanmin(alt))
+        print(f"  Total alt drop  : {total_alt_drop:.1f} m")
+
+    # ── Pitch average ─────────────────────────────────────────────────────────
+    pitch = d["pitch_deg"]
+    nav_p = d["nav_pitch_deg"]
+    locked_mask = d["target_locked"] == 1.0
+    if np.any(locked_mask):
+        mean_pitch      = float(np.nanmean(pitch[locked_mask]))
+        mean_nav_pitch  = float(np.nanmean(nav_p[locked_mask]))
+        print(f"\n  ── Pitch (locked rows only) ──")
+        print(f"  Mean pitch      : {mean_pitch:.1f} deg")
+        print(f"  Mean nav_pitch  : {mean_nav_pitch:.1f} deg")
     else:
-        print("\n  No terminal phase data (terminal column all 0).")
+        mean_pitch     = float(np.nanmean(pitch))
+        mean_nav_pitch = float(np.nanmean(nav_p))
+        print(f"\n  ── Pitch (all rows) ──")
+        print(f"  Mean pitch      : {mean_pitch:.1f} deg")
+        print(f"  Mean nav_pitch  : {mean_nav_pitch:.1f} deg")
 
     print(f"{'─'*55}\n")
 
@@ -216,8 +226,6 @@ def print_summary(d: dict, t_entry: float | None, first_lock_idx: int | None):
 
 def _plot_figure(d: dict, path: str,
                  t0_full: float,
-                 t_entry: float | None,
-                 t_lowest: float | None,
                  t_nearest: float | None):
     t = d["timestamp_s"] - t0_full
 
@@ -240,11 +248,10 @@ def _plot_figure(d: dict, path: str,
     ax1c.spines["right"].set_position(("axes", 1.12))
 
     ax1.plot(t, s("alt_rel_m"),          color="tab:blue",   label="alt rel (m)")
-    ax1b.plot(t, s("airspeed_ms") * 3.6, color="tab:orange", label="airspeed (km/h)", linestyle="--")
+    ax1b.plot(t, s("groundspeed_ms") * 3.6, color="tab:orange", label="groundspeed (km/h)", linestyle="--")
     ax1c.plot(t, s("throttle_pct"),       color="tab:green",  label="throttle (%)",    linestyle=":")
-    vline(ax1, t_entry,   "red",     "--", "terminal entry")
-    vline(ax1, t_nearest, "cyan",    ":",  "nearest dist")
-    vline(ax1, t_lowest,  "magenta", ":",  "lowest alt")
+
+    vline(ax1, t_nearest, "cyan", ":",  "nearest dist")
     ax1.set_ylabel("alt rel (m)"); ax1b.set_ylabel("speed (km/h)"); ax1c.set_ylabel("throttle (%)")
     ax1.set_title("Altitude / Airspeed / Throttle")
     lines  = (ax1.get_legend_handles_labels()[0] +
@@ -261,9 +268,8 @@ def _plot_figure(d: dict, path: str,
     ax2.plot(t, s("errorx"), color="tab:blue",   label="errorx")
     ax2.plot(t, s("errory"), color="tab:orange",  label="errory")
     ax2.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    vline(ax2, t_entry,   "red",     "--")
-    vline(ax2, t_nearest, "cyan",    ":")
-    vline(ax2, t_lowest,  "magenta", ":")
+
+    vline(ax2, t_nearest, "cyan", ":")
     locked = s("target_locked")
     for i in range(len(t) - 1):
         if locked[i] == 0:
@@ -279,9 +285,8 @@ def _plot_figure(d: dict, path: str,
     ax3.plot(t, s("roll_deg"),      color="tab:orange",  label="roll (deg)")
     ax3.plot(t, s("nav_pitch_deg"), color="tab:green",   label="nav_pitch (deg)", linestyle="--")
     ax3.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    vline(ax3, t_entry,   "red",     "--")
-    vline(ax3, t_nearest, "cyan",    ":")
-    vline(ax3, t_lowest,  "magenta", ":")
+
+    vline(ax3, t_nearest, "cyan", ":")
     ax3.set_ylabel("degrees")
     ax3.set_title("Aircraft Attitude")
     ax3.legend(fontsize=7, loc="upper right")
@@ -292,9 +297,8 @@ def _plot_figure(d: dict, path: str,
     ax4.plot(t, s("elevator"), color="tab:blue",   label="elevator")
     ax4.plot(t, s("aileron"),  color="tab:orange",  label="aileron")
     ax4.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-    vline(ax4, t_entry,   "red",     "--")
-    vline(ax4, t_nearest, "cyan",    ":",  "nearest dist")
-    vline(ax4, t_lowest,  "magenta", ":",  "lowest alt")
+
+    vline(ax4, t_nearest, "cyan", ":", "nearest dist")
     ax4.set_ylabel("normalised")
     ax4.set_xlabel("time (s)")
     ax4.set_title("Control Surfaces (elevon demix)")
@@ -321,16 +325,13 @@ def main():
     # Apply stage-1 (first pass) and stage-2 (lowest alt) cuts
     d, _pass_end, _lowest = apply_cuts(d_raw)
 
-    t_entry        = find_terminal_entry(d)
     first_lock_idx = find_first_lock(d)
-    _, t_lowest    = find_lowest_alt(d)
-    _, t_nearest   = find_nearest_dist(d)
+    nearest_idx, t_nearest = find_nearest_dist(d)
 
-    print_summary(d, t_entry, first_lock_idx)
+    print_summary(d, first_lock_idx, nearest_idx)
 
     t0_full = d_raw["timestamp_s"][0]
-    _plot_figure(d, path, t0_full=t0_full,
-                 t_entry=t_entry, t_lowest=t_lowest, t_nearest=t_nearest)
+    _plot_figure(d, path, t0_full=t0_full, t_nearest=t_nearest)
     plt.show()
 
 
