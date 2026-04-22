@@ -21,36 +21,33 @@
   <rect x="395" y="234" width="110" height="11" rx="4" fill="#4a5568"/>
   <text x="450" y="260" text-anchor="middle" font-family="Arial" font-size="12" fill="#2d3748" font-weight="bold">Monitor</text>
 
-  <!-- ═══════════ AIRFRAME (flying wing, top-down, nose up toward monitor) ═══════════ -->
-  <!-- Wing left -->
-  <path d="M 450,345 L 195,405 L 228,438 L 450,370 Z" fill="#d4c9b0" stroke="#8b7355" stroke-width="2"/>
+  <!-- ═══════════ AIRFRAME — Nano Talon 900mm (flying wing, pusher, top-down) ═══════════ -->
+  <!-- Wing left — wider for 900mm span -->
+  <path d="M 450,345 L 172,410 L 208,442 L 450,372 Z" fill="#d4c9b0" stroke="#8b7355" stroke-width="2"/>
   <!-- Wing right -->
-  <path d="M 450,345 L 705,405 L 672,438 L 450,370 Z" fill="#d4c9b0" stroke="#8b7355" stroke-width="2"/>
+  <path d="M 450,345 L 728,410 L 692,442 L 450,372 Z" fill="#d4c9b0" stroke="#8b7355" stroke-width="2"/>
+  <!-- Wing shading -->
+  <path d="M 450,345 L 172,410 L 208,427 L 450,358 Z" fill="#e2d6be" opacity="0.5"/>
+  <path d="M 450,345 L 728,410 L 692,427 L 450,358 Z" fill="#e2d6be" opacity="0.5"/>
   <!-- Fuselage -->
-  <ellipse cx="450" cy="375" rx="22" ry="38" fill="#e8e0d0" stroke="#8b7355" stroke-width="2"/>
+  <ellipse cx="450" cy="378" rx="20" ry="36" fill="#e8e0d0" stroke="#8b7355" stroke-width="2"/>
   <!-- Camera lens (nose, pointing up = toward monitor) -->
-  <circle cx="450" cy="338" r="11" fill="#222" stroke="#555" stroke-width="2"/>
-  <circle cx="450" cy="338" r="5" fill="#4a90d9"/>
-  <!-- Motor left -->
-  <circle cx="212" cy="422" r="14" fill="#444" stroke="#222" stroke-width="2"/>
-  <circle cx="212" cy="422" r="7" fill="#888"/>
-  <!-- Prop lines left -->
-  <line x1="197" y1="422" x2="227" y2="422" stroke="#bbb" stroke-width="2"/>
-  <line x1="212" y1="407" x2="212" y2="437" stroke="#bbb" stroke-width="2"/>
-  <!-- Motor right -->
-  <circle cx="688" cy="422" r="14" fill="#444" stroke="#222" stroke-width="2"/>
-  <circle cx="688" cy="422" r="7" fill="#888"/>
-  <!-- Prop lines right -->
-  <line x1="673" y1="422" x2="703" y2="422" stroke="#bbb" stroke-width="2"/>
-  <line x1="688" y1="407" x2="688" y2="437" stroke="#bbb" stroke-width="2"/>
+  <circle cx="450" cy="343" r="11" fill="#222" stroke="#555" stroke-width="2"/>
+  <circle cx="450" cy="343" r="5" fill="#4a90d9"/>
+  <!-- Pusher motor (rear, single) -->
+  <circle cx="450" cy="414" r="13" fill="#333" stroke="#111" stroke-width="2"/>
+  <circle cx="450" cy="414" r="6" fill="#777"/>
+  <!-- Prop lines (pusher, horizontal) -->
+  <line x1="434" y1="414" x2="466" y2="414" stroke="#bbb" stroke-width="2.5"/>
+  <line x1="450" y1="401" x2="450" y2="427" stroke="#bbb" stroke-width="2.5"/>
   <!-- Flight Controller chip -->
-  <rect x="438" y="362" width="24" height="22" rx="3" fill="#e07b39" stroke="#b85c1a" stroke-width="1.5"/>
-  <text x="450" y="376" text-anchor="middle" font-family="Arial" font-size="7" fill="white" font-weight="bold">FC</text>
+  <rect x="438" y="360" width="24" height="20" rx="3" fill="#e07b39" stroke="#b85c1a" stroke-width="1.5"/>
+  <text x="450" y="374" text-anchor="middle" font-family="Arial" font-size="7" fill="white" font-weight="bold">FC</text>
   <!-- RC Receiver chip -->
-  <rect x="438" y="387" width="24" height="16" rx="3" fill="#5ba3e0" stroke="#2c6fad" stroke-width="1.5"/>
-  <text x="450" y="399" text-anchor="middle" font-family="Arial" font-size="6.5" fill="white" font-weight="bold">RX</text>
+  <rect x="438" y="383" width="24" height="15" rx="3" fill="#5ba3e0" stroke="#2c6fad" stroke-width="1.5"/>
+  <text x="450" y="394" text-anchor="middle" font-family="Arial" font-size="6.5" fill="white" font-weight="bold">RX</text>
   <!-- Label -->
-  <text x="450" y="465" text-anchor="middle" font-family="Arial" font-size="13" fill="#2d3748" font-weight="bold">AtomRC Mobula 650mm</text>
+  <text x="450" y="465" text-anchor="middle" font-family="Arial" font-size="13" fill="#2d3748" font-weight="bold">Nano Talon 900 mm</text>
   <text x="450" y="481" text-anchor="middle" font-family="Arial" font-size="11" fill="#4a5568">Flight Controller · RC Receiver · Kamera</text>
 
   <!-- ═══════════ LAPTOP (bottom right) ═══════════ -->
