@@ -378,6 +378,7 @@ class Seeker:
         self._cap_stop  = False
         self._cap_ok    = False
         self._cap_frame = None
+        self._cap_seq   = 0
         self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._cap_thread.start()
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -400,6 +401,7 @@ class Seeker:
             with self._cap_lock:
                 self._cap_ok    = ok
                 self._cap_frame = frame
+                self._cap_seq  += 1
 
     def close(self):
         """Release the capture device and destroy the display window."""
@@ -959,11 +961,15 @@ class Seeker:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def read_frame(self):
-        """Return (ok, frame) from the background capture buffer, cropped if configured."""
+        """Return (seq, ok, frame) from the background capture buffer, cropped if configured.
+
+        seq increments each time the capture thread delivers a new frame.
+        Callers can skip processing when seq is unchanged from the previous call.
+        """
         with self._cap_lock:
-            ok, frame = self._cap_ok, self._cap_frame
+            seq, ok, frame = self._cap_seq, self._cap_ok, self._cap_frame
         if frame is None:
-            return False, None
+            return 0, False, None
         if ok and self.crop is not None:
             x, y, w, h = self.crop
             fh, fw = frame.shape[:2]
@@ -977,7 +983,7 @@ class Seeker:
             print(f"[Seeker] Resolution: {fw}x{fh}"
                   + (f"  (cropped from raw, offset {self.crop[:2]})" if self.crop else ""))
             self._res_logged = True
-        return ok, frame
+        return seq, ok, frame
 
     def run(self):
         """Open source, run CamShift tracking loop; press 'q' to quit,
@@ -992,7 +998,7 @@ class Seeker:
                 prev_time = curr_time
                 fps = 1.0 / (sum(frame_times) / len(frame_times))
 
-                ok, frame = self.read_frame()
+                _seq, ok, frame = self.read_frame()
                 if frame is None:
                     continue   # capture thread not ready yet
                 if not ok:

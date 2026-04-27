@@ -152,12 +152,6 @@ def parse_args():
         default=False,
         help="Record annotated video to tracking_<timestamp>.avi while in TRACKING mode",
     )
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        default=False,
-        help="Auto mode: enter TRACKING when within 1 km of target; ch6 keeps FC in AUTO otherwise",
-    )
 
     parser.add_argument(
         "--crop",
@@ -211,8 +205,7 @@ def main():
         use_kalman=use_kalman,
         tracker=tracker_name,
         hud_pitch=not args.no_hud_pitch,
-        hud_yaw=not args.no_hud_yaw,
-        auto_mode=args.auto,
+        hud_yaw=not args.no_hud_yaw
     )
     ctrl.connect()
 

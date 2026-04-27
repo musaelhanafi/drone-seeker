@@ -18,6 +18,7 @@ from seeker import Seeker
 
 # RC channel 6 PWM threshold to consider the switch "active"
 _CH6_ACTIVE_PWM = 1400
+_CH6_FORCE_ACTIVE_PWM = 1700
 
 # ── Tracking control tuning ───────────────────────────────────────────────────
 _LATENCY_S     = 0.08   # pipeline latency to compensate (s)
@@ -75,11 +76,9 @@ class SeekerCtrl:
         use_kalman: bool = True,
         tracker: str = "",
         hud_pitch: bool = True,
-        hud_yaw: bool = True,
-        auto_mode: bool = False,
+        hud_yaw: bool = True
     ):
         self._input_prediction = input_prediction
-        self._auto_mode        = auto_mode
         self.connection_string = connection_string
         self.baud   = baud
         self.master = None
@@ -94,6 +93,14 @@ class SeekerCtrl:
         # ── MAVLink telemetry state ───────────────────────────────────────────
         self._srv1_raw      = 0        # SERVO_OUTPUT_RAW servo1 (µs)
         self._srv2_raw      = 0        # SERVO_OUTPUT_RAW servo2 (µs)
+        self._srv1_trim     = 1500.0   # SERVO1_TRIM (µs)
+        self._srv1_min      = 1000.0   # SERVO1_MIN  (µs)
+        self._srv1_max      = 2000.0   # SERVO1_MAX  (µs)
+        self._srv2_trim     = 1500.0   # SERVO2_TRIM (µs)
+        self._srv2_max      = 2000.0   # SERVO2_MAX  (µs)
+        self._srv4_raw      = 0        # SERVO_OUTPUT_RAW servo4 — L-Rudvator (µs)
+        self._srv4_trim     = 1500.0   # SERVO4_TRIM (µs)
+        self._srv4_max      = 2000.0   # SERVO4_MAX  (µs)
         self._roll_deg       = 0.0      # ATTITUDE roll (deg)
         self._pitch_deg      = 0.0      # ATTITUDE pitch (deg)
         self._nav_pitch_deg  = 0.0      # NAV_CONTROLLER_OUTPUT nav_pitch (deg)
@@ -207,6 +214,13 @@ class SeekerCtrl:
         "TRK_TGT_LAT":      "_target_lat",
         "TRK_TGT_LON":      "_target_lon",
         "TRK_PITCH_OFFSET": "_pitch_offset",
+        "SERVO1_TRIM":      "_srv1_trim",
+        "SERVO1_MIN":       "_srv1_min",
+        "SERVO1_MAX":       "_srv1_max",
+        "SERVO2_TRIM":      "_srv2_trim",
+        "SERVO2_MAX":       "_srv2_max",
+        "SERVO4_TRIM":      "_srv4_trim",
+        "SERVO4_MAX":       "_srv4_max",
     }
 
     def _fetch_tracking_params(self):
@@ -287,6 +301,7 @@ class SeekerCtrl:
         if msg:
             self._srv1_raw = msg.servo1_raw
             self._srv2_raw = msg.servo2_raw
+            self._srv4_raw = msg.servo4_raw
 
         msg = self.master.messages.get("ATTITUDE")
         if msg:
@@ -366,11 +381,14 @@ class SeekerCtrl:
     # ── CSV logger ────────────────────────────────────────────────────────────
 
     def _open_csv(self):
-        self._csv_file   = open("tracking.csv", "w", newline="")
+        ts = getattr(self, "_tracking_ts", None) or \
+             __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"tracking_{ts}.csv"
+        self._csv_file   = open(fname, "w", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
             "timestamp_s", "errorx", "errory",
-            "aileron", "elevator",
+            "aileron", "elevator", "rudder",
             "roll_deg", "pitch_deg", "roll_rate_dps", "pitch_rate_dps",
             "pid_roll_desired", "pid_roll_P", "pid_roll_I", "pid_roll_D",
             "pid_pitch_desired", "pid_pitch_P", "pid_pitch_I", "pid_pitch_D",
@@ -379,7 +397,7 @@ class SeekerCtrl:
             "target_locked",
             "dist_m",
         ])
-        print("[LOG] tracking.csv opened")
+        print(f"[LOG] {fname} opened")
 
     def _close_csv(self):
         if self._csv_file is not None:
@@ -393,15 +411,24 @@ class SeekerCtrl:
                  target_locked: bool = True):
         if self._csv_writer is None:
             return
-        # Elevon demix: srv1/srv2 centred at 1500 µs
-        aileron  = (self._srv1_raw - self._srv2_raw) / 700
-        elevator = (self._srv1_raw + self._srv2_raw - 2700) / 700
+        # Aileron — asymmetric ANGLE normalisation (mirrors SIM_XPlane ANGLE type):
+        # use half_up = max-trim when above trim, half_dn = trim-min when below.
+        srv1_half = (self._srv1_max - self._srv1_trim) if self._srv1_raw >= self._srv1_trim \
+                    else (self._srv1_trim - self._srv1_min)
+        aileron   = (self._srv1_raw - self._srv1_trim) / srv1_half
+        # Vtail demix — mirrors SIM_XPlane VTAIL_ELEVATOR / VTAIL_RUDDER:
+        # SV2 = R-rudvator (ch2), SV4 = L-rudvator (ch4)
+        sum_trim  = self._srv2_trim + self._srv4_trim
+        denom     = (self._srv2_max - self._srv2_trim) + (self._srv4_max - self._srv4_trim)
+        elevator  = -(self._srv2_raw + self._srv4_raw - sum_trim) / denom
+        rudder    =  (self._srv4_raw - self._srv2_raw) / denom
         self._csv_writer.writerow([
             f"{timestamp:.3f}",
             f"{errorx:+.4f}" if errorx is not None else "",
             f"{errory:+.4f}" if errory is not None else "",
             f"{aileron:.4f}",
             f"{elevator:.4f}",
+            f"{rudder:.4f}",
             f"{self._roll_deg:.3f}",
             f"{self._pitch_deg:.3f}",
             f"{self._roll_rate_dps:.3f}",
@@ -444,6 +471,7 @@ class SeekerCtrl:
             self._ffmpeg_tkof = proc
         else:
             self._ffmpeg = proc
+            self._tracking_ts = ts
         print(f"[REC] {label} recording → {path}  fps={fps:.1f}")
 
     def _close_video(self, label: str = "tracking"):
@@ -558,7 +586,11 @@ class SeekerCtrl:
 
     def _ch6_active(self) -> bool:
         pwm = self.rc_channels.get("ch6", 0)
-        return pwm >= _CH6_ACTIVE_PWM
+        return pwm >= _CH6_ACTIVE_PWM and pwm < _CH6_FORCE_ACTIVE_PWM
+    def _ch6_force_active(self) -> bool:
+        pwm = self.rc_channels.get("ch6", 0)
+        return pwm >= _CH6_FORCE_ACTIVE_PWM
+
 
     # ── Flight mode ───────────────────────────────────────────────────────────
 
@@ -566,6 +598,7 @@ class SeekerCtrl:
         if self._commanded_mode == custom_mode:
             return
         self._commanded_mode = custom_mode
+        print(f"[MODE] → {label} ({custom_mode})")
         self.master.mav.command_long_send(
             self.master.target_system,
             self.master.target_component,
@@ -645,17 +678,27 @@ class SeekerCtrl:
         self.seeker.open()
 
         frame_times: collections.deque = collections.deque(maxlen=30)
-        prev_time       = time.monotonic()
+        prev_time        = time.monotonic()
         prev_in_tracking = False
+        prev_frame_seq   = -1
         try:
             while True:
                 # ── 1. Grab frame & run pink CamShift tracker ─────────────────
-                ok, frame = self.seeker.read_frame()
+                frame_seq, ok, frame = self.seeker.read_frame()
                 if frame is None:
+                    time.sleep(0.002)
                     continue   # capture thread not ready yet
                 if not ok:
                     print("[Ctrl] End of stream.")
                     break
+                if frame_seq == prev_frame_seq:
+                    # No new frame yet — pump MAVLink and yield to avoid
+                    # spinning the main loop at CPU speed and saturating the
+                    # MAVLink link with redundant send_tracking() calls.
+                    self._poll_rc()
+                    time.sleep(0.002)
+                    continue
+                prev_frame_seq = frame_seq
 
                 now = time.monotonic()
                 frame_times.append(now - prev_time)
@@ -675,7 +718,6 @@ class SeekerCtrl:
                 self._poll_rc()
                 self._poll_heartbeat()
                 self._poll_mavlink_state()
-                ch6_on = self._ch6_active()
 
                 # ── 3. Mode management ────────────────────────────────────────
                 ch6_fell = self._prev_ch6_on and not ch6_on  # armed → disarmed edge
@@ -686,22 +728,25 @@ class SeekerCtrl:
                 on_last_wp       = (self._waypoint_count > 0 and
                                     self._current_wp == self._waypoint_count - 1)
 
-                if self._auto_mode:
+                if self._ch6_active():
                     # Enter TRACKING only when in AUTO mode, on the last waypoint,
                     # and within close-enough range.
                     if (in_auto and on_last_wp and close_enough and
                             target_locked and not self._in_tracking):
                         self.set_mode_tracking()
                         self._in_tracking = True
+                    elif ch6_fell and self._in_tracking:
+                        self._in_tracking = False
+                        self.set_mode_stabilize()
                     elif not self._in_tracking:
                         # Rule 1 (joystick on): ch6 high → AUTO, ch6 low → STABILIZE
                         # Rule 2 (joystick off): always AUTO, ch6 has no effect
-                        if self._joy_handler is not None and not ch6_on:
+                        if not ch6_on:
                             self.set_mode_stabilize()
                         else:
                             self.set_mode_auto()
 
-                else:
+                elif self._ch6_force_active():
                     # Rule 3: ch6 gates TRACKING; no auto-mode logic.
                     if ch6_fell:
                         self._in_tracking = False
@@ -713,12 +758,13 @@ class SeekerCtrl:
                 self._prev_ch6_on = ch6_on
 
                 # ── 4. CSV / video lifecycle ──────────────────────────────────
-                # Takeoff file: open on WP 1 entry, close when WP leaves 1.
+                # Takeoff file: open on STABILIZE entry (pre-launch), close when WP leaves 1.
                 if self._record:
-                    if in_auto and self._current_wp == 1 and self._prev_wp != 1:
-                        if self._ffmpeg_tkof is None:
-                            self._pending_video_open = True
-                            print("[REC] WP1 takeoff — warming up FPS before recording")
+                    if (self._flight_mode == "STABILIZE" and
+                            self._prev_flight_mode != "STABILIZE" and
+                            self._ffmpeg_tkof is None):
+                        self._pending_video_open = True
+                        print("[REC] STABILIZE — warming up FPS before takeoff recording")
                     elif self._current_wp != 1 and self._prev_wp == 1:
                         self._pending_video_open = False
                         self._close_video("takeoff")
@@ -772,20 +818,20 @@ class SeekerCtrl:
                         self._lost_count  = 0
                         _ey_adj = errory  - self._pitch_offset / _TRK_MAX_DEG
                         self.send_tracking(errorx, _ey_adj)
-                        self._log_row(now, errorx, _ey_adj, target_locked=True)
+                        self._log_row(now, errorx, errory, target_locked=True)
 
                     else:
                         self._lost_count += 1
-                        if self._auto_mode and self._lost_count >= 50:
-                            # In auto mode: revert to AUTO after sustained track loss.
+                        if self._lost_count >= 30:
                             self._lost_count  = 0
                             self._in_tracking = False
-                            self.set_mode_auto()
+                            if self._ch6_active() or self._ch6_force_active():
+                                self.set_mode_auto()
                         else:
                             _ey_adj = self._last_errory - self._pitch_offset / _TRK_MAX_DEG
-                        self.send_tracking(self._last_errorx, _ey_adj)
-                        self._log_row(now, self._last_errorx, _ey_adj,
-                                      target_locked=False)
+                            self.send_tracking(self._last_errorx, _ey_adj)
+                            self._log_row(now, self._last_errorx, self._last_errory,
+                                          target_locked=False)
 
                 # ── 6. Annotate HUD ───────────────────────────────────────────
                 h_frame  = annotated.shape[0]
@@ -798,7 +844,7 @@ class SeekerCtrl:
                     alt_dist_m, spd_kmh, self._throttle_pct,
                 )
                 cv2.putText(annotated,
-                            f"FPS: {fps:.1f}  LOCK: {'ON' if (self._auto_mode or ch6_on) else 'OFF'}{err_str}",
+                            f"FPS: {fps:.1f}  LOCK: {'ON' if self._ch6_active() or self._ch6_force_active() else 'OFF'}{err_str}",
                             (5, h_frame - 40),
                             cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
                 cv2.putText(annotated,
