@@ -63,24 +63,6 @@ def parse_args():
         help="Camera index (e.g. 0) or video file path (e.g. video.mp4)",
     )
     parser.add_argument(
-        "--joystick",
-        action="store_true",
-        default=False,
-        help="Enable joystick RC override (default: disabled)",
-    )
-    parser.add_argument(
-        "--joy-index",
-        type=int,
-        default=0,
-        help="Joystick device index (default: 0)",
-    )
-    parser.add_argument(
-        "--joy-rate",
-        type=int,
-        default=50,
-        help="Joystick send rate in Hz (default: 50)",
-    )
-    parser.add_argument(
         "--res",
         type=int,
         nargs=2,
@@ -187,9 +169,6 @@ def main():
         connection_string=args.connection,
         baud=args.baud,
         source=source,
-        joystick_enabled=args.joystick,
-        joystick_index=args.joy_index,
-        joystick_rate=args.joy_rate,
         capture_width=args.res[0] if args.res else None,
         capture_height=args.res[1] if args.res else None,
         crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,

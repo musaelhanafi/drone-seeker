@@ -9,7 +9,6 @@ import cv2
 from pymavlink import mavutil
 
 from hud_display import HudDisplay
-from joystick_handler import JoystickHandler
 from seeker import Seeker
 
 # Tracking errors are sent as TRACKING_MESSAGE (MAVLink ID 11045, ardupilotmega dialect).
@@ -57,10 +56,6 @@ class SeekerCtrl:
         connection_string: str,
         baud: int = 57600,
         source: int | str = 0,
-        joystick_enabled: bool = False,
-        joystick_index: int = 0,
-        joystick_rate: int = 50,
-
         capture_width: int | None = None,
         capture_height: int | None = None,
         crop: tuple[int | None, int | None, int | None, int | None] | None = None,
@@ -175,14 +170,6 @@ class SeekerCtrl:
                              tracker=tracker,
                              pitch_offset_norm=self._pitch_offset / _TRK_MAX_DEG)
 
-        # ── Joystick ──────────────────────────────────────────────────────────
-        self._joystick_enabled    = joystick_enabled
-        self._joystick_index      = joystick_index
-        self._joystick_rate       = joystick_rate
-        self._joy_handler: JoystickHandler | None = None
-        self._joy_thread:  threading.Thread | None = None
-        self._joy_stop     = threading.Event()
-
     # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self):
@@ -204,8 +191,6 @@ class SeekerCtrl:
         self._request_data_streams()
         self._fetch_tracking_params()
         self._fetch_mission_count()
-        if self._joystick_enabled:
-            self._start_joystick_thread()
 
     # ── Parameter fetch ───────────────────────────────────────────────────────
 
@@ -498,67 +483,6 @@ class SeekerCtrl:
                 except BrokenPipeError:
                     pass
 
-    # ── Joystick thread ───────────────────────────────────────────────────────
-
-    def _start_joystick_thread(self):
-        self._joy_handler = JoystickHandler(joy_index=self._joystick_index,
-                                             thr_invert=False)
-        self._joy_handler.open()
-        self._joy_stop.clear()
-        self._joy_thread = threading.Thread(
-            target=self._joystick_loop, daemon=True, name="joystick"
-        )
-        self._joy_thread.start()
-        print("[JOY] Joystick thread started")
-
-    def _joystick_loop(self):
-        interval   = 1.0 / self._joystick_rate
-        prev_ch    = {}
-        last_send  = 0.0
-
-        while not self._joy_stop.is_set():
-            now = time.monotonic()
-            ch  = self._joy_handler.read_channels()
-            changed = ch != prev_ch
-
-            if changed or now - last_send >= interval:
-                last_send = now
-                prev_ch   = ch
-                self._send_rc_override(ch)
-
-            sleep_for = interval - (time.monotonic() - now)
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-
-        # Release override on exit
-        self._send_rc_override({k: 0 for k in ("ch1", "ch2", "ch3", "ch4", "ch5", "ch6")})
-        print("[JOY] RC override released")
-
-    def _send_rc_override(self, ch: dict):
-        if self.master is None:
-            return
-        self.master.mav.rc_channels_override_send(
-            self.master.target_system,
-            self.master.target_component,
-            ch.get("ch1", UINT16_MAX),
-            ch.get("ch2", UINT16_MAX),
-            ch.get("ch3", UINT16_MAX),
-            ch.get("ch4", UINT16_MAX),
-            ch.get("ch5", UINT16_MAX),
-            ch.get("ch6", UINT16_MAX),
-            UINT16_MAX,
-            UINT16_MAX,
-        )
-
-    def _stop_joystick_thread(self):
-        if self._joy_thread is not None:
-            self._joy_stop.set()
-            self._joy_thread.join(timeout=2.0)
-            self._joy_thread = None
-        if self._joy_handler is not None:
-            self._joy_handler.close()
-            self._joy_handler = None
-
     # ── RC (non-blocking poll) ────────────────────────────────────────────────
 
     def _poll_rc(self):
@@ -713,13 +637,12 @@ class SeekerCtrl:
                     errorx, errory = 0.0, 0.0
 
                 # ── 2. Poll RC, HEARTBEAT & telemetry (non-blocking) ──────────
-                if self._joy_handler is not None:
-                    self._joy_handler.pump()
                 self._poll_rc()
                 self._poll_heartbeat()
                 self._poll_mavlink_state()
 
                 # ── 3. Mode management ────────────────────────────────────────
+                ch6_on   = self._ch6_active() or self._ch6_force_active()
                 ch6_fell = self._prev_ch6_on and not ch6_on  # armed → disarmed edge
 
                 dist_to_target_m = self._dist_to_target_m()
@@ -874,5 +797,3 @@ class SeekerCtrl:
             self._close_video("takeoff")
             self._close_video("tracking")
             self.seeker.close()
-            if self._joystick_enabled:
-                self._stop_joystick_thread()
