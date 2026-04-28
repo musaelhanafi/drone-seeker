@@ -301,7 +301,7 @@ def _plot_figure(d: dict, path: str,
     vline(ax4, t_nearest, "cyan", ":", "nearest dist")
     ax4.set_ylabel("normalised")
     ax4.set_xlabel("time (s)")
-    ax4.set_title("Control Surfaces (elevon demix)")
+    ax4.set_title("Control Surfaces")
     ax4.legend(fontsize=7, loc="upper right")
     ax4.grid(True, alpha=0.3)
 

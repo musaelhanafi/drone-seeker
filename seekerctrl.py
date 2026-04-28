@@ -84,6 +84,7 @@ class SeekerCtrl:
         self._prev_ch6_on    = False   # previous ch6 armed state for edge detection
         self._commanded_mode = -1      # last custom_mode we sent a command for
         self._wp_takeoff_sent = False  # WP-0 reset sent only once at startup
+        self._armed           = False  # True when FC reports MAV_MODE_FLAG_SAFETY_ARMED
 
         # ── MAVLink telemetry state ───────────────────────────────────────────
         self._srv1_raw      = 0        # SERVO_OUTPUT_RAW servo1 (µs)
@@ -168,7 +169,7 @@ class SeekerCtrl:
                              box_filter=box_filter,
                              use_kalman=use_kalman,
                              tracker=tracker,
-                             pitch_offset_norm=self._pitch_offset / _TRK_MAX_DEG)
+                             pitch_offset_norm=2*self._pitch_offset / _TRK_MAX_DEG)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -188,6 +189,8 @@ class SeekerCtrl:
             *([0] * 18),
         )
         print("[RC] All overrides released")
+        self._set_mode(0, "MANUAL")
+        self._disarm()
         self._request_data_streams()
         self._fetch_tracking_params()
         self._fetch_mission_count()
@@ -502,11 +505,11 @@ class SeekerCtrl:
         return self.rc_channels
 
     def _poll_heartbeat(self):
-        """Update _flight_mode from the last HEARTBEAT stored by pymavlink."""
         msg = self.master.messages.get("HEARTBEAT")
         if msg:
             self._flight_mode = _PLANE_MODES.get(msg.custom_mode,
                                                   f"MODE({msg.custom_mode})")
+            self._armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
     def _ch6_active(self) -> bool:
         pwm = self.rc_channels.get("ch6", 0)
@@ -556,8 +559,21 @@ class SeekerCtrl:
             self._wp_takeoff_sent = True
         self._set_mode(_AUTO_MODE, "AUTO")
 
+    def set_mode_manual(self):
+        self._set_mode(0, "MANUAL")
+
     def set_mode_stabilize(self):
         self._set_mode(_STABILIZE_MODE, "STABILIZE")
+
+    def _disarm(self):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0, 0, 0, 0, 0, 0, 0,
+        )
+        print("[ARM] Disarm sent")
 
     # ── TRACKING MAVLink message ──────────────────────────────────────────────
 
@@ -600,6 +616,48 @@ class SeekerCtrl:
             raise RuntimeError("Not connected. Call connect() first.")
 
         self.seeker.open()
+
+        # Wait until AUTO mode — display camera + HUD while waiting.
+        print("[Ctrl] Waiting for AUTO mode ...")
+        _prev_seq_wait = -1
+        while True:
+            self._poll_rc()
+            self._poll_heartbeat()
+            self._poll_mavlink_state()
+            if self._flight_mode == "AUTO":
+                print("[Ctrl] AUTO mode confirmed — starting seeker loop.")
+                if self._record:
+                    self._pending_video_open = True
+                    print("[REC] AUTO — queuing takeoff recording (waiting for FPS warmup)")
+                break
+            seq, ok, frame = self.seeker.read_frame()
+            if frame is None or seq == _prev_seq_wait:
+                time.sleep(0.002)
+                continue
+            _prev_seq_wait = seq
+            annotated, _, _ = self.seeker.track(frame)
+            self._hud.draw_hud(True, annotated,
+                               self._lat, self._lon,
+                               self._yaw_deg, self._pitch_deg, self._roll_deg)
+            h_w       = annotated.shape[0]
+            dist_km   = self._dist_to_target_m() / 1000.0
+            alt_rel_m = self._alt_msl_m - self._target_alt_msl
+            spd_kmh   = self._groundspeed_ms * 3.6
+            armed_str = "ARMED" if self._armed else "DISARMED"
+            cv2.putText(annotated,
+                        f"WAITING AUTO  mode={self._flight_mode}  SEEKER: {'ON' if self._ch6_active() or self._ch6_force_active() else 'OFF'} ",
+                        (5, h_w - 40),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
+            cv2.putText(annotated,
+                        "%s:%d, dist %.3f km, alt %+.0f m, v %.2f km/jam, throttle %.0f%%." % (
+                            self._flight_mode, self._current_wp,
+                            dist_km, alt_rel_m, spd_kmh, self._throttle_pct),
+                        (5, h_w - 20),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
+            cv2.imshow(self.seeker.window_name, annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                return
+            time.sleep(0.02)
 
         frame_times: collections.deque = collections.deque(maxlen=30)
         prev_time        = time.monotonic()
@@ -651,7 +709,9 @@ class SeekerCtrl:
                 on_last_wp       = (self._waypoint_count > 0 and
                                     self._current_wp == self._waypoint_count - 1)
 
-                if self._ch6_active():
+                if not self.rc_channels:
+                    pass  # hold MANUAL until first RC packet arrives
+                elif self._ch6_active():
                     # Enter TRACKING only when in AUTO mode, on the last waypoint,
                     # and within close-enough range.
                     if (in_auto and on_last_wp and close_enough and
@@ -662,11 +722,9 @@ class SeekerCtrl:
                         self._in_tracking = False
                         self.set_mode_stabilize()
                     elif not self._in_tracking:
-                        # Rule 1 (joystick on): ch6 high → AUTO, ch6 low → STABILIZE
-                        # Rule 2 (joystick off): always AUTO, ch6 has no effect
                         if not ch6_on:
                             self.set_mode_stabilize()
-                        else:
+                        elif self._armed:
                             self.set_mode_auto()
 
                 elif self._ch6_force_active():
@@ -699,14 +757,17 @@ class SeekerCtrl:
                     self._pending_video_open = False
 
                 if self._in_tracking and not prev_in_tracking:
-                    if self._debug_log:
+                    if self._debug_log and self._csv_writer is None:
                         self._open_csv()
-                    if self._record:
+                    if self._record and self._ffmpeg is None:
                         self._open_video(frame.shape, fps, "tracking")
                 elif not self._in_tracking and prev_in_tracking:
                     # Tracking just stopped — send a final zero error so
                     # ArduPlane does not act on any stale error still in flight.
                     self.send_tracking(0.0, 0.0)
+
+                if (self._flight_mode in ("STABILIZE", "MANUAL") and
+                        self._prev_flight_mode not in ("STABILIZE", "MANUAL")):
                     if self._debug_log:
                         self._close_csv()
                     if self._record:
@@ -741,11 +802,11 @@ class SeekerCtrl:
                         self._lost_count  = 0
                         _ey_adj = errory  - self._pitch_offset / _TRK_MAX_DEG
                         self.send_tracking(errorx, _ey_adj)
-                        self._log_row(now, errorx, errory, target_locked=True)
+                        self._log_row(now, errorx, _ey_adj, target_locked=True)
 
                     else:
                         self._lost_count += 1
-                        if self._lost_count >= 30:
+                        if self._lost_count >= 10:
                             self._lost_count  = 0
                             self._in_tracking = False
                             if self._ch6_active() or self._ch6_force_active():
@@ -767,7 +828,7 @@ class SeekerCtrl:
                     alt_dist_m, spd_kmh, self._throttle_pct,
                 )
                 cv2.putText(annotated,
-                            f"FPS: {fps:.1f}  LOCK: {'ON' if self._ch6_active() or self._ch6_force_active() else 'OFF'}{err_str}",
+                            f"FPS: {fps:.1f}  SEEKER: {'ON' if self._ch6_active() or self._ch6_force_active() else 'OFF'}{err_str}",
                             (5, h_frame - 40),
                             cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
                 cv2.putText(annotated,
