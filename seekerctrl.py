@@ -81,7 +81,8 @@ class SeekerCtrl:
         self.rc_channels    = {}
         self._in_tracking    = False   # True while flight mode is TRACKING
         self._flight_mode    = "?"     # last known flight mode name from HEARTBEAT
-        self._prev_ch6_on    = False   # previous ch6 armed state for edge detection
+        self._prev_ch6_on       = False   # previous ch6 armed state for edge detection
+        self._prev_ch6_force_on = False   # previous ch6 force-active state for rising-edge detection
         self._commanded_mode = -1      # last custom_mode we sent a command for
         self._wp_takeoff_sent = False  # WP-0 reset sent only once at startup
         self._armed           = False  # True when FC reports MAV_MODE_FLAG_SAFETY_ARMED
@@ -728,15 +729,23 @@ class SeekerCtrl:
                             self.set_mode_auto()
 
                 elif self._ch6_force_active():
-                    # Rule 3: ch6 gates TRACKING; no auto-mode logic.
-                    if ch6_fell:
+                    ch6_force_rose = not self._prev_ch6_force_on
+                    if ch6_force_rose:
+                        # Rising edge → reset to MANUAL + WP 0 (takeoff)
+                        self._in_tracking    = False
+                        self._wp_takeoff_sent = False
+                        self.set_mode_manual()
+                        self._force_wp_takeoff()
+                        print("[MODE] ch6 force-active ↑ → MANUAL + WP 0 reset")
+                    elif ch6_fell:
                         self._in_tracking = False
                         self.set_mode_auto()
                     elif ch6_on and target_locked and not self._in_tracking:
                         self.set_mode_tracking()
                         self._in_tracking = True
 
-                self._prev_ch6_on = ch6_on
+                self._prev_ch6_on       = ch6_on
+                self._prev_ch6_force_on = self._ch6_force_active()
 
                 # ── 4. CSV / video lifecycle ──────────────────────────────────
                 # Takeoff file: open on STABILIZE entry (pre-launch), close when WP leaves 1.
