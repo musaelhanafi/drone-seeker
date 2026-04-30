@@ -19,7 +19,8 @@ class HudDisplay():
         st = math.sin(theta)
         return int(x * ct - y * st), int(x * st + y * ct)
 
-    def draw_hud(self, is_enabled, frame, lat, lon, yaw, pitch, roll):
+    def draw_hud(self, is_enabled, frame, lat, lon, yaw, pitch, roll,
+                 pitch_offset_norm=0.0):
         if is_enabled:
             zero = np.zeros((frame.shape[0], frame.shape[1], 3), dtype="uint8")
 
@@ -57,6 +58,9 @@ class HudDisplay():
 
         if self.show_yaw:
             self.draw_yaw(frame, lat, lon, yaw)
+
+        h, w = frame.shape[:2]
+        self.draw_center_cross(frame, w, h, pitch_offset_norm)
 
     def draw_yaw(self, frame, lat, lon, yaw):
         x = int(frame.shape[1] / 2)
@@ -116,6 +120,24 @@ class HudDisplay():
             if idx % 2 == rem:
                 cv2.putText(frame, deg, (x + 20, y + oy + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    @staticmethod
+    def draw_center_cross(frame, w, h, pitch_offset_norm=0.0,
+                          box=80, arm=16, color=(0, 0, 233), thickness=3):
+        """Corner-bracket crosshair at the effective pitch-offset aim point."""
+        cx = w // 2
+        cy = h // 2 - int(round(pitch_offset_norm * h / 2))
+        for x, y, dx, dy in [
+            (cx - box, cy - box, +1, +1),
+            (cx + box, cy - box, -1, +1),
+            (cx + box, cy + box, -1, -1),
+            (cx - box, cy + box, +1, -1),
+        ]:
+            cv2.line(frame, (x, y), (x + arm * dx, y), color, thickness)
+            cv2.line(frame, (x, y), (x, y + arm * dy), color, thickness)
+        cs = 24
+        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), color, thickness)
+        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), color, thickness)
 
     def draw_center(self, frame, roll):
         x = int(3 * frame.shape[1] / 4)

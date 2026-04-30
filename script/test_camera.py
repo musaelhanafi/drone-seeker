@@ -3,22 +3,55 @@ import collections
 import cv2
 import time
 
+
+def open_capture(source, w, h):
+    """Open camera source. Uses Picamera2 on Pi 5 (integer source), OpenCV otherwise."""
+    if isinstance(source, int):
+        try:
+            from picamera2 import Picamera2
+            cam = Picamera2()
+            cfg = cam.create_video_configuration(
+                main={"size": (w, h), "format": "BGR888"}
+            )
+            cam.configure(cfg)
+            cam.start()
+
+            class _Cap:
+                def read(self):
+                    try:
+                        return True, cam.capture_array()
+                    except Exception:
+                        return False, None
+                def release(self):
+                    cam.stop()
+
+            print(f"[test_camera] Using Picamera2 backend  {w}x{h}")
+            return _Cap()
+        except ImportError:
+            pass
+
+    cap = cv2.VideoCapture(source)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    print(f"[test_camera] Using OpenCV backend  source={source!r}  "
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    return cap
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("source", nargs="?", default="0",
                     help="Camera index (e.g. 0) or video file path")
+parser.add_argument("--width",  type=int, default=1280)
+parser.add_argument("--height", type=int, default=720)
 args = parser.parse_args()
 
 source = int(args.source) if args.source.isdigit() else args.source
-cap = cv2.VideoCapture(source)
-w = 1280    
-h = 720
+cap = open_capture(source, args.width, args.height)
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
 newh = 480
-neww = newh*w//h
-
-print(f"new width={neww} new height={newh}")
+neww = newh * args.width // args.height
+print(f"display size: {neww}x{newh}")
 
 prev_time = time.time()
 frame_times = collections.deque(maxlen=30)
@@ -26,6 +59,7 @@ frame_times = collections.deque(maxlen=30)
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("No frame — exiting.")
         break
 
     frame = cv2.resize(frame, (neww, newh))

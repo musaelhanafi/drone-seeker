@@ -4,6 +4,58 @@ import numpy as np
 import threading
 import time
 
+from hud_display import HudDisplay
+
+
+# ── Picamera2 drop-in replacement for cv2.VideoCapture ───────────────────────
+# On Raspberry Pi 5 the rp1-cfe CSI driver exposes /dev/video0-7 as media
+# pipeline sub-devices, NOT V4L2 capture devices.  cv2.VideoCapture therefore
+# always fails.  Picamera2Capture wraps picamera2/libcamera to give Seeker the
+# same isOpened / set / get / read / release interface it expects.
+class Picamera2Capture:
+    def __init__(self, width: int = 1280, height: int = 720):
+        from picamera2 import Picamera2
+        self._w = width
+        self._h = height
+        self._cam = Picamera2()
+        cfg = self._cam.create_video_configuration(
+            main={"size": (self._w, self._h), "format": "BGR888"}
+        )
+        self._cam.configure(cfg)
+        self._cam.start()
+        self._opened = True
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def set(self, prop_id: int, value: float) -> bool:
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            self._w = int(value)
+        elif prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            self._h = int(value)
+        return True
+
+    def get(self, prop_id: int) -> float:
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def read(self):
+        if not self._opened:
+            return False, None
+        try:
+            frame = self._cam.capture_array()
+            return True, frame
+        except Exception:
+            return False, None
+
+    def release(self):
+        if self._opened:
+            self._cam.stop()
+            self._opened = False
+
 
 # ── Hot-pink HSV range (OpenCV hue 0-179) ────────────────────────────────────
 # Hot pink sits at H ≈ 130-173 (≈300-330° on the standard wheel).
@@ -363,7 +415,12 @@ class Seeker:
 
     def open(self):
         """Open the video source and create the display window."""
-        self.cap = cv2.VideoCapture(self.source)
+        if isinstance(self.source, int):
+            w = self.capture_width  or 1280
+            h = self.capture_height or 720
+            self.cap = Picamera2Capture(w, h)
+        else:
+            self.cap = cv2.VideoCapture(self.source)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open source: {self.source!r}")
         if self.capture_width is not None:
@@ -568,7 +625,6 @@ class Seeker:
                 cv2.imshow(self._mask_window, mask)
             rect = _nearest_blob_rect(mask, frame.shape, self._box_filter)
             if rect is None:
-                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 self._update_histogram_window()
                 return out, None, None
             x, y, w, h = rect
@@ -577,12 +633,11 @@ class Seeker:
             ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
             ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
             centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-            box_colour = (0, 233, 0) if centred else (0, 0, 255)
+            box_colour = (0, 233, 0) if centred else (180, 105, 255)
             cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
             cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
             cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
             cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
-            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, cx, cy
 
@@ -645,7 +700,6 @@ class Seeker:
             cv2.imshow(self._mask_window, mask)
 
         if self._roi_hist is None or self._track_win is None or self._detect_count < 3:
-            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, None, None
 
@@ -671,7 +725,6 @@ class Seeker:
                             self._kf_initialized = False
                             self._miss_count     = 0
                             self._tracker_obj    = None
-                        self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                         self._update_histogram_window()
                         return out, None, None
                     self._miss_count = 0
@@ -706,12 +759,11 @@ class Seeker:
                     ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
                     ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
                     centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-                    box_colour = (0, 233, 0) if centred else (0, 0, 255)
+                    box_colour = (0, 233, 0) if centred else (180, 105, 255)
                     cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
                     cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
                     cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
                     cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
-                    self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                     self._update_histogram_window()
                     return out, cx, cy
             # Tracker update failed or bbox too small — hard reset
@@ -722,7 +774,6 @@ class Seeker:
             self._kf_initialized = False
             self._miss_count     = 0
             self._tracker_obj    = None
-            self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
             self._update_histogram_window()
             return out, None, None
 
@@ -802,7 +853,6 @@ class Seeker:
                 th = int(self._win_h_ema) or 40
                 self._track_win = (max(0, pcx - tw // 2), max(0, pcy - th // 2),
                                    min(tw, w_frame), min(th, h_frame))
-                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 cv2.circle(out, (pcx, pcy), 5, (0, 165, 255), 2)   # orange = predicting
                 cv2.line(out, (0, pcy), (w_frame, pcy), (0, 165, 255), 1)
                 cv2.line(out, (pcx, 0), (pcx, h_frame), (0, 165, 255), 1)
@@ -817,7 +867,6 @@ class Seeker:
                 self._kf_initialized = False
                 self._miss_count     = 0
                 self._tracker_obj    = None
-                self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
                 self._update_histogram_window()
                 return out, None, None
 
@@ -872,7 +921,7 @@ class Seeker:
         ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
         ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
         centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-        box_colour = (0, 233, 0) if centred else (0, 0, 255)
+        box_colour = (0, 233, 0) if centred else (180, 105, 255)
         if ret is not None:
             pts = cv2.boxPoints(ret).astype(np.intp)
             cv2.polylines(out, [pts], True, box_colour, 2)
@@ -885,7 +934,6 @@ class Seeker:
         cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
         cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
 
-        self._draw_center_cross(out, w_frame, h_frame, self.pitch_offset_norm)
         self._update_histogram_window()
         return out, cx, cy
 
@@ -918,29 +966,6 @@ class Seeker:
         if not getattr(self, "_hist_window", None) or self._cal_hist is None:
             return
         cv2.imshow(self._hist_window, self._render_histogram(self._cal_hist))
-
-    @staticmethod
-    def _draw_center_cross(frame, w, h, pitch_offset_norm=0.0,
-                           box=80, arm=16, color=(0, 0, 233), thickness=3):
-        """Draw corner-bracket crosshair at the effective pitch-offset aim point.
-
-        pitch_offset_norm shifts the aim point upward by offset_norm * h/2 pixels,
-        matching the error normalization scale (positive = aim above centre).
-        """
-        cx = w // 2
-        cy = h // 2 - int(round(pitch_offset_norm * h / 2))
-        corners = [
-            (cx - box, cy - box, +1, +1),
-            (cx + box, cy - box, -1, +1),
-            (cx + box, cy + box, -1, -1),
-            (cx - box, cy + box, +1, -1),
-        ]
-        for x, y, dx, dy in corners:
-            cv2.line(frame, (x, y), (x + arm * dx, y), color, thickness)
-            cv2.line(frame, (x, y), (x, y + arm * dy), color, thickness)
-        cs = 24
-        cv2.line(frame, (cx - cs, cy), (cx + cs, cy), color, thickness)
-        cv2.line(frame, (cx, cy - cs), (cx, cy + cs), color, thickness)
 
     # ── Error computation ─────────────────────────────────────────────────────
 

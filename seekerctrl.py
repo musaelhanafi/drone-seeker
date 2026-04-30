@@ -639,7 +639,8 @@ class SeekerCtrl:
             annotated, _, _ = self.seeker.track(frame)
             self._hud.draw_hud(True, annotated,
                                self._lat, self._lon,
-                               self._yaw_deg, self._pitch_deg, self._roll_deg)
+                               self._yaw_deg, self._pitch_deg, self._roll_deg,
+                               self._pitch_offset / _TRK_MAX_DEG)
             h_w       = annotated.shape[0]
             dist_km   = self._dist_to_target_m() / 1000.0
             alt_rel_m = self._alt_msl_m - self._target_alt_msl
@@ -847,7 +848,8 @@ class SeekerCtrl:
 
                 self._hud.draw_hud(True, annotated,
                                    self._lat, self._lon,
-                                   self._yaw_deg, self._pitch_deg, self._roll_deg)
+                                   self._yaw_deg, self._pitch_deg, self._roll_deg,
+                               self._pitch_offset / _TRK_MAX_DEG)
 
                 if self._record:
                     self._write_frame(annotated)
