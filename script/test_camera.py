@@ -49,8 +49,8 @@ args = parser.parse_args()
 source = int(args.source) if args.source.isdigit() else args.source
 cap = open_capture(source, args.width, args.height)
 
-newh = 480
-neww = newh * args.width // args.height
+newh = args.height
+neww = args.width   
 print(f"display size: {neww}x{newh}")
 
 prev_time = time.time()
