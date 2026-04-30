@@ -621,6 +621,7 @@ class SeekerCtrl:
         # Wait until AUTO mode — display camera + HUD while waiting.
         print("[Ctrl] Waiting for AUTO mode ...")
         _prev_seq_wait = -1
+        cv2.namedWindow(self.seeker.window_name, cv2.WINDOW_GUI_NORMAL)
         while True:
             self._poll_rc()
             self._poll_heartbeat()

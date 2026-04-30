@@ -56,6 +56,7 @@ print(f"display size: {neww}x{newh}")
 prev_time = time.time()
 frame_times = collections.deque(maxlen=30)
 
+cv2.namedWindow("Camera", cv2.WINDOW_GUI_NORMAL)
 while True:
     ret, frame = cap.read()
     if not ret:
