@@ -810,9 +810,8 @@ class SeekerCtrl:
                         self._last_errorx = errorx
                         self._last_errory = errory
                         self._lost_count  = 0
-                        _ey_adj = errory  - self._pitch_offset / _TRK_MAX_DEG
-                        self.send_tracking(errorx, _ey_adj)
-                        self._log_row(now, errorx, _ey_adj, target_locked=True)
+                        self.send_tracking(errorx, errory)
+                        self._log_row(now, errorx, errory, target_locked=True)
 
                     else:
                         self._lost_count += 1
@@ -822,8 +821,7 @@ class SeekerCtrl:
                             if self._ch6_active() or self._ch6_force_active():
                                 self.set_mode_auto()
                         else:
-                            _ey_adj = self._last_errory - self._pitch_offset / _TRK_MAX_DEG
-                            self.send_tracking(self._last_errorx, _ey_adj)
+                            self.send_tracking(self._last_errorx, self._last_errory)
                             self._log_row(now, self._last_errorx, self._last_errory,
                                           target_locked=False)
 

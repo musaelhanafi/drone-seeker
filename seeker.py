@@ -418,7 +418,10 @@ class Seeker:
         if isinstance(self.source, int):
             w = self.capture_width  or 1280
             h = self.capture_height or 720
-            self.cap = Picamera2Capture(w, h)
+            try:
+                self.cap = Picamera2Capture(w, h)
+            except (ImportError, Exception):
+                self.cap = cv2.VideoCapture(self.source)
         else:
             self.cap = cv2.VideoCapture(self.source)
         if not self.cap.isOpened():
@@ -634,8 +637,8 @@ class Seeker:
             cy = y + h // 2
             ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
             ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
-            centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-            box_colour = (0, 233, 0) if centred else (180, 105, 255)
+            centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey-self.pitch_offset_norm) < _CENTER_THRESHOLD
+            box_colour = (180, 105, 255) if centred else (0, 255, 255)
             cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
             cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
             cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
@@ -760,8 +763,8 @@ class Seeker:
                     cy = max(0, min(cy, h_frame - 1))
                     ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
                     ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
-                    centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-                    box_colour = (0, 233, 0) if centred else (180, 105, 255)
+                    centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey-self.pitch_offset_norm) < _CENTER_THRESHOLD
+                    box_colour = (180, 105, 255) if centred else (0, 255, 255)
                     cv2.rectangle(out, (x, y), (x + w, y + h), box_colour, 2)
                     cv2.line(out, (0, cy), (w_frame, cy), (0, 233, 233), 1)
                     cv2.line(out, (cx, 0), (cx, h_frame), (0, 233, 233), 1)
@@ -922,8 +925,8 @@ class Seeker:
         # ── Draw rotated bounding box (green when centred, red otherwise) ──────
         ex = (cx - w_frame / 2.0) / (w_frame / 2.0)
         ey = -(cy - h_frame / 2.0) / (h_frame / 2.0)
-        centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey) < _CENTER_THRESHOLD
-        box_colour = (0, 233, 0) if centred else (180, 105, 255)
+        centred    = abs(ex) < _CENTER_THRESHOLD and abs(ey-self.pitch_offset_norm) < _CENTER_THRESHOLD
+        box_colour = (180, 105, 255) if centred else (0, 255, 255)
         if ret is not None:
             pts = cv2.boxPoints(ret).astype(np.intp)
             cv2.polylines(out, [pts], True, box_colour, 2)
@@ -983,7 +986,7 @@ class Seeker:
         h, w = frame_shape[:2]
         errorx =  (cx - w / 2.0) / (w / 2.0)
         errory =  -(cy - h / 2.0) / (h / 2.0)
-        return float(errorx), float(errory)
+        return float(errorx), float(errory - self.pitch_offset_norm)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
