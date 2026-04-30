@@ -439,6 +439,7 @@ class Seeker:
         self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._cap_thread.start()
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, actual_w, actual_h)
         if self._show_histogram and self._cal_hist is not None:
             self._hist_window = f"{self.window_name} — Histogram"
             cv2.namedWindow(self._hist_window, cv2.WINDOW_NORMAL)

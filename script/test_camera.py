@@ -57,6 +57,7 @@ prev_time = time.time()
 frame_times = collections.deque(maxlen=30)
 
 cv2.namedWindow("Camera", cv2.WINDOW_GUI_NORMAL)
+cv2.resizeWindow("Camera", neww, newh)
 while True:
     ret, frame = cap.read()
     if not ret:
