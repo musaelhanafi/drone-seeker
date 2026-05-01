@@ -144,6 +144,12 @@ def parse_args():
         help="Crop each frame to this ROI (e.g. --crop 320 180 640 360). "
              "Use - for W or H to mean 'rest of dimension after offset'.",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help="Force ch6 active (simulate PWM 1500) — seeker armed without physical RC switch",
+    )
     return parser.parse_args()
 
 
@@ -184,7 +190,8 @@ def main():
         use_kalman=use_kalman,
         tracker=tracker_name,
         hud_pitch=not args.no_hud_pitch,
-        hud_yaw=not args.no_hud_yaw
+        hud_yaw=not args.no_hud_yaw,
+        auto=args.auto,
     )
     ctrl.connect()
 

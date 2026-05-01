@@ -71,7 +71,8 @@ class SeekerCtrl:
         use_kalman: bool = True,
         tracker: str = "",
         hud_pitch: bool = True,
-        hud_yaw: bool = True
+        hud_yaw: bool = True,
+        auto: bool = False,
     ):
         self._input_prediction = input_prediction
         self.connection_string = connection_string
@@ -156,6 +157,7 @@ class SeekerCtrl:
         self._ffmpeg      = None   # subprocess.Popen for TRACKING phase
         self._ffmpeg_tkof = None   # subprocess.Popen for takeoff (WP 1)
 
+        self._auto = auto
         self._hud = HudDisplay(show_pitch=hud_pitch, show_yaw=hud_yaw)
 
         self.seeker = Seeker(source=source,
@@ -513,6 +515,8 @@ class SeekerCtrl:
             self._armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
     def _ch6_active(self) -> bool:
+        if self._auto:
+            return True
         pwm = self.rc_channels.get("ch6", 0)
         return pwm >= _CH6_ACTIVE_PWM and pwm < _CH6_FORCE_ACTIVE_PWM
     def _ch6_force_active(self) -> bool:
