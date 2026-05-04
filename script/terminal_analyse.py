@@ -245,7 +245,7 @@ def _plot_figure(d: dict, path: str,
     ax1  = fig.add_subplot(gs[0])
     ax1b = ax1.twinx()
     ax1c = ax1.twinx()
-    ax1c.spines["right"].set_position(("axes", 1.12))
+    ax1c.spines["right"].set_position(("axes", 1.08))
 
     ax1.plot(t, s("alt_rel_m"),          color="tab:blue",   label="alt rel (m)")
     ax1b.plot(t, s("groundspeed_ms") * 3.6, color="tab:orange", label="groundspeed (km/h)", linestyle="--")
