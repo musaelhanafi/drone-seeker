@@ -1,6 +1,8 @@
 import collections
+import ctypes
 import cv2
 import numpy as np
+import sys
 import threading
 import time
 
@@ -433,6 +435,12 @@ class Seeker:
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[Seeker] Opened source={self.source!r}  capture={actual_w}x{actual_h}")
+        if self.crop is not None:
+            cx, cy, cw, ch = self.crop
+            frame_w = (actual_w - cx) if cw is None else cw
+            frame_h = (actual_h - cy) if ch is None else ch
+        else:
+            frame_w, frame_h = actual_w, actual_h
         # Start background capture thread so read_frame() never blocks on I/O.
         self._cap_lock  = threading.Lock()
         self._cap_stop  = False
@@ -441,8 +449,15 @@ class Seeker:
         self._cap_seq   = 0
         self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._cap_thread.start()
+        disp_w = frame_w
+        disp_h = frame_h
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                pass
         cv2.namedWindow(self.window_name, cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, actual_w, actual_h)
+        cv2.resizeWindow(self.window_name, disp_w, disp_h)
         if self._show_histogram and self._cal_hist is not None:
             self._hist_window = f"{self.window_name} — Histogram"
             cv2.namedWindow(self._hist_window, cv2.WINDOW_NORMAL|cv2.WINDOW_GUI_NORMAL)
@@ -452,7 +467,7 @@ class Seeker:
         if self._show_mask:
             self._mask_window = f"{self.window_name} — Mask"
             cv2.namedWindow(self._mask_window, cv2.WINDOW_GUI_NORMAL|cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self._mask_window, actual_w, actual_h)
+            cv2.resizeWindow(self._mask_window, disp_w, disp_h)
         else:
             self._mask_window = None
 

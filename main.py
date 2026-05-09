@@ -70,6 +70,7 @@ def parse_args():
         metavar=("W", "H"),
         help="Request this capture resolution from the camera (e.g. --capture-res 1280 720)",
     )
+
     parser.add_argument(
         "--histogram",
         action="store_true",

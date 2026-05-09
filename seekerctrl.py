@@ -1,7 +1,10 @@
 import collections
 import csv
 import math
+import os
+import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -440,6 +443,35 @@ class SeekerCtrl:
             f"{self._dist_to_target_m():.1f}",
         ])
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_ffmpeg() -> str:
+        """Return the ffmpeg executable path, reading the live system PATH on
+        Windows so installs that happened after this process started are found."""
+        if sys.platform == "win32":
+            import winreg
+            paths = list(os.environ.get("PATH", "").split(os.pathsep))
+            for hive, sub in [
+                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                (winreg.HKEY_CURRENT_USER,  r"Environment"),
+            ]:
+                try:
+                    with winreg.OpenKey(hive, sub) as k:
+                        val, _ = winreg.QueryValueEx(k, "PATH")
+                        paths.extend(val.split(os.pathsep))
+                except OSError:
+                    pass
+            found = shutil.which("ffmpeg", path=os.pathsep.join(paths))
+            if found:
+                return found
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        raise FileNotFoundError(
+            "ffmpeg not found. Install it and ensure it is on PATH."
+        )
+
     # ── Video recorder ────────────────────────────────────────────────────────
 
     def _open_video(self, frame_shape, fps: float, label: str = "tracking"):
@@ -448,7 +480,7 @@ class SeekerCtrl:
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = f"{label}_{ts}.mp4"
         cmd  = [
-            "ffmpeg", "-y",
+            self._resolve_ffmpeg(), "-y",
             "-f", "rawvideo", "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps),
             "-i", "pipe:0",
@@ -691,7 +723,8 @@ class SeekerCtrl:
                 now = time.monotonic()
                 frame_times.append(now - prev_time)
                 prev_time = now
-                fps = 1.0 / (sum(frame_times) / len(frame_times))
+                avg_ft = sum(frame_times) / len(frame_times) if frame_times else 0.0
+                fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
 
                 annotated, cx, cy = self.seeker.track(frame)
                 target_locked     = cx is not None and cy is not None
