@@ -60,7 +60,23 @@ def parse_args():
     parser.add_argument(
         "--source",
         default="0",
-        help="Camera index (e.g. 0) or video file path (e.g. video.mp4)",
+        help="Camera index (e.g. 0), video file path (e.g. video.mp4), "
+             "or GStreamer pipeline string. Overridden by --udpsrc.",
+    )
+    parser.add_argument(
+        "--udpsrc",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Receive camera stream from UDP port via GStreamer (e.g. --udpsrc 5600). "
+             "Overrides --source. Use --udpsrc-codec to select codec.",
+    )
+    parser.add_argument(
+        "--udpsrc-codec",
+        default="h264",
+        choices=["h264", "mjpeg"],
+        metavar="CODEC",
+        help="Codec for --udpsrc stream: h264 (default) or mjpeg.",
     )
     parser.add_argument(
         "--res",
@@ -162,9 +178,29 @@ def _parse_source(value: str) -> int | str:
         return value
 
 
+def _build_udpsrc_pipeline(port: int, codec: str) -> str:
+    if codec == "mjpeg":
+        return (
+            f"udpsrc port={port} "
+            "! application/x-rtp,encoding-name=JPEG "
+            "! rtpjpegdepay ! jpegdec ! videoconvert "
+            "! appsink drop=1 max-buffers=1"
+        )
+    return (
+        f"udpsrc port={port} "
+        "! application/x-rtp,payload=96 "
+        "! rtph264depay ! avdec_h264 ! videoconvert "
+        "! appsink drop=1 max-buffers=1"
+    )
+
+
 def main():
-    args   = parse_args()
-    source = _parse_source(args.source)
+    args = parse_args()
+
+    if args.udpsrc is not None:
+        source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
+    else:
+        source = _parse_source(args.source)
 
     try:
         use_camshift, shift_algo, use_kalman, tracker_name = _parse_tracker_opt(args.tracker)

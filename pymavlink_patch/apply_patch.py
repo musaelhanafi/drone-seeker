@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Apply TRACKING_MESSAGE (ID 11045) patch to the installed pymavlink dialect.
+Apply satria-firmware patches to the installed pymavlink.
+
+Patches applied:
+  1. TRACKING_MESSAGE (ID 11045) added to ardupilotmega dialect XML/py.
+  2. TRACKING mode (27) added to mode_mapping_apm in mavutil.py.
 
 Run once after installing or upgrading pymavlink:
     python3 pymavlink_patch/apply_patch.py
@@ -68,6 +72,27 @@ def regenerate_dialect(xml_path: str) -> None:
     print(f"Regenerated {py_path}")
 
 
+def patch_mode_mapping() -> None:
+    import pymavlink.mavutil as mavutil_mod
+    mavutil_path = mavutil_mod.__file__
+
+    with open(mavutil_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if "27 : 'TRACKING'" in content:
+        print("TRACKING mode already present in mode_mapping_apm — skipping.")
+        return
+
+    anchor = "    26 : 'AUTOLAND',\n}"
+    if anchor not in content:
+        sys.exit("ERROR: expected anchor not found in mavutil.py; pymavlink version may be unsupported.")
+
+    patched = content.replace(anchor, "    26 : 'AUTOLAND',\n    27 : 'TRACKING',\n}")
+    with open(mavutil_path, "w", encoding="utf-8") as f:
+        f.write(patched)
+    print(f"Patched {mavutil_path} — added TRACKING mode 27 to mode_mapping_apm")
+
+
 def verify() -> None:
     # Force reimport
     import pymavlink.dialects.v20.ardupilotmega as dialect
@@ -77,11 +102,18 @@ def verify() -> None:
         sys.exit(f"ERROR: verification failed — MAVLINK_MSG_ID_TRACKING_MESSAGE = {msg_id}")
     print(f"Verified: MAVLINK_MSG_ID_TRACKING_MESSAGE = {msg_id}")
 
+    import pymavlink.mavutil as mavutil_mod
+    importlib.reload(mavutil_mod)
+    if mavutil_mod.mode_mapping_apm.get(27) != 'TRACKING':
+        sys.exit("ERROR: verification failed — mode 27 not mapped to TRACKING in mode_mapping_apm")
+    print("Verified: mode_mapping_apm[27] = 'TRACKING'")
+
 
 if __name__ == "__main__":
     xml_path = find_pymavlink_xml()
     changed = patch_xml(xml_path)
     if changed:
         regenerate_dialect(xml_path)
+    patch_mode_mapping()
     verify()
     print("Done.")

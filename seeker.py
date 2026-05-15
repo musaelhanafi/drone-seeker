@@ -424,6 +424,8 @@ class Seeker:
                 self.cap = Picamera2Capture(w, h)
             except (ImportError, Exception):
                 self.cap = cv2.VideoCapture(self.source)
+        elif isinstance(self.source, str) and ' ! ' in self.source:
+            self.cap = cv2.VideoCapture(self.source, cv2.CAP_GSTREAMER)
         else:
             self.cap = cv2.VideoCapture(self.source)
         if not self.cap.isOpened():

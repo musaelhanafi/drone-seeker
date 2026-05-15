@@ -4,8 +4,39 @@ import cv2
 import time
 
 
+def _build_udpsrc_pipeline(port: int, codec: str) -> str:
+    if codec == "mjpeg":
+        return (
+            f"udpsrc port={port} "
+            "! application/x-rtp,encoding-name=JPEG "
+            "! rtpjpegdepay ! jpegdec ! videoconvert "
+            "! appsink drop=1 max-buffers=1"
+        )
+    return (
+        f"udpsrc port={port} "
+        "! application/x-rtp,payload=96 "
+        "! rtph264depay ! avdec_h264 ! videoconvert "
+        "! appsink drop=1 max-buffers=1"
+    )
+
+
 def open_capture(source, w, h):
-    """Open camera source. Uses Picamera2 on Pi 5 (integer source), OpenCV otherwise."""
+    """Open camera source.
+    - GStreamer pipeline string (contains ' ! '): uses cv2.CAP_GSTREAMER
+    - Integer: tries Picamera2 first, falls back to OpenCV
+    - String path/device: OpenCV
+    """
+    if isinstance(source, str) and " ! " in source:
+        cap = cv2.VideoCapture(source, cv2.CAP_GSTREAMER)
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"GStreamer pipeline failed to open. "
+                "Check OpenCV was built with GStreamer support:\n"
+                "  python3 -c \"import cv2; print(cv2.getBuildInformation())\" | grep GStreamer"
+            )
+        print(f"[test_camera] Using GStreamer backend  pipeline={source!r}")
+        return cap
+
     if isinstance(source, int):
         try:
             from picamera2 import Picamera2
@@ -39,14 +70,22 @@ def open_capture(source, w, h):
     return cap
 
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(description="Camera / GStreamer UDP stream viewer")
 parser.add_argument("source", nargs="?", default="0",
-                    help="Camera index (e.g. 0) or video file path")
+                    help="Camera index (e.g. 0), video file, or GStreamer pipeline string")
 parser.add_argument("--width",  type=int, default=1280)
 parser.add_argument("--height", type=int, default=720)
+parser.add_argument("--udpsrc", type=int, default=None, metavar="PORT",
+                    help="Receive H.264/MJPEG stream from UDP port (e.g. --udpsrc 5600). "
+                         "Overrides positional source.")
+parser.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
+                    metavar="CODEC", help="Codec for --udpsrc: h264 (default) or mjpeg")
 args = parser.parse_args()
 
-source = int(args.source) if args.source.isdigit() else args.source
+if args.udpsrc is not None:
+    source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
+else:
+    source = int(args.source) if args.source.isdigit() else args.source
 cap = open_capture(source, args.width, args.height)
 
 newh = args.height
