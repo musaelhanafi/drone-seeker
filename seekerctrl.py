@@ -76,6 +76,7 @@ class SeekerCtrl:
         hud_pitch: bool = True,
         hud_yaw: bool = True,
         auto: bool = False,
+        flip: bool = False,
     ):
         self._input_prediction = input_prediction
         self.connection_string = connection_string
@@ -175,6 +176,7 @@ class SeekerCtrl:
                              box_filter=box_filter,
                              use_kalman=use_kalman,
                              tracker=tracker,
+                             flip=flip,
                              pitch_offset_norm=2*self._pitch_offset / _TRK_MAX_DEG)
 
     # ── Connection ────────────────────────────────────────────────────────────
@@ -711,8 +713,6 @@ class SeekerCtrl:
                 if not ok:
                     print("[Ctrl] End of stream.")
                     break
-                if frame_seq == prev_frame_seq:
-               reak
                 if frame_seq == prev_frame_seq:
                     # No new frame yet — pump MAVLink and yield to avoid
                     # spinning the main loop at CPU speed and saturating the
