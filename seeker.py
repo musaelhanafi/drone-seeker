@@ -1026,6 +1026,13 @@ class Seeker:
                 h = fh - y
             frame = frame[y:y + h, x:x + w]
         if ok and not self._res_logged:
+          = frame.shape[:2]
+            if w is None:
+                w = fw - x
+            if h is None:
+                h = fh - y
+            frame = frame[y:y + h, x:x + w]
+        if ok and not self._res_logged:
             fh, fw = frame.shape[:2]
             print(f"[Seeker] Resolution: {fw}x{fh}"
                   + (f"  (cropped from raw, offset {self.crop[:2]})" if self.crop else ""))

@@ -4,6 +4,48 @@ import cv2
 import time
 
 
+class Picamera2Capture:
+    """cv2.VideoCapture drop-in using picamera2/libcamera (RPi CSI camera)."""
+    def __init__(self, width: int = 1280, height: int = 720, flip: bool = False):
+        from picamera2 import Picamera2
+        from libcamera import Transform
+        self._w = width
+        self._h = height
+        self._cam = Picamera2()
+        cfg = self._cam.create_video_configuration(
+            main={"size": (self._w, self._h), "format": "BGR888"},
+            transform=Transform(hflip=1, vflip=1) if flip else Transform(),
+        )
+        self._cam.configure(cfg)
+        self._cam.start()
+        self._opened = True
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def set(self, prop_id: int, value: float) -> bool:
+        return True
+
+    def get(self, prop_id: int) -> float:
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def read(self):
+        if not self._opened:
+            return False, None
+        try:
+            return True, self._cam.capture_array()
+        except Exception:
+            return False, None
+
+    def release(self):
+        self._cam.stop()
+        self._opened = False
+
+
 def _build_udpsrc_pipeline(port: int, codec: str) -> str:
     if codec == "mjpeg":
         return (
@@ -20,10 +62,10 @@ def _build_udpsrc_pipeline(port: int, codec: str) -> str:
     )
 
 
-def open_capture(source, w, h):
+def open_capture(source, w, h, flip=False):
     """Open camera source.
     - GStreamer pipeline string (contains ' ! '): uses cv2.CAP_GSTREAMER
-    - Integer: tries Picamera2 first, falls back to OpenCV
+    - Integer: tries Picamera2 first (flip via libcamera Transform), falls back to OpenCV
     - String path/device: OpenCV
     """
     if isinstance(source, str) and " ! " in source:
@@ -39,26 +81,10 @@ def open_capture(source, w, h):
 
     if isinstance(source, int):
         try:
-            from picamera2 import Picamera2
-            cam = Picamera2()
-            cfg = cam.create_video_configuration(
-                main={"size": (w, h), "format": "BGR888"}
-            )
-            cam.configure(cfg)
-            cam.start()
-
-            class _Cap:
-                def read(self):
-                    try:
-                        return True, cam.capture_array()
-                    except Exception:
-                        return False, None
-                def release(self):
-                    cam.stop()
-
-            print(f"[test_camera] Using Picamera2 backend  {w}x{h}")
-            return _Cap()
-        except ImportError:
+            cap = Picamera2Capture(w, h, flip=flip)
+            print(f"[test_camera] Using Picamera2 backend  {w}x{h}  flip={flip}")
+            return cap
+        except Exception:
             pass
 
     cap = cv2.VideoCapture(source)
@@ -80,13 +106,15 @@ parser.add_argument("--udpsrc", type=int, default=None, metavar="PORT",
                          "Overrides positional source.")
 parser.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
                     metavar="CODEC", help="Codec for --udpsrc: h264 (default) or mjpeg")
+parser.add_argument("--flip", action="store_true", default=False,
+                    help="Flip frames 180 degrees. Uses libcamera Transform for Picamera2 sources.")
 args = parser.parse_args()
 
 if args.udpsrc is not None:
     source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
 else:
     source = int(args.source) if args.source.isdigit() else args.source
-cap = open_capture(source, args.width, args.height)
+cap = open_capture(source, args.width, args.height, flip=args.flip)
 
 newh = args.height
 neww = args.width   

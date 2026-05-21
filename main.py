@@ -116,6 +116,12 @@ def parse_args():
         help="Disable box-like shape filter; accept any blob regardless of shape",
     )
     parser.add_argument(
+        "--flip",
+        action="store_true",
+        default=False,
+        help="Flip captured frames 180 degrees (both axes). Use when camera is mounted upside-down.",
+    )
+    parser.add_argument(
         "--no-hud-pitch",
         action="store_true",
         default=False,
@@ -229,6 +235,7 @@ def main():
         hud_pitch=not args.no_hud_pitch,
         hud_yaw=not args.no_hud_yaw,
         auto=args.auto,
+        flip=args.flip,
     )
     ctrl.connect()
 

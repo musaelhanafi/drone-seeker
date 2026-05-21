@@ -712,6 +712,8 @@ class SeekerCtrl:
                     print("[Ctrl] End of stream.")
                     break
                 if frame_seq == prev_frame_seq:
+               reak
+                if frame_seq == prev_frame_seq:
                     # No new frame yet — pump MAVLink and yield to avoid
                     # spinning the main loop at CPU speed and saturating the
                     # MAVLink link with redundant send_tracking() calls.
