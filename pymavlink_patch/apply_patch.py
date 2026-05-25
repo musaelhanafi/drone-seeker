@@ -64,7 +64,7 @@ def regenerate_dialect(xml_path: str) -> None:
     opts = mavgen.Opts(
         output=py_path,
         wire_protocol=PROTOCOL_2_0,
-        language="Python3",
+        language="Python",
         validate=False,
         strict_units=False,
     )
@@ -79,34 +79,62 @@ def patch_mode_mapping() -> None:
     with open(mavutil_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    if "27 : 'TRACKING'" in content:
+    if "27 : 'TRACKING'" in content or "'TRACKING'" in content:
         print("TRACKING mode already present in mode_mapping_apm — skipping.")
         return
 
-    anchor = "    26 : 'AUTOLAND',\n}"
-    if anchor not in content:
-        sys.exit("ERROR: expected anchor not found in mavutil.py; pymavlink version may be unsupported.")
+    # Try anchors for different pymavlink versions.
+    # NOTE: match only mode_mapping_apm anchors (plane/VTOL).
+    # Do NOT use 'MANUAL' as anchor — it appears in mode_mapping_sub (submarine) too.
+    anchors = [
+        ("    26 : 'AUTOLAND',\n}", "    26 : 'AUTOLAND',\n    27 : 'TRACKING',\n}"),
+        ("    26: 'AUTOLAND',\n}",  "    26: 'AUTOLAND',\n    27: 'TRACKING',\n}"),
+        ("    24 : 'THERMAL',\n}",  "    24 : 'THERMAL',\n    27 : 'TRACKING',\n}"),
+        ("    24: 'THERMAL',\n}",   "    24: 'THERMAL',\n    27: 'TRACKING',\n}"),
+    ]
+    for anchor, replacement in anchors:
+        if anchor in content:
+            patched = content.replace(anchor, replacement)
+            with open(mavutil_path, "w", encoding="utf-8") as f:
+                f.write(patched)
+            print(f"Patched {mavutil_path} — added TRACKING mode 27 to mode_mapping_apm")
+            return
 
-    patched = content.replace(anchor, "    26 : 'AUTOLAND',\n    27 : 'TRACKING',\n}")
-    with open(mavutil_path, "w", encoding="utf-8") as f:
-        f.write(patched)
-    print(f"Patched {mavutil_path} — added TRACKING mode 27 to mode_mapping_apm")
+    sys.exit(
+        "ERROR: expected anchor not found in mavutil.py; pymavlink version may be unsupported.\n"
+        "Supported anchors: 26:'AUTOLAND' or 19:'MANUAL' as last entry of mode_mapping_apm."
+    )
 
 
 def verify() -> None:
-    # Force reimport
-    import pymavlink.dialects.v20.ardupilotmega as dialect
-    importlib.reload(dialect)
-    msg_id = getattr(dialect, "MAVLINK_MSG_ID_TRACKING_MESSAGE", None)
+    # Spawn a fresh interpreter to avoid stale module cache from this process
+    import subprocess
+    code = (
+        "import pymavlink.dialects.v20.ardupilotmega as d, pymavlink.mavutil as m; "
+        "print(getattr(d, 'MAVLINK_MSG_ID_TRACKING_MESSAGE', None)); "
+        "print(m.mode_mapping_apm.get(27))"
+    )
+    result = subprocess.run([sys.executable, "-c", code],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = type('R', (), {
+        'stdout': result.stdout.decode(),
+        'stderr': result.stderr.decode(),
+        'returncode': result.returncode,
+    })()
+    lines = result.stdout.strip().splitlines()
+    if len(lines) < 2:
+        sys.exit(f"ERROR: verification subprocess failed:\n{result.stderr}")
+
+    msg_id   = int(lines[0]) if lines[0].isdigit() else None
+    mode_name = lines[1].strip()
+
     if msg_id != 11045:
         sys.exit(f"ERROR: verification failed — MAVLINK_MSG_ID_TRACKING_MESSAGE = {msg_id}")
     print(f"Verified: MAVLINK_MSG_ID_TRACKING_MESSAGE = {msg_id}")
 
-    import pymavlink.mavutil as mavutil_mod
-    importlib.reload(mavutil_mod)
-    if mavutil_mod.mode_mapping_apm.get(27) != 'TRACKING':
-        sys.exit("ERROR: verification failed — mode 27 not mapped to TRACKING in mode_mapping_apm")
-    print("Verified: mode_mapping_apm[27] = 'TRACKING'")
+    if mode_name != 'TRACKING':
+        sys.exit(f"ERROR: verification failed — mode_mapping_apm[27] = {mode_name!r}")
+    print(f"Verified: mode_mapping_apm[27] = '{mode_name}'")
 
 
 if __name__ == "__main__":

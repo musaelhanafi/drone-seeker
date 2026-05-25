@@ -1,4 +1,11 @@
 import argparse
+import os
+
+# Force pymavlink to use MAVLink 2.0 — TRACKING_MESSAGE (msgid 11045) is only
+# defined in the v2.0 ardupilotmega dialect. With the default v1.0 dialect,
+# `tracking_message_send` doesn't exist and our send_tracking() call would do
+# nothing (PX4 ends up in TRACKING with no incoming errors).
+os.environ["MAVLINK20"] = "1"
 
 from seekerctrl import SeekerCtrl
 
@@ -116,6 +123,12 @@ def parse_args():
         help="Disable box-like shape filter; accept any blob regardless of shape",
     )
     parser.add_argument(
+        "--flip",
+        action="store_true",
+        default=False,
+        help="Flip captured frames 180 degrees (both axes). Use when camera is mounted upside-down.",
+    )
+    parser.add_argument(
         "--no-hud-pitch",
         action="store_true",
         default=False,
@@ -166,6 +179,14 @@ def parse_args():
         action="store_true",
         default=False,
         help="Force ch6 active (simulate PWM 1500) — seeker armed without physical RC switch",
+    )
+    parser.add_argument(
+        "--px4",
+        action="store_true",
+        default=False,
+        help="Target PX4 instead of ArduPilot: maps STABILIZE→STABILIZED (main 7), "
+             "AUTO→AUTO_MISSION (main 4, sub 4). Heartbeat custom_mode decoded with "
+             "PX4 encoding. Without this flag, normal ArduCopter mode codes are used.",
     )
     return parser.parse_args()
 
@@ -229,6 +250,8 @@ def main():
         hud_pitch=not args.no_hud_pitch,
         hud_yaw=not args.no_hud_yaw,
         auto=args.auto,
+        flip=args.flip,
+        px4=args.px4,
     )
     ctrl.connect()
 

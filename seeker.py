@@ -15,13 +15,15 @@ from hud_display import HudDisplay
 # always fails.  Picamera2Capture wraps picamera2/libcamera to give Seeker the
 # same isOpened / set / get / read / release interface it expects.
 class Picamera2Capture:
-    def __init__(self, width: int = 1280, height: int = 720):
+    def __init__(self, width: int = 1280, height: int = 720, flip: bool = False):
         from picamera2 import Picamera2
+        from libcamera import Transform
         self._w = width
         self._h = height
         self._cam = Picamera2()
         cfg = self._cam.create_video_configuration(
-            main={"size": (self._w, self._h), "format": "BGR888"}
+            main={"size": (self._w, self._h), "format": "BGR888"},
+            transform=Transform(hflip=1, vflip=1) if flip else Transform(),
         )
         self._cam.configure(cfg)
         self._cam.start()
@@ -305,6 +307,7 @@ class Seeker:
         box_filter: bool = True,
         use_kalman: bool = True,
         tracker: str = "",
+        flip: bool = False,
         pitch_offset_norm: float = 0.0,
     ):
         """
@@ -334,6 +337,7 @@ class Seeker:
         self.capture_width   = capture_width
         self.capture_height  = capture_height
         self.crop            = crop   # (x, y, w, h) or None
+        self._flip           = flip
         self._show_histogram = show_histogram
         self._show_mask      = show_mask
         self._mask_algo      = mask_algo
@@ -421,7 +425,7 @@ class Seeker:
             w = self.capture_width  or 1280
             h = self.capture_height or 720
             try:
-                self.cap = Picamera2Capture(w, h)
+                self.cap = Picamera2Capture(w, h, flip=self._flip)
             except (ImportError, Exception):
                 self.cap = cv2.VideoCapture(self.source)
         elif isinstance(self.source, str) and ' ! ' in self.source:

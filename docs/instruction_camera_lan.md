@@ -84,13 +84,13 @@ gst-launch-1.0 \
 
 ## Step 3 — Seeker Laptop: run drone-seeker with GStreamer source
 
-Pass the GStreamer receive pipeline as `--source`:
+Use `--udpsrc PORT` to receive a UDP stream. The pipeline is built automatically.
 
 **H.264 (matches sender step 2 default):**
 
 ```bash
 python3 main.py \
-    --source "udpsrc port=5600 ! application/x-rtp,payload=96 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink drop=1 max-buffers=1" \
+    --udpsrc 5600 \
     --connection udpin:0.0.0.0:14560
 ```
 
@@ -98,12 +98,21 @@ python3 main.py \
 
 ```bash
 python3 main.py \
-    --source "udpsrc port=5600 ! application/x-rtp,encoding-name=JPEG ! rtpjpegdepay ! jpegdec ! videoconvert ! appsink drop=1 max-buffers=1" \
+    --udpsrc 5600 --udpsrc-codec mjpeg \
     --connection udpin:0.0.0.0:14560
 ```
 
-`drop=1 max-buffers=1` keeps the pipeline at the latest frame and prevents
-buffer buildup when processing is slower than the stream rate.
+`--udpsrc` overrides `--source` and sets `drop=1 max-buffers=1` automatically to
+keep the pipeline at the latest frame and prevent buffer buildup.
+
+**Manual pipeline (advanced):** pass a full GStreamer pipeline via `--source` if
+you need custom parameters:
+
+```bash
+python3 main.py \
+    --source "udpsrc port=5600 ! application/x-rtp,payload=96 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink drop=1 max-buffers=1" \
+    --connection udpin:0.0.0.0:14560
+```
 
 ---
 
@@ -142,4 +151,6 @@ sudo tcpdump -i any udp port 5600
 | OBS virtual camera device | `/dev/video10` |
 | Stream port | `5600/udp` |
 | Codec | H.264 (default) or MJPEG (low latency) |
-| `--source` value | GStreamer pipeline string |
+| `--udpsrc PORT` | Receive UDP stream (builds pipeline automatically) |
+| `--udpsrc-codec` | `h264` (default) or `mjpeg` |
+| `--source` (manual) | Full GStreamer pipeline string (advanced) |

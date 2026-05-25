@@ -49,6 +49,47 @@ _PLANE_MODES: dict[int, str] = {
     21: "QRTL",          27: "TRACKING",
 }
 
+# ─── PX4 mode encoding ────────────────────────────────────────────────────────
+# PX4 custom_mode is a union of (main_mode << 16) | (sub_mode << 24).
+# Reference: PX4-Autopilot/src/modules/commander/px4_custom_mode.h
+#   main_mode:  1=MANUAL  2=ALTCTL  3=POSCTL  4=AUTO  5=ACRO
+#               6=OFFBOARD  7=STABILIZED  8=RATTITUDE
+#   sub_mode (only used when main_mode == AUTO):
+#               1=READY  2=TAKEOFF  3=LOITER  4=MISSION
+#               5=RTL    6=LAND     7=RTGS   8=FOLLOW  9=PRECLAND
+_PX4_MAIN_MANUAL       = 1
+_PX4_MAIN_AUTO         = 4
+_PX4_MAIN_STABILIZED   = 7
+_PX4_SUB_AUTO_LOITER   = 3
+_PX4_SUB_AUTO_MISSION  = 4
+# AUTO sub-modes 11..18 are EXTERNAL1..EXTERNAL8 (PX4 ModeManagement). The
+# PX4 fw_tracking module activates on NAVIGATION_STATE_EXTERNAL1 = 23, which
+# the commander assigns when it receives custom_sub_mode = EXTERNAL1.
+_PX4_SUB_AUTO_EXTERNAL1 = 11
+
+def _px4_mode(main: int, sub: int = 0) -> int:
+    return (sub << 24) | (main << 16)
+
+# Logical mode names mirror the ArduPlane dict so the rest of the code can
+# keep comparing self._flight_mode against "STABILIZE" / "AUTO" / etc.
+_PX4_MODES: dict[int, str] = {
+    _px4_mode(_PX4_MAIN_MANUAL):       "MANUAL",
+    _px4_mode(2):                      "ALTCTL",
+    _px4_mode(3):                      "POSCTL",
+    _px4_mode(_PX4_MAIN_AUTO, 1):      "AUTO",      # READY
+    _px4_mode(_PX4_MAIN_AUTO, 2):      "TAKEOFF",
+    _px4_mode(_PX4_MAIN_AUTO, 3):      "LOITER",
+    _px4_mode(_PX4_MAIN_AUTO,
+              _PX4_SUB_AUTO_MISSION):  "AUTO",      # MISSION → logical AUTO
+    _px4_mode(_PX4_MAIN_AUTO, 5):      "RTL",
+    _px4_mode(_PX4_MAIN_AUTO, 6):      "LAND",
+    _px4_mode(5):                      "ACRO",
+    _px4_mode(6):                      "OFFBOARD",
+    _px4_mode(_PX4_MAIN_STABILIZED):   "STABILIZE", # STABILIZED → logical STABILIZE
+    _px4_mode(_PX4_MAIN_AUTO,
+              _PX4_SUB_AUTO_EXTERNAL1): "TRACKING", # EXTERNAL1 → logical TRACKING
+}
+
 
 UINT16_MAX = 65535
 
@@ -76,11 +117,52 @@ class SeekerCtrl:
         hud_pitch: bool = True,
         hud_yaw: bool = True,
         auto: bool = False,
+        flip: bool = False,
+        px4: bool = False,
     ):
         self._input_prediction = input_prediction
         self.connection_string = connection_string
         self.baud   = baud
         self.master = None
+
+        # Autopilot dialect selection. With px4=True, set_mode_* sends the
+        # PX4-encoded custom_mode and HEARTBEAT is decoded with the PX4 dict.
+        # Logical mode strings ("STABILIZE", "AUTO") are kept the same so the
+        # rest of this file's flow comparisons don't care which AP is talking.
+        #
+        # Mapping under --px4:
+        #   AC STABILIZE → PX4 STABILIZED       (main 7)
+        #   AC AUTO      → PX4 AUTO_MISSION     (main 4, sub 4)
+        #   AC MANUAL    → PX4 HOLD / AUTO_LOITER (main 4, sub 3)
+        # MANUAL→HOLD because PX4's literal MANUAL (main 1) is direct stick
+        # passthrough with no stabilization — sending it as the "safe idle"
+        # mode the seeker drops into would be dangerous. PX4 HOLD/LOITER is
+        # the equivalent of AC's "park here and stop accepting tracking
+        # commands" semantics.
+        self._px4 = px4
+        if px4:
+            self._stabilize_mode  = _px4_mode(_PX4_MAIN_STABILIZED)
+            self._stabilize_label = "STABILIZED"
+            self._auto_mode       = _px4_mode(_PX4_MAIN_AUTO, _PX4_SUB_AUTO_MISSION)
+            self._auto_label      = "MISSION"
+            self._manual_mode     = _px4_mode(_PX4_MAIN_AUTO, _PX4_SUB_AUTO_LOITER)
+            self._manual_label    = "HOLD"
+            self._tracking_mode   = _px4_mode(_PX4_MAIN_AUTO, _PX4_SUB_AUTO_EXTERNAL1)
+            # PX4 module registers under name "Tracking" (mode_id = 23). Use
+            # the same terminology in our local prints so the heartbeat-decoded
+            # state ("TRACKING") and the commanded label match.
+            self._tracking_label  = "TRACKING"
+            self._modes_dict      = _PX4_MODES
+        else:
+            self._stabilize_mode  = _STABILIZE_MODE
+            self._stabilize_label = "STABILIZE"
+            self._auto_mode       = _AUTO_MODE
+            self._auto_label      = "AUTO"
+            self._manual_mode     = 0
+            self._manual_label    = "MANUAL"
+            self._tracking_mode   = _TRACKING_MODE
+            self._tracking_label  = "TRACKING"
+            self._modes_dict      = _PLANE_MODES
 
         self.rc_channels    = {}
         self._in_tracking    = False   # True while flight mode is TRACKING
@@ -175,6 +257,7 @@ class SeekerCtrl:
                              box_filter=box_filter,
                              use_kalman=use_kalman,
                              tracker=tracker,
+                             flip=flip,
                              pitch_offset_norm=2*self._pitch_offset / _TRK_MAX_DEG)
 
     # ── Connection ────────────────────────────────────────────────────────────
@@ -542,8 +625,8 @@ class SeekerCtrl:
     def _poll_heartbeat(self):
         msg = self.master.messages.get("HEARTBEAT")
         if msg:
-            self._flight_mode = _PLANE_MODES.get(msg.custom_mode,
-                                                  f"MODE({msg.custom_mode})")
+            self._flight_mode = self._modes_dict.get(msg.custom_mode,
+                                                     f"MODE({msg.custom_mode})")
             self._armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
     def _ch6_active(self) -> bool:
@@ -563,18 +646,46 @@ class SeekerCtrl:
             return
         self._commanded_mode = custom_mode
         print(f"[MODE] → {label} ({custom_mode})")
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            custom_mode,
-            0, 0, 0, 0, 0,
-        )
+
+        # PX4 and ArduPilot disagree on how MAV_CMD_DO_SET_MODE is encoded:
+        #   - ArduPilot: param2 = the full custom_mode integer (e.g. 10 = AUTO,
+        #     2 = STABILIZE, 27 = TRACKING). Fits in a byte for AC. Done.
+        #   - PX4: commander reads main_mode and sub_mode as SEPARATE byte
+        #     params — main_mode from param2, sub_mode from param3 — and casts
+        #     each to uint8_t (Commander.cpp:906-907). The encoded 32-bit form
+        #     (e.g. 0x0B040000 = AUTO_EXTERNAL1) is NEVER sent over the wire
+        #     for DO_SET_MODE; we have to split it ourselves. Sending the
+        #     encoded form as param2 truncates to its low byte (0) → "Unsupported
+        #     main mode" / "Unsupported auto mode" from the commander.
+        if self._px4:
+            main_mode = (custom_mode >> 16) & 0xFF
+            sub_mode  = (custom_mode >> 24) & 0xFF
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                float(main_mode),
+                float(sub_mode),
+                0, 0, 0, 0,
+            )
+        else:
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                custom_mode,
+                0, 0, 0, 0, 0,
+            )
 
     def set_mode_tracking(self):
-        self._set_mode(_TRACKING_MODE, "TRACKING")
+        # AC TRACKING (custom_mode 27) → PX4 AUTO_EXTERNAL1 (main 4 sub 11)
+        # under --px4. PX4's fw_tracking module activates on the corresponding
+        # NAVIGATION_STATE_EXTERNAL1 nav_state.
+        self._set_mode(self._tracking_mode, self._tracking_label)
 
     def set_mode_loiter(self):
         self._set_mode(_LOITER_MODE, "LOITER")
@@ -594,13 +705,16 @@ class SeekerCtrl:
         if not self._wp_takeoff_sent:
             self._force_wp_takeoff()
             self._wp_takeoff_sent = True
-        self._set_mode(_AUTO_MODE, "AUTO")
+        self._set_mode(self._auto_mode, self._auto_label)
 
     def set_mode_manual(self):
-        self._set_mode(0, "MANUAL")
+        # AC MANUAL → PX4 HOLD (AUTO LOITER, main 4 sub 3) under --px4, so the
+        # seeker's "fallback / safe idle" command parks the vehicle instead of
+        # disabling stabilization (which is what PX4's literal MANUAL does).
+        self._set_mode(self._manual_mode, self._manual_label)
 
     def set_mode_stabilize(self):
-        self._set_mode(_STABILIZE_MODE, "STABILIZE")
+        self._set_mode(self._stabilize_mode, self._stabilize_label)
 
     def _disarm(self):
         self.master.mav.command_long_send(
