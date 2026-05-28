@@ -62,10 +62,16 @@ _PX4_MAIN_AUTO         = 4
 _PX4_MAIN_STABILIZED   = 7
 _PX4_SUB_AUTO_LOITER   = 3
 _PX4_SUB_AUTO_MISSION  = 4
-# AUTO sub-modes 11..18 are EXTERNAL1..EXTERNAL8 (PX4 ModeManagement). The
+# AUTO sub-modes 12..19 are EXTERNAL1..EXTERNAL8 (PX4 ModeManagement). The
 # PX4 fw_tracking module activates on NAVIGATION_STATE_EXTERNAL1 = 23, which
 # the commander assigns when it receives custom_sub_mode = EXTERNAL1.
-_PX4_SUB_AUTO_EXTERNAL1 = 11
+#
+# NOTE: this value changed from 11 → 12 in PX4 v1.18-alpha1 (upstream commit
+# 8b3ef1cf9e "feat(navigator): add Guided Course mode for fixed-wing") which
+# inserted PX4_CUSTOM_SUB_MODE_GUIDED_COURSE at slot 11, shifting all
+# EXTERNAL slots up by one. Sending sub=11 to a current PX4 build will
+# activate Guided Course, not Tracking.
+_PX4_SUB_AUTO_EXTERNAL1 = 12
 
 def _px4_mode(main: int, sub: int = 0) -> int:
     return (sub << 24) | (main << 16)
@@ -180,9 +186,11 @@ class SeekerCtrl:
         self._srv1_min      = 1000.0   # SERVO1_MIN  (µs)
         self._srv1_max      = 2000.0   # SERVO1_MAX  (µs)
         self._srv2_trim     = 1500.0   # SERVO2_TRIM (µs)
+        self._srv2_min      = 1000.0   # SERVO2_MIN  (µs)
         self._srv2_max      = 2000.0   # SERVO2_MAX  (µs)
         self._srv4_raw      = 0        # SERVO_OUTPUT_RAW servo4 — L-Rudvator (µs)
         self._srv4_trim     = 1500.0   # SERVO4_TRIM (µs)
+        self._srv4_min      = 1000.0   # SERVO4_MIN  (µs)
         self._srv4_max      = 2000.0   # SERVO4_MAX  (µs)
         self._roll_deg       = 0.0      # ATTITUDE roll (deg)
         self._pitch_deg      = 0.0      # ATTITUDE pitch (deg)
@@ -862,7 +870,7 @@ class SeekerCtrl:
                 on_last_wp       = (self._waypoint_count > 0 and
                                     self._current_wp == self._waypoint_count - 1)
 
-                if not self.rc_channels:
+                if not self.rc_channels and not self._auto:
                     pass  # hold MANUAL until first RC packet arrives
                 elif self._ch6_active():
                     # Enter TRACKING only when in AUTO mode, on the last waypoint,
