@@ -371,6 +371,12 @@ class Seeker:
         self._track_win       = None   # current CamShift window (x, y, w, h)
         self._detect_count    = 0      # consecutive successful detections
         self._res_logged      = False
+        # Stage profiling (set by SeekerCtrl when --profile / --debug). track()
+        # records the tracker.update sub-cost here each frame; the loop profiler
+        # reads it via note(). Zero cost when self.profile is False.
+        self.profile      = False
+        self.t_detect_ms  = 0.0
+        self.t_track_ms   = 0.0
         self._term_crit  = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.5
         )
@@ -623,6 +629,16 @@ class Seeker:
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, self._kern5)
         return mask, 1
 
+    def _timed(self, attr, fn, *args):
+        """Call fn(*args), adding its elapsed ms to self.<attr> when profiling.
+        Returns fn's result. No timing overhead when self.profile is False."""
+        if not self.profile:
+            return fn(*args)
+        _t = time.perf_counter()
+        r = fn(*args)
+        setattr(self, attr, getattr(self, attr) + (time.perf_counter() - _t) * 1000.0)
+        return r
+
     def track(self, frame: np.ndarray):
         """Run one tracking step.
 
@@ -635,6 +651,9 @@ class Seeker:
         half-resolution frame to find and confirm the blob.
         """
         h_frame, w_frame = frame.shape[:2]
+        if self.profile:                       # reset per-frame stage counters
+            self.t_detect_ms = 0.0
+            self.t_track_ms  = 0.0
         # Reuse persistent buffers; (re)allocate only when frame shape changes.
         if self._hsv_buf is None or self._hsv_buf.shape[:2] != (h_frame, w_frame):
             self._hsv_buf = np.empty((h_frame, w_frame, 3), dtype=np.uint8)
@@ -731,7 +750,7 @@ class Seeker:
 
         # ── MIL step (replaces CamShift when --tracker mil is active) ────────
         if self._tracker_name and self._tracker_obj is not None:
-            ok, bbox = self._tracker_obj.update(frame)
+            ok, bbox = self._timed("t_track_ms", self._tracker_obj.update, frame)
             if ok:
                 x, y, w, h = (int(v) for v in bbox)
                 if w >= 4 and h >= 4:

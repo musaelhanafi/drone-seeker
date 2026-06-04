@@ -13,6 +13,7 @@ from pymavlink import mavutil
 
 from hud_display import HudDisplay
 from seeker import Seeker
+from stage_profiler import StageProfiler
 
 # Tracking errors are sent as TRACKING_MESSAGE (MAVLink ID 11045, ardupilotmega dialect).
 # Fields: errorx, errory, both normalised to [-1, 1].
@@ -112,6 +113,7 @@ class SeekerCtrl:
         show_histogram: bool = False,
         show_mask: bool = False,
         debug_log: bool = False,
+        profile: bool = False,
         record: bool = False,
         input_prediction: bool = True,
         mask_algo: str = "all",
@@ -267,6 +269,21 @@ class SeekerCtrl:
                              tracker=tracker,
                              flip=flip,
                              pitch_offset_norm=2*self._pitch_offset / _TRK_MAX_DEG)
+
+        # ── Stage profiler (--profile / --debug) ──────────────────────────────
+        # Profiling runs when --profile OR --debug is set. With --debug the
+        # periodic reports are also appended to a timestamped logfile
+        # profile_<tracker>_<YYYYmmdd-HHMMSS>.log so successive runs of different
+        # trackers don't clobber each other and stay comparable.
+        prof_enabled = profile or debug_log
+        prof_logfile = None
+        if debug_log:
+            trk = tracker or (shift_algo if use_camshift else "notrack")
+            prof_logfile = "profile_%s_%s.log" % (trk, time.strftime("%Y%m%d-%H%M%S"))
+        self.seeker.profile = prof_enabled
+        self._prof = StageProfiler(enabled=prof_enabled, logfile=prof_logfile)
+        if prof_logfile:
+            print("[PROF] logging pipeline profile to %s" % prof_logfile)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -826,6 +843,7 @@ class SeekerCtrl:
         try:
             while True:
                 # ── 1. Grab frame & run pink CamShift tracker ─────────────────
+                self._prof.begin()
                 frame_seq, ok, frame = self.seeker.read_frame()
                 if frame is None:
                     time.sleep(0.002)
@@ -841,6 +859,7 @@ class SeekerCtrl:
                     time.sleep(0.002)
                     continue
                 prev_frame_seq = frame_seq
+                self._prof.lap("capture")     # buffered read (decode is threaded)
 
                 now = time.monotonic()
                 frame_times.append(now - prev_time)
@@ -849,6 +868,9 @@ class SeekerCtrl:
                 fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
 
                 annotated, cx, cy = self.seeker.track(frame)
+                self._prof.lap("track")
+                self._prof.note("  detect",  self.seeker.t_detect_ms)
+                self._prof.note("  tracker", self.seeker.t_track_ms)
                 target_locked     = cx is not None and cy is not None
                 if target_locked:
                     errorx, errory = self.seeker.error_xy(cx, cy, frame.shape)
@@ -984,6 +1006,8 @@ class SeekerCtrl:
                             self._log_row(now, self._last_errorx, self._last_errory,
                                           target_locked=False)
 
+                self._prof.lap("ctrl+mav")    # poll + mode mgmt + send_tracking + csv
+
                 # ── 6. Annotate HUD ───────────────────────────────────────────
                 h_frame  = annotated.shape[0]
                 dist_tgt_m = dist_to_target_m if dist_to_target_m is not None else self._dist_to_target_m()
@@ -1007,12 +1031,15 @@ class SeekerCtrl:
                                    self._lat, self._lon,
                                    self._yaw_deg, self._pitch_deg, self._roll_deg,
                                self._pitch_offset / _TRK_MAX_DEG)
+                self._prof.lap("hud")
 
                 if self._record:
                     self._write_frame(annotated)
                 cv2.imshow(self.seeker.window_name, annotated)
 
                 key = cv2.waitKey(1) & 0xFF
+                self._prof.lap("display")     # record write + imshow + waitKey
+                self._prof.frame_end()
                 if key == ord("q"):
                     print("[Ctrl] Quit.")
                     break
@@ -1025,4 +1052,5 @@ class SeekerCtrl:
             self._close_csv()
             self._close_video("takeoff")
             self._close_video("tracking")
+            self._prof.close()
             self.seeker.close()

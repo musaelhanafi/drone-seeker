@@ -156,7 +156,17 @@ def parse_args():
         "--debug",
         action="store_true",
         default=False,
-        help="Log tracking telemetry to tracking.csv while in TRACKING mode",
+        help="Log tracking telemetry to tracking.csv while in TRACKING mode. "
+             "Also enables stage profiling and appends the reports to "
+             "profile_<tracker>_<timestamp>.log.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="Print per-stage loop timing (capture/track/ctrl+mav/hud/display) "
+             "to stdout every ~2 s. (--debug also enables this and saves it to "
+             "a logfile.)",
     )
     parser.add_argument(
         "--record",
@@ -239,6 +249,7 @@ def main():
         show_histogram=args.histogram,
         show_mask=args.mask,
         debug_log=args.debug,
+        profile=args.profile,
         record=args.record,
         input_prediction=not args.no_prediction,
         mask_algo=args.mask_algo,
