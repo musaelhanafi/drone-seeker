@@ -830,6 +830,18 @@ class Seeker:
             self._kf_last_t = now_t
 
         back_proj = cv2.calcBackProject([hsv], [0], self._roi_hist, [0, 180], 1)
+        # ── S/V gate ──────────────────────────────────────────────────────────
+        # The back-projection above is hue-only, so it lights up *any* same-hue
+        # pixel regardless of saturation/value — including the shadowed,
+        # washed-out ground/runway below the target. That mass pulls the CamShift
+        # centroid downward (the vertical |ey| bias) and lets lock collapse when
+        # same-hue clutter dominates. AND-gate the back-projection with the
+        # acquisition 'outer' band (hue±2σ with S,V ≥ 40 floors) so only pixels
+        # that are also saturated/bright enough survive — the same gate detection
+        # already uses, now applied during tracking too.
+        if self._precomp_bands is not None:
+            sv_mask = self._apply_inrange_band(hsv, "outer")
+            cv2.bitwise_and(back_proj, sv_mask, dst=back_proj)
         # Pre-translate the search window by Kalman-predicted velocity so CamShift
         # starts near where the target is expected to be this frame.
         twx, twy, tww, twh = self._track_win
