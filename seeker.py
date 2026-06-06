@@ -163,7 +163,9 @@ _GAUSS_SIGMA        = 2.0   # confidence window: ±2.0σ
 _KF_Q_POS    = 2.0    # process noise — position  (px^2/s)
 _KF_Q_VEL    = 80.0   # process noise — velocity  (px^2/s^3)
 _KF_R        = 30.0   # measurement noise         (px^2)
-_KF_MISS_MAX = 5      # predict this many frames after lock loss, then give up
+_KF_MISS_MAX = 10     # predict this many frames after lock loss, then give up
+                      # (~0.5-0.7 s of Kalman coast at 15-20 FPS; was 5 ≈ 0.3 s,
+                      # too short to ride out brief CamShift dropouts / re-scales)
 
 
 def _make_tracker(name: str):
@@ -839,7 +841,13 @@ class Seeker:
         # acquisition 'outer' band (hue±2σ with S,V ≥ 40 floors) so only pixels
         # that are also saturated/bright enough survive — the same gate detection
         # already uses, now applied during tracking too.
+        # Keep an UN-gated copy for the loss/density check below. The gate
+        # removes dark/washed same-hue pixels to sharpen the centroid, but those
+        # removals must NOT be read as "target gone" — otherwise the gate trips
+        # the density check and *increases* track loss instead of helping.
+        presence = None
         if self._precomp_bands is not None:
+            presence = back_proj.copy()
             sv_mask = self._apply_inrange_band(hsv, "outer")
             cv2.bitwise_and(back_proj, sv_mask, dst=back_proj)
         # Pre-translate the search window by Kalman-predicted velocity so CamShift
@@ -862,6 +870,11 @@ class Seeker:
         if bx2 < w_frame:  back_proj[by1:by2, bx2:] = 0
         cv2.GaussianBlur(back_proj, (3, 3), 0, dst=back_proj)
         cv2.dilate(back_proj, back_proj, self._kern5)
+        # Process the un-gated presence map identically so the density threshold
+        # stays calibrated to the original (pre-gate) signal.
+        if presence is not None:
+            cv2.GaussianBlur(presence, (3, 3), 0, dst=presence)
+            cv2.dilate(presence, presence, self._kern5)
 
         if self._shift_algo == "meanshift":
             _, self._track_win = cv2.meanShift(
@@ -887,8 +900,11 @@ class Seeker:
 
         if not camshift_bad:
             # ── Signal density check — drop lock if back-proj is mostly empty ─
+            # Use the UN-gated presence map (falls back to back_proj when the
+            # gate is inactive) so the S/V gate can't cause false losses.
             wx, wy, ww, wh = self._track_win
-            roi_bp  = back_proj[wy:wy + wh, wx:wx + ww]
+            dens_src = presence if presence is not None else back_proj
+            roi_bp  = dens_src[wy:wy + wh, wx:wx + ww]
             density = float(roi_bp.mean()) / 255.0
             if density < 0.05:
                 camshift_bad = True
