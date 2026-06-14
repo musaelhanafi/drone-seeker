@@ -28,7 +28,8 @@ _LATENCY_S     = 0.08   # pipeline latency to compensate (s)
 _PN_LEAD_S     = 0.30   # proportional navigation lead time (s) — increase for faster aircraft
 _TRK_PITCH_OFFSET    = 3.0         # must match ArduPlane TRK_PITCH_OFFSET (deg) — cruise nose-up bias
 _TRK_MAX_DEG         = 30.0        # must match ArduPlane TRK_MAX_DEG — full-scale error angle (deg)
-_TRK_CLOSE_M         = 1000.0           # enter TRACKING only within this slant distance (m)
+_TRK_CLOSE_M         = 1000.0           # default TRACKING-entry slant distance (m); overwritten
+                                        # by firmware TRK_CLOSE_M via _TRACKED_PARAMS at startup
 _TRK_TARGET_ALT_MSL  = 744.0            # must match ArduPlane TRK_TGT_ALT  (m MSL)
 _TRK_TARGET_LAT      = -6.897367724    # must match ArduPlane TRK_TGT_LAT  (decimal deg)
 _TRK_TARGET_LON      = 107.566559898   # must match ArduPlane TRK_TGT_LON  (decimal deg)
@@ -37,12 +38,12 @@ _TRK_TARGET_LON      = 107.566559898   # must match ArduPlane TRK_TGT_LON  (deci
 _TRACKING_MODE   = 27
 _LOITER_MODE     = 5   # fallback mode when ch6 goes low
 _AUTO_MODE       = 10  # AUTO when lock lost / ch6 disarmed
-_STABILIZE_MODE  = 2   # STABILIZE — auto mode ch6-low fallback
+_FBWA_MODE       = 5   # FBWA — seeker fallback under ArduPilot (replaces STABILIZE)
 
 # ArduPlane custom_mode → display name
 _PLANE_MODES: dict[int, str] = {
     0:  "MANUAL",        1:  "CIRCLE",      2:  "STABILIZE",
-    3:  "TRAINING",      4:  "ACRO",        5:  "LOITER",
+    3:  "TRAINING",      4:  "ACRO",        5:  "FBWA",
     6:  "FBW_B",         7:  "CRUISE",      8:  "AUTOTUNE",
     10: "AUTO",          11: "RTL",         12: "LOITER",
     13: "TAKEOFF",       15: "GUIDED",      17: "QSTABILIZE",
@@ -151,6 +152,9 @@ class SeekerCtrl:
         if px4:
             self._stabilize_mode  = _px4_mode(_PX4_MAIN_STABILIZED)
             self._stabilize_label = "STABILIZED"
+            # PX4 has no FBWA; STABILIZED stays the seeker fallback. Heartbeat
+            # decodes it to logical "STABILIZE" (see _PX4_MODES).
+            self._stabilize_flight_name = "STABILIZE"
             self._auto_mode       = _px4_mode(_PX4_MAIN_AUTO, _PX4_SUB_AUTO_MISSION)
             self._auto_label      = "MISSION"
             self._manual_mode     = _px4_mode(_PX4_MAIN_AUTO, _PX4_SUB_AUTO_LOITER)
@@ -162,8 +166,10 @@ class SeekerCtrl:
             self._tracking_label  = "TRACKING"
             self._modes_dict      = _PX4_MODES
         else:
-            self._stabilize_mode  = _STABILIZE_MODE
-            self._stabilize_label = "STABILIZE"
+            # ArduPilot fallback is FBWA (mode 5) — replaces STABILIZE.
+            self._stabilize_mode  = _FBWA_MODE
+            self._stabilize_label = "FBWA"
+            self._stabilize_flight_name = "FBWA"
             self._auto_mode       = _AUTO_MODE
             self._auto_label      = "AUTO"
             self._manual_mode     = 0
@@ -224,6 +230,7 @@ class SeekerCtrl:
         self._target_lat     = _TRK_TARGET_LAT        # TRK_TGT_LAT (decimal deg)
         self._target_lon     = _TRK_TARGET_LON        # TRK_TGT_LON (decimal deg)
         self._pitch_offset   = _TRK_PITCH_OFFSET      # TRK_PITCH_OFFSET (deg)
+        self._trk_close_m    = _TRK_CLOSE_M           # TRK_CLOSE_M (m) — overwritten from firmware
 
         # ── Mission state ─────────────────────────────────────────────────────
         self._waypoint_count = 0    # total mission items (from MISSION_COUNT)
@@ -316,6 +323,7 @@ class SeekerCtrl:
         "TRK_TGT_LAT":      "_target_lat",
         "TRK_TGT_LON":      "_target_lon",
         "TRK_PITCH_OFFSET": "_pitch_offset",
+        "TRK_CLOSE_M":      "_trk_close_m",
         "SERVO1_TRIM":      "_srv1_trim",
         "SERVO1_MIN":       "_srv1_min",
         "SERVO1_MAX":       "_srv1_max",
@@ -887,7 +895,7 @@ class SeekerCtrl:
                 ch6_fell = self._prev_ch6_on and not ch6_on  # armed → disarmed edge
 
                 dist_to_target_m = self._dist_to_target_m()
-                close_enough     = dist_to_target_m <= _TRK_CLOSE_M
+                close_enough     = dist_to_target_m <= self._trk_close_m
                 in_auto          = (self._flight_mode == "AUTO")
                 on_last_wp       = (self._waypoint_count > 0 and
                                     self._current_wp == self._waypoint_count - 1)
@@ -930,13 +938,15 @@ class SeekerCtrl:
                 self._prev_ch6_force_on = self._ch6_force_active()
 
                 # ── 4. CSV / video lifecycle ──────────────────────────────────
-                # Takeoff file: open on STABILIZE entry (pre-launch), close when WP leaves 1.
+                # Takeoff file: open on fallback-mode entry (FBWA on ArduPilot /
+                # STABILIZE on PX4, pre-launch), close when WP leaves 1.
+                fb = self._stabilize_flight_name
                 if self._record:
-                    if (self._flight_mode == "STABILIZE" and
-                            self._prev_flight_mode != "STABILIZE" and
+                    if (self._flight_mode == fb and
+                            self._prev_flight_mode != fb and
                             self._ffmpeg_tkof is None):
                         self._pending_video_open = True
-                        print("[REC] STABILIZE — warming up FPS before takeoff recording")
+                        print(f"[REC] {fb} — warming up FPS before takeoff recording")
                     elif self._current_wp != 1 and self._prev_wp == 1:
                         self._pending_video_open = False
                         self._close_video("takeoff")
@@ -957,8 +967,8 @@ class SeekerCtrl:
                     # ArduPlane does not act on any stale error still in flight.
                     self.send_tracking(0.0, 0.0)
 
-                if (self._flight_mode in ("STABILIZE", "MANUAL") and
-                        self._prev_flight_mode not in ("STABILIZE", "MANUAL")):
+                if (self._flight_mode in (fb, "MANUAL") and
+                        self._prev_flight_mode not in (fb, "MANUAL")):
                     if self._debug_log:
                         self._close_csv()
                     if self._record:
