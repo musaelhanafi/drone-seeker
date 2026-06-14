@@ -237,7 +237,6 @@ class SeekerCtrl:
         self._current_wp     = 0    # current waypoint seq (from MISSION_CURRENT)
         self._prev_wp        = -1   # previous WP for transition detection
         self._prev_flight_mode  = ""    # previous flight mode for transition detection
-        self._pending_video_open = False  # waiting for FPS warmup before opening video
 
         # ── Lock-loss hold state ──────────────────────────────────────────────
         self._last_errorx        = 0.0   # last valid errorx (re-sent while lock is lost)
@@ -257,7 +256,6 @@ class SeekerCtrl:
         # ── Video recorder (FFmpeg pipe) ──────────────────────────────────────
         self._record      = record
         self._ffmpeg      = None   # subprocess.Popen for TRACKING phase
-        self._ffmpeg_tkof = None   # subprocess.Popen for takeoff (WP 1)
 
         self._auto = auto
         self._hud = HudDisplay(show_pitch=hud_pitch, show_yaw=hud_yaw)
@@ -606,15 +604,12 @@ class SeekerCtrl:
         ]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if label == "takeoff":
-            self._ffmpeg_tkof = proc
-        else:
-            self._ffmpeg = proc
-            self._tracking_ts = ts
+        self._ffmpeg = proc
+        self._tracking_ts = ts
         print(f"[REC] {label} recording → {path}  fps={fps:.1f}")
 
     def _close_video(self, label: str = "tracking"):
-        proc = self._ffmpeg_tkof if label == "takeoff" else self._ffmpeg
+        proc = self._ffmpeg
         if proc is None:
             return
         try:
@@ -622,20 +617,15 @@ class SeekerCtrl:
             proc.wait(timeout=5.0)
         except Exception:
             proc.kill()
-        if label == "takeoff":
-            self._ffmpeg_tkof = None
-        else:
-            self._ffmpeg = None
+        self._ffmpeg = None
         print(f"[REC] {label} recording stopped")
 
     def _write_frame(self, frame):
-        raw = frame.tobytes()
-        for proc in (self._ffmpeg_tkof, self._ffmpeg):
-            if proc is not None:
-                try:
-                    proc.stdin.write(raw)
-                except BrokenPipeError:
-                    pass
+        if self._ffmpeg is not None:
+            try:
+                self._ffmpeg.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                pass
 
     # ── RC (non-blocking poll) ────────────────────────────────────────────────
 
@@ -810,9 +800,6 @@ class SeekerCtrl:
             self._poll_mavlink_state()
             if self._flight_mode == "AUTO":
                 print("[Ctrl] AUTO mode confirmed — starting seeker loop.")
-                if self._record:
-                    self._pending_video_open = True
-                    print("[REC] AUTO — queuing takeoff recording (waiting for FPS warmup)")
                 break
             seq, ok, frame = self.seeker.read_frame()
             if frame is None or seq == _prev_seq_wait:
@@ -938,25 +925,7 @@ class SeekerCtrl:
                 self._prev_ch6_force_on = self._ch6_force_active()
 
                 # ── 4. CSV / video lifecycle ──────────────────────────────────
-                # Takeoff file: open on fallback-mode entry (FBWA on ArduPilot /
-                # STABILIZE on PX4, pre-launch), close when WP leaves 1.
-                fb = self._stabilize_flight_name
-                if self._record:
-                    if (self._flight_mode == fb and
-                            self._prev_flight_mode != fb and
-                            self._ffmpeg_tkof is None):
-                        self._pending_video_open = True
-                        print(f"[REC] {fb} — warming up FPS before takeoff recording")
-                    elif self._current_wp != 1 and self._prev_wp == 1:
-                        self._pending_video_open = False
-                        self._close_video("takeoff")
-
-                # Open takeoff video once frame_times buffer is full.
-                if (self._pending_video_open and self._ffmpeg_tkof is None and
-                        len(frame_times) >= frame_times.maxlen):
-                    self._open_video(frame.shape, fps, "takeoff")
-                    self._pending_video_open = False
-
+                fb = self._stabilize_flight_name   # logical fallback-mode name (FBWA / STABILIZE)
                 if self._in_tracking and not prev_in_tracking:
                     if self._debug_log and self._csv_writer is None:
                         self._open_csv()
@@ -1060,7 +1029,6 @@ class SeekerCtrl:
 
         finally:
             self._close_csv()
-            self._close_video("takeoff")
             self._close_video("tracking")
             self._prof.close()
             self.seeker.close()
