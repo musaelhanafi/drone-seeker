@@ -115,9 +115,12 @@ if args.udpsrc is not None:
 else:
     source = int(args.source) if args.source.isdigit() else args.source
 cap = open_capture(source, args.width, args.height, flip=args.flip)
+# Picamera2 flips in hardware (libcamera Transform); for OpenCV/GStreamer
+# sources do the 180-degree flip in software here.
+sw_flip = args.flip and not isinstance(cap, Picamera2Capture)
 
 newh = args.height
-neww = args.width   
+neww = args.width
 print(f"display size: {neww}x{newh}")
 
 prev_time = time.time()
@@ -130,6 +133,9 @@ while True:
     if not ret:
         print("No frame — exiting.")
         break
+
+    if sw_flip:
+        frame = cv2.flip(frame, -1)
 
     frame = cv2.resize(frame, (neww, newh))
     curr_time = time.time()
