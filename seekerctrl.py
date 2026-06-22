@@ -113,6 +113,7 @@ class SeekerCtrl:
         crop: tuple[int | None, int | None, int | None, int | None] | None = None,
         show_histogram: bool = False,
         show_mask: bool = False,
+        display: bool = True,
         debug_log: bool = False,
         profile: bool = False,
         record: bool = False,
@@ -266,6 +267,7 @@ class SeekerCtrl:
                              crop=crop,
                              show_histogram=show_histogram,
                              show_mask=show_mask,
+                             display=display,
                              mask_algo=mask_algo,
                              use_camshift=use_camshift,
                              shift_algo=shift_algo,
@@ -826,9 +828,10 @@ class SeekerCtrl:
                             dist_km, alt_rel_m, spd_kmh, self._throttle_pct),
                         (5, h_w - 20),
                         cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 2)
-            cv2.imshow(self.seeker.window_name, annotated)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                return
+            if self.seeker.display:
+                cv2.imshow(self.seeker.window_name, annotated)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    return
             time.sleep(0.02)
 
         frame_times: collections.deque = collections.deque(maxlen=30)
@@ -1014,9 +1017,11 @@ class SeekerCtrl:
 
                 if self._record:
                     self._write_frame(annotated)
-                cv2.imshow(self.seeker.window_name, annotated)
-
-                key = cv2.waitKey(1) & 0xFF
+                if self.seeker.display:
+                    cv2.imshow(self.seeker.window_name, annotated)
+                    key = cv2.waitKey(1) & 0xFF
+                else:
+                    key = 0xFF
                 self._prof.lap("display")     # record write + imshow + waitKey
                 self._prof.frame_end()
                 if key == ord("q"):

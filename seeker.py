@@ -303,6 +303,7 @@ class Seeker:
         histogram_file: str = _CAL_HISTOGRAM_FILE,
         show_histogram: bool = False,
         show_mask: bool = False,
+        display: bool = True,
         mask_algo: str = "all",
         use_camshift: bool = True,
         shift_algo: str = "camshift",   # "camshift" | "meanshift"
@@ -340,8 +341,9 @@ class Seeker:
         self.capture_height  = capture_height
         self.crop            = crop   # (x, y, w, h) or None
         self._flip           = flip
-        self._show_histogram = show_histogram
-        self._show_mask      = show_mask
+        self.display         = display
+        self._show_histogram = show_histogram and display
+        self._show_mask      = show_mask and display
         self._mask_algo      = mask_algo
         self._use_camshift   = use_camshift
         self._shift_algo     = shift_algo
@@ -470,20 +472,19 @@ class Seeker:
                 ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception:
                 pass
-        cv2.namedWindow(self.window_name, cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, disp_w, disp_h)
-        if self._show_histogram and self._cal_hist is not None:
-            self._hist_window = f"{self.window_name} — Histogram"
-            cv2.namedWindow(self._hist_window, cv2.WINDOW_NORMAL|cv2.WINDOW_GUI_NORMAL)
-            cv2.resizeWindow(self._hist_window, 360, 230)
-        else:
-            self._hist_window = None
-        if self._show_mask:
-            self._mask_window = f"{self.window_name} — Mask"
-            cv2.namedWindow(self._mask_window, cv2.WINDOW_GUI_NORMAL|cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self._mask_window, disp_w, disp_h)
-        else:
-            self._mask_window = None
+        self._hist_window = None
+        self._mask_window = None
+        if self.display:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window_name, disp_w, disp_h)
+            if self._show_histogram and self._cal_hist is not None:
+                self._hist_window = f"{self.window_name} — Histogram"
+                cv2.namedWindow(self._hist_window, cv2.WINDOW_NORMAL|cv2.WINDOW_GUI_NORMAL)
+                cv2.resizeWindow(self._hist_window, 360, 230)
+            if self._show_mask:
+                self._mask_window = f"{self.window_name} — Mask"
+                cv2.namedWindow(self._mask_window, cv2.WINDOW_GUI_NORMAL|cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._mask_window, disp_w, disp_h)
 
     def _capture_loop(self):
         """Background thread: continuously read frames, always keep the latest."""
@@ -503,7 +504,8 @@ class Seeker:
         if self.cap:
             self.cap.release()
             self.cap = None
-        cv2.destroyWindow(self.window_name)
+        if self.display:
+            cv2.destroyWindow(self.window_name)
         if getattr(self, "_hist_window", None):
             cv2.destroyWindow(self._hist_window)
             self._hist_window = None
@@ -1114,9 +1116,11 @@ class Seeker:
                 cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 233, 0), 2)
 
-                cv2.imshow(self.window_name, annotated)
-
-                key = cv2.waitKey(1) & 0xFF
+                if self.display:
+                    cv2.imshow(self.window_name, annotated)
+                    key = cv2.waitKey(1) & 0xFF
+                else:
+                    key = 0xFF
                 if key == ord("q"):
                     print("[Seeker] Quit.")
                     break

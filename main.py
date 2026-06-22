@@ -107,6 +107,13 @@ def parse_args():
         help="Show detection mask in a separate window (default: disabled)",
     )
     parser.add_argument(
+        "--no-display",
+        action="store_true",
+        default=False,
+        help="Headless: no OpenCV preview window (saves CPU/power on the drone). "
+             "Also disables the histogram/mask windows.",
+    )
+    parser.add_argument(
         "--tracker",
         default="camshift,kalman",
         metavar="TOKENS",
@@ -248,6 +255,7 @@ def main():
         crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,
         show_histogram=args.histogram,
         show_mask=args.mask,
+        display=not args.no_display,
         debug_log=args.debug,
         profile=args.profile,
         record=args.record,
