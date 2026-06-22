@@ -114,6 +114,7 @@ class SeekerCtrl:
         show_histogram: bool = False,
         show_mask: bool = False,
         display: bool = True,
+        max_fps: float | None = None,
         debug_log: bool = False,
         profile: bool = False,
         record: bool = False,
@@ -256,6 +257,7 @@ class SeekerCtrl:
 
         # ── Video recorder (FFmpeg pipe) ──────────────────────────────────────
         self._record      = record
+        self._max_fps     = max_fps
         self._ffmpeg      = None   # subprocess.Popen for TRACKING phase
 
         self._auto = auto
@@ -838,6 +840,7 @@ class SeekerCtrl:
         prev_time        = time.monotonic()
         prev_in_tracking = False
         prev_frame_seq   = -1
+        _fps_last        = time.monotonic()
         try:
             while True:
                 # ── 1. Grab frame & run pink CamShift tracker ─────────────────
@@ -1024,6 +1027,12 @@ class SeekerCtrl:
                     key = 0xFF
                 self._prof.lap("display")     # record write + imshow + waitKey
                 self._prof.frame_end()
+                if self._max_fps:                          # FPS cap (race-to-idle)
+                    _budget = 1.0 / self._max_fps
+                    _dt = time.monotonic() - _fps_last
+                    if _dt < _budget:
+                        time.sleep(_budget - _dt)
+                    _fps_last = time.monotonic()
                 if key == ord("q"):
                     print("[Ctrl] Quit.")
                     break
