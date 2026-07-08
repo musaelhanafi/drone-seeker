@@ -2,6 +2,7 @@ import collections
 import ctypes
 import cv2
 import numpy as np
+import os
 import sys
 import threading
 import time
@@ -457,6 +458,21 @@ class Seeker:
             frame_h = (actual_h - cy) if ch is None else ch
         else:
             frame_w, frame_h = actual_w, actual_h
+        # Pace playback ONLY for seekable video files so the clip plays at real
+        # time. The capture thread otherwise decodes as fast as the CPU allows,
+        # which fast-forwards a file source. Live sources MUST NOT be paced —
+        # they are already paced by the driver and pacing would add latency /
+        # drop fresh frames:
+        #   • camera index   → self.source is an int (not a str)
+        #   • UDP / GStreamer → self.source is a pipeline string (' ! ')
+        # so both fail the isfile() check and keep _cap_interval == 0.
+        self._cap_interval = 0.0
+        is_pipeline = isinstance(self.source, str) and ' ! ' in self.source
+        if isinstance(self.source, str) and not is_pipeline and os.path.isfile(self.source):
+            src_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            if src_fps and src_fps > 0:
+                self._cap_interval = 1.0 / src_fps
+                print(f"[Seeker] Video file source — pacing playback to {src_fps:.2f} fps")
         # Start background capture thread so read_frame() never blocks on I/O.
         self._cap_lock  = threading.Lock()
         self._cap_stop  = False
@@ -487,13 +503,28 @@ class Seeker:
                 cv2.resizeWindow(self._mask_window, disp_w, disp_h)
 
     def _capture_loop(self):
-        """Background thread: continuously read frames, always keep the latest."""
+        """Background thread: continuously read frames, always keep the latest.
+
+        For seekable video-file sources (_cap_interval > 0) the reads are
+        throttled to the file's native frame interval so the clip plays at real
+        time; otherwise it would decode as fast as the CPU allows and the video
+        fast-forwards. Live sources keep _cap_interval == 0 and run flat-out."""
+        next_t = time.monotonic()
         while not self._cap_stop:
             ok, frame = self.cap.read()
             with self._cap_lock:
                 self._cap_ok    = ok
                 self._cap_frame = frame
                 self._cap_seq  += 1
+            if self._cap_interval:
+                next_t += self._cap_interval
+                delay = next_t - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    # Decode fell behind real time — reset the schedule so we
+                    # don't burst-read to "catch up" and re-introduce fast-forward.
+                    next_t = time.monotonic()
 
     def close(self):
         """Release the capture device and destroy the display window."""
@@ -1091,6 +1122,7 @@ class Seeker:
         self.open()
         prev_time = time.time()
         frame_times = collections.deque(maxlen=30)
+        started = False
         try:
             while True:
                 curr_time = time.time()
@@ -1100,10 +1132,17 @@ class Seeker:
 
                 _seq, ok, frame = self.read_frame()
                 if frame is None:
-                    continue   # capture thread not ready yet
+                    # None before any frame = capture thread warming up; None
+                    # *after* frames have flowed = end of a video file → stop
+                    # (otherwise the loop spins forever on a finished file).
+                    if started:
+                        print("[Seeker] End of stream.")
+                        break
+                    continue
                 if not ok:
                     print("[Seeker] End of stream.")
                     break
+                started = True
 
                 annotated, cx, cy = self.track(frame)
                 errorx, errory    = self.error_xy(cx, cy, frame.shape)
