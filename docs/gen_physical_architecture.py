@@ -87,93 +87,88 @@ def routed_arrow(ax, points, label="", label_seg=None,
                 bbox=dict(facecolor="white", edgecolor="none", pad=1.5))
 
 # ── layout constants ──────────────────────────────────────────────────────────
-# DARAT: x 0.2–7.0   UDARA: x 8.6–15.8
-# Routing lanes: top y=6.6, bottom y=0.15, gap x=7.0–8.6
+# DARAT: x 0.2–7.0   UDARA: x 8.6–15.8   gap x 7.0–8.6
+# Rows:  top y≈5.4 (RC),  mid y≈4.05 (telemetry),  low y 0.7–3.4 (laptop / Pi)
 
 DL, DR = 0.2, 7.0     # Darat left/right
 UL, UR = 8.6, 15.8    # Udara left/right
-TOP_Y  = 6.55          # upper routing lane
-BOT_Y  = 0.18          # lower routing lane
 
 # ── DARAT container ───────────────────────────────────────────────────────────
 container(ax, DL, 0.4, DR-DL, 6.0, "Darat", "#eef4fb", "#2c6fad", zorder=0)
 
 # RC Transmitter (top strip)
-box(ax, 0.45, 5.1, 6.3, 1.0, "#4A90D9", "RC Transmitter")
+box(ax, 0.45, 4.9, 6.3, 1.0, "#4A90D9", "RC Transmitter")
+
+# Telemetry RX (mid, above QGroundControl)
+box(ax, 0.65, 3.6, 2.6, 0.9, "#8E7CC3", "Telemetry RX", fontsize=9)
 
 # Laptop sub-container
-container(ax, 0.45, 0.65, 6.3, 4.1, "Laptop", "#f0faf5", "#1d7a68", fontsize=9, zorder=1)
+container(ax, 0.45, 0.7, 6.3, 2.7, "Laptop", "#f0faf5", "#1d7a68", fontsize=9, zorder=1)
 
-# QGroundControl  (left column, bottom)
-box(ax, 0.65, 0.85, 2.7, 1.0, "#2ECC71", "QGroundControl", fontsize=9)
+# QGroundControl  (left)
+box(ax, 0.65, 1.4, 2.6, 1.0, "#2ECC71", "QGroundControl", fontsize=8.5)
 
-# X-Plane  (right column, bottom)
-box(ax, 3.7,  0.85, 2.8, 1.0, "#7B5EA7", "X-Plane", fontsize=9)
+# X-Plane  (right)
+box(ax, 3.75, 1.4, 2.7, 1.0, "#7B5EA7", "X-Plane", fontsize=9)
 
-# Monitor  (spans full width, above QGC/XP)
-box(ax, 0.65, 2.2, 5.85, 1.0, "#5B7FD4", "Monitor", fontsize=9)
-
-# X-Plane -> Monitor
-simple_arrow(ax, 5.1, 1.85, 3.575, 2.2, label="display")
+# Telemetry RX -> QGroundControl (MAVLink over telemetry radio)
+simple_arrow(ax, 1.95, 3.6, 1.95, 2.4, label="MAVLink", loff=(0.55, 0))
 
 # ── UDARA container ───────────────────────────────────────────────────────────
 container(ax, UL, 0.4, UR-UL, 6.0, "Udara", "#fff8ec", "#b85c1a", zorder=0)
 
 # RC Receiver  (top-left of Udara)
-box(ax, 8.85, 5.1, 3.0, 1.0, "#5BA3E0", "RC Receiver", sublabel="(SBUS/PWM)")
+box(ax, 8.85, 4.9, 2.9, 1.0, "#5BA3E0", "RC Receiver", sublabel="(SBUS)")
 
 # Flight Controller  (top-right of Udara)
-box(ax, 12.2, 5.1, 3.3, 1.0, "#E07B39", "Flight Controller", sublabel="(ArduPlane)")
+box(ax, 12.1, 4.9, 3.4, 1.0, "#E07B39", "Flight Controller", sublabel="(ArduPlane)")
+
+# Telemetry TX  (mid-left of Udara)
+box(ax, 8.85, 3.6, 2.6, 0.9, "#8E7CC3", "Telemetry TX", fontsize=9)
 
 # RC RX -> FC
-simple_arrow(ax, 11.85, 5.6, 12.2, 5.6)
+simple_arrow(ax, 11.75, 5.4, 12.1, 5.4)
 
-# Companion sub-container
-container(ax, 8.85, 0.65, 6.65, 4.1, "Companion Computer", "#fef9e7", "#d4ac0d",
+# FC -> Telemetry TX  (TELEM1, routed to the mid-left radio)
+routed_arrow(ax,
+    [(12.1, 4.6), (11.6, 4.6), (11.6, 4.05), (11.45, 4.05)],
+    label="TELEM1", label_seg=0)
+
+# Raspberry PI sub-container (iptables + Kamera + Seeker)
+container(ax, 8.85, 0.7, 6.65, 2.7, "Raspberry PI", "#fef9e7", "#d4ac0d",
           fontsize=9, zorder=1)
 
-# Kamera  (top-left of Companion)
-box(ax, 9.05, 3.0, 2.5, 1.0, "#F0C040", "Kamera", fontsize=9)
+# iptables forward  (upper-left of Pi — bridges pppd link to the X-Plane app)
+box(ax, 9.05, 1.7, 2.7, 0.9, "#16A085", "iptables\nforward", fontsize=8.5)
 
-# Seeker  (below Kamera)
-box(ax, 9.05, 1.65, 2.5, 1.0, "#E05C5C", "Seeker", fontsize=9)
+# Seeker  (upper-right of Pi, below FC)
+box(ax, 12.4, 1.7, 2.9, 0.9, "#E05C5C", "Seeker", fontsize=9)
+
+# Kamera  (below Seeker)
+box(ax, 12.4, 0.75, 2.9, 0.8, "#F0C040", "Kamera", fontsize=9)
+
+# FC <-> Seeker : UART (MAVLink) — clean vertical, right column
+simple_arrow(ax, 13.85, 4.9, 13.85, 2.6, label="UART", two_way=True, loff=(0.62, 0))
+
+# FC <-> iptables : pppd TELEM2 — routed above the Pi, dropping in left of the title
+routed_arrow(ax,
+    [(12.65, 4.9), (12.65, 3.5), (10.4, 3.5), (10.4, 2.6)],
+    label="pppd TELEM2", label_seg=0, two_way=True)
 
 # Kamera -> Seeker
-simple_arrow(ax, 10.3, 3.0, 10.3, 2.65, label="")
-
-# MAVProxy  (right of Companion)
-box(ax, 12.2, 2.1, 3.0, 1.0, "#3A9E8A", "MAVProxy", fontsize=9)
-
-# Seeker -> MAVProxy : MAVLink UDP
-simple_arrow(ax, 11.55, 2.15, 12.2, 2.35, label="MAVLink UDP", loff=(0.1, 0.12))
-
-# MAVProxy -> FC : serial  (vertical, no overlap)
-simple_arrow(ax, 13.7, 3.1, 13.7, 5.1, label="serial", loff=(0.35, 0))
+simple_arrow(ax, 13.85, 1.55, 13.85, 1.7)
 
 # ── cross-container arrows — routed to avoid overlap ─────────────────────────
 
 # 1. RC TX → RC RX : 2.4 GHz RF  (horizontal through gap, clear)
-simple_arrow(ax, 6.75, 5.6, 8.85, 5.6, label="2.4 GHz RF")
+simple_arrow(ax, 6.75, 5.4, 8.85, 5.4, label="2.4 GHz RF")
 
-# 2. FC ↔ X-Plane : pppd/Telem2 — routed via TOP lane
-#    FC top (13.85, 6.1) → up → (13.85, TOP_Y) → left → (5.1, TOP_Y) → down → XP top (5.1, 1.85)
-routed_arrow(ax,
-    [(13.85, 6.1), (13.85, TOP_Y), (5.1, TOP_Y), (5.1, 1.85)],
-    label="pppd / Telem2", label_seg=1,
-    two_way=True)
+# 2. Telemetry TX ↔ Telemetry RX : telemetry RF  (horizontal, clear band)
+simple_arrow(ax, 8.85, 4.05, 3.25, 4.05, label="telemetry RF", two_way=True)
 
-# 3. Monitor -.→ Kamera : visual — horizontal through gap at y=2.7
-#    Monitor right (6.5, 2.7) → gap → Kamera left (9.05, 3.5)
-routed_arrow(ax,
-    [(6.5, 2.7), (7.8, 2.7), (7.8, 3.5), (9.05, 3.5)],
-    label="visual", label_seg=0,
-    dashed=True)
-
-# 4. MAVProxy → QGC : WiFi — routed via BOTTOM lane
-#    MAVProxy bottom (13.7, 2.1) → down → (13.7, BOT_Y) → left → (2.0, BOT_Y) → up → QGC bottom (2.0, 0.85)
-routed_arrow(ax,
-    [(13.7, 2.1), (13.7, BOT_Y), (2.0, BOT_Y), (2.0, 0.85)],
-    label="WiFi", label_seg=1)
+# 3. iptables ↔ X-Plane : WiFi, iptables forward (X-Plane HITL data)
+#    The Raspberry Pi forwards X-Plane data to the X-Plane app on the laptop.
+simple_arrow(ax, 9.05, 2.15, 6.45, 1.9, label="WiFi · iptables", two_way=True, loff=(0, 0.22))
 
 # ── save ─────────────────────────────────────────────────────────────────────
 out = "chart_00_physical_architecture.png"

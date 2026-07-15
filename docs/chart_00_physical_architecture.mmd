@@ -6,36 +6,46 @@ flowchart LR
     subgraph DARAT["🖥️ Darat"]
         direction TB
         RCTX["🎮 RC Transmitter"]
+        TRX["📡 Telemetry RX"]
         subgraph LAPTOP["💻 Laptop"]
             direction TB
-            WEBCAM["📷 Kamera"] --> SK["Seeker\n(seekerctrl.py)"]
-            SK <-->|"MAVLink UDP\n14560"| MAVP["MAVProxy"]
-            MAVP -->|"UDP 14550"| QGC["QGroundControl"]
-            XP["X-Plane 11"] --> MON["🖥️ Monitor"]
+            QGC["QGroundControl"]
+            XP["X-Plane 11"]
         end
+        TRX -->|"MAVLink"| QGC
     end
 
-    subgraph UDARA["✈️ Udara (Simulasi HITL)"]
+    subgraph UDARA["✈️ Udara"]
         direction TB
-        FC["Flight Controller\n(Pixhawk / ArduPlane)"]
         RCRX["RC Receiver\n(SBUS)"]
-        FC --- RCRX
+        FC["Flight Controller\n(Pixhawk / ArduPlane)"]
+        TTX["📡 Telemetry TX"]
+        subgraph RPI["🍓 Raspberry PI"]
+            direction TB
+            IPT["iptables forward"]
+            WEBCAM["📷 Kamera"] --> SK["Seeker\n(seekerctrl.py)"]
+        end
+        RCRX --- FC
+        FC ---|"TELEM1"| TTX
+        FC <-->|"TELEM2\npppd"| IPT
+        FC <-->|"UART\nMAVLink"| SK
     end
 
     RCTX -->|"2.4 GHz RF"| RCRX
-    MAVP <-->|"MAVLink\npppd TELEM2\n115200 baud"| FC
-    FC <-->|"DATA@ / DREF\nPPP 10.0.0.x"| XP
+    TTX <-->|"telemetry RF"| TRX
+    IPT <-->|"WiFi\niptables forward"| XP
 
-    style DARAT    fill:#eef4fb,stroke:#2c6fad,color:#333
-    style LAPTOP   fill:#f0faf5,stroke:#1d7a68,color:#333
-    style UDARA    fill:#fff8ec,stroke:#b85c1a,color:#333
-    style RCTX     fill:#4A90D9,stroke:#2c6fad,color:#fff
-    style WEBCAM   fill:#F0C040,stroke:#c89a10,color:#333
-
-    style SK       fill:#E05C5C,stroke:#b83030,color:#fff
-    style MAVP     fill:#3A9E8A,stroke:#1d7a68,color:#fff
-    style QGC      fill:#2ECC71,stroke:#1a9e52,color:#fff
-    style XP       fill:#7B5EA7,stroke:#5a3d87,color:#fff
-    style MON      fill:#5B7FD4,stroke:#3558b0,color:#fff
-    style FC       fill:#E07B39,stroke:#b85c1a,color:#fff
-    style RCRX     fill:#5BA3E0,stroke:#2c6fad,color:#fff
+    style DARAT     fill:#eef4fb,stroke:#2c6fad,color:#333
+    style LAPTOP    fill:#f0faf5,stroke:#1d7a68,color:#333
+    style UDARA     fill:#fff8ec,stroke:#b85c1a,color:#333
+    style RPI       fill:#fef9e7,stroke:#d4ac0d,color:#333
+    style RCTX      fill:#4A90D9,stroke:#2c6fad,color:#fff
+    style TRX       fill:#8E7CC3,stroke:#5a3d87,color:#fff
+    style WEBCAM    fill:#F0C040,stroke:#c89a10,color:#333
+    style SK        fill:#E05C5C,stroke:#b83030,color:#fff
+    style IPT       fill:#16A085,stroke:#0e6b57,color:#fff
+    style QGC       fill:#2ECC71,stroke:#1a9e52,color:#fff
+    style XP        fill:#7B5EA7,stroke:#5a3d87,color:#fff
+    style FC        fill:#E07B39,stroke:#b85c1a,color:#fff
+    style RCRX      fill:#5BA3E0,stroke:#2c6fad,color:#fff
+    style TTX       fill:#8E7CC3,stroke:#5a3d87,color:#fff
