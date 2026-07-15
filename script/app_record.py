@@ -91,6 +91,28 @@ def _build_udpsrc_pipeline(port: int, codec: str) -> str:
     )
 
 
+def _resolve_crop(crop, fw: int, fh: int):
+    """Resolve (offset_x, offset_y, w, h) against a frame, clamped to bounds.
+
+    X/Y are the crop's top-left offset; W/H the size (None = 'rest of dimension
+    after the offset'). The offset is clamped into the frame and the size trimmed
+    so the window never runs off the edge."""
+    cx, cy, cw, ch = crop
+    cx = min(max(0, cx), max(0, fw - 1))
+    cy = min(max(0, cy), max(0, fh - 1))
+    cw = fw - cx if cw is None else min(cw, fw - cx)
+    ch = fh - cy if ch is None else min(ch, fh - cy)
+    return cx, cy, cw, ch
+
+
+def _apply_crop(frame, crop):
+    if crop is None:
+        return frame
+    fh, fw = frame.shape[:2]
+    cx, cy, cw, ch = _resolve_crop(crop, fw, fh)
+    return frame[cy:cy + ch, cx:cx + cw]
+
+
 def open_capture(source, w, h, flip=False):
     """Open camera source.
     - GStreamer pipeline string (contains ' ! '): uses cv2.CAP_GSTREAMER
@@ -236,9 +258,17 @@ parser.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
                     metavar="CODEC", help="Codec for --udpsrc: h264 (default) or mjpeg")
 parser.add_argument("--flip", action="store_true", default=False,
                     help="Flip frames 180 degrees. Uses libcamera Transform for Picamera2 sources.")
+parser.add_argument("--crop", type=str, nargs=4, default=None,
+                    metavar=("X", "Y", "W", "H"),
+                    help="Crop each frame to this ROI before recording "
+                         "(e.g. --crop 320 180 640 360). Use - for W or H to mean "
+                         "'rest of dimension after offset'.")
 parser.add_argument("--no-display", action="store_true", default=False,
                     help="Headless: do not open a preview window.")
 args = parser.parse_args()
+
+crop = (tuple(None if v == '-' else int(v) for v in args.crop)
+        if args.crop else None)
 
 if args.udpsrc is not None:
     source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
@@ -249,6 +279,9 @@ cap = open_capture(source, args.width, args.height, flip=args.flip)
 # Picamera2 flips in hardware (libcamera Transform); for OpenCV/GStreamer
 # sources do the 180-degree flip in software here.
 sw_flip = args.flip and not isinstance(cap, Picamera2Capture)
+if crop is not None:
+    print(f"[app_record] crop ROI (applied before recording): "
+          f"X={args.crop[0]} Y={args.crop[1]} W={args.crop[2]} H={args.crop[3]}")
 master = connect_mavlink(args.connection, args.baud)
 recorder = Recorder()
 
@@ -270,6 +303,7 @@ try:
 
         if sw_flip:
             frame = cv2.flip(frame, -1)
+        frame = _apply_crop(frame, crop)
 
         curr_time = time.time()
         frame_times.append(curr_time - prev_time)

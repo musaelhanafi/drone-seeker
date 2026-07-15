@@ -21,6 +21,8 @@ Usage:
     python3 script/app_calibrate.py --source video.mp4
     python3 script/app_calibrate.py --source 0
     python3 script/app_calibrate.py --source clip.mp4 --output my_hist.txt
+    python3 script/app_calibrate.py --udpsrc 5600                 # H.264 UDP stream
+    python3 script/app_calibrate.py --udpsrc 5600 --udpsrc-codec mjpeg
 """
 
 from __future__ import annotations
@@ -52,6 +54,26 @@ def _parse_source(value: str) -> int | str:
         return int(value)
     except ValueError:
         return value
+
+
+def _build_udpsrc_pipeline(port: int, codec: str) -> str:
+    """GStreamer pipeline receiving an RTP H.264/MJPEG stream on a UDP port.
+
+    Matches script/test_camera.py so the Seeker's stream can be calibrated with
+    the same --udpsrc/--udpsrc-codec invocation."""
+    if codec == "mjpeg":
+        return (
+            f"udpsrc port={port} "
+            "! application/x-rtp,encoding-name=JPEG "
+            "! rtpjpegdepay ! jpegdec ! videoconvert "
+            "! appsink drop=1 max-buffers=1"
+        )
+    return (
+        f"udpsrc port={port} "
+        "! application/x-rtp,payload=96 "
+        "! rtph264depay ! avdec_h264 ! videoconvert "
+        "! appsink drop=1 max-buffers=1"
+    )
 
 
 def _compute_histogram(frame_bgr: np.ndarray, rect) -> np.ndarray:
@@ -154,7 +176,14 @@ def main():
         epilog=__doc__,
     )
     ap.add_argument("--source", default="0",
-                    help="Video file path or camera index (default: 0)")
+                    help="Video file path, camera index, or GStreamer pipeline "
+                         "string (default: 0)")
+    ap.add_argument("--udpsrc", type=int, default=None, metavar="PORT",
+                    help="Receive an H.264/MJPEG stream from this UDP port "
+                         "(e.g. --udpsrc 5600). Overrides --source.")
+    ap.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
+                    metavar="CODEC",
+                    help="Codec for --udpsrc: h264 (default) or mjpeg")
     ap.add_argument("--res", type=int, nargs=2, default=None, metavar=("W", "H"),
                     help="Request this capture resolution (e.g. --res 1280 720)")
     ap.add_argument("--output", default="color_histogram.txt",
@@ -169,12 +198,27 @@ def main():
 
     crop = (tuple(None if v == '-' else int(v) for v in args.crop)
             if args.crop else None)
-    source = _parse_source(args.source)
-    is_file = isinstance(source, str)
 
-    cap = cv2.VideoCapture(source)
+    if args.udpsrc is not None:
+        source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
+    else:
+        source = _parse_source(args.source)
+
+    # A GStreamer pipeline (from --udpsrc, or a ' ! '-containing --source) is a
+    # live stream: open it on the GStreamer backend and treat it like a camera —
+    # self-paced, with no looping or frame seeking. Plain strings are files;
+    # ints are cameras.
+    is_pipeline = isinstance(source, str) and " ! " in source
+    is_file = isinstance(source, str) and not is_pipeline
+
+    cap = (cv2.VideoCapture(source, cv2.CAP_GSTREAMER) if is_pipeline
+           else cv2.VideoCapture(source))
     if not cap.isOpened():
         print(f"ERROR: cannot open source {source!r}", file=sys.stderr)
+        if is_pipeline:
+            print("  (GStreamer backend — check OpenCV was built with GStreamer "
+                  "support and a stream is being sent to the port)",
+                  file=sys.stderr)
         sys.exit(1)
     if args.res:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.res[0])

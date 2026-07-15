@@ -8,25 +8,6 @@ import os
 os.environ["MAVLINK20"] = "1"
 
 
-def _apply_thread_cap():
-    """Cap CPU threads (BLAS/OpenMP) before numpy/cv2 import to flatten peak
-    current — the Pi-5 browns out on OpenCV bursts. Honours --threads /
-    SEEKER_THREADS (read from argv here because argparse runs after import)."""
-    import sys
-    t = os.environ.get("SEEKER_THREADS")
-    for i, a in enumerate(sys.argv):
-        if a == "--threads" and i + 1 < len(sys.argv):
-            t = sys.argv[i + 1]
-        elif a.startswith("--threads="):
-            t = a.split("=", 1)[1]
-    if t:
-        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                  "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-            os.environ.setdefault(v, t)
-
-
-_apply_thread_cap()
-
 from seekerctrl import SeekerCtrl
 
 _SHIFT_ALGOS         = {"camshift", "meanshift"}
@@ -132,22 +113,6 @@ def parse_args():
         default=False,
         help="Headless: no OpenCV preview window (saves CPU/power on the drone). "
              "Also disables the histogram/mask windows.",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Cap CPU threads (OpenCV/BLAS) to N to flatten peak current and "
-             "avoid Pi-5 brownout (e.g. --threads 2). Default: uncapped.",
-    )
-    parser.add_argument(
-        "--max-fps",
-        type=float,
-        default=25.0,
-        metavar="FPS",
-        help="Cap processing rate to FPS (race-to-idle): sleeps between frames "
-             "to cut average CPU/power. Default: 25. Use 0 to disable the cap.",
     )
     parser.add_argument(
         "--tracker",
@@ -271,11 +236,6 @@ def _build_udpsrc_pipeline(port: int, codec: str) -> str:
 def main():
     args = parse_args()
 
-    if args.threads:
-        import cv2
-        cv2.setNumThreads(args.threads)
-        print(f"[main] thread cap = {args.threads} (OpenCV/BLAS)")
-
     if args.udpsrc is not None:
         source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
     else:
@@ -297,7 +257,6 @@ def main():
         show_histogram=args.histogram,
         show_mask=args.mask,
         display=not args.no_display,
-        max_fps=args.max_fps,
         debug_log=args.debug,
         profile=args.profile,
         record=args.record,
