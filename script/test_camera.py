@@ -13,7 +13,11 @@ class Picamera2Capture:
         self._h = height
         self._cam = Picamera2()
         cfg = self._cam.create_video_configuration(
-            main={"size": (self._w, self._h), "format": "BGR888"},
+            # Picamera2 format names are byte-order reversed: "RGB888" yields a
+            # B,G,R array (OpenCV BGR), "BGR888" yields R,G,B. capture_array() is
+            # fed straight to OpenCV, so use "RGB888" to get true BGR — else R/B
+            # swap and the image looks red.
+            main={"size": (self._w, self._h), "format": "RGB888"},
             transform=Transform(hflip=1, vflip=1) if flip else Transform(),
         )
         self._cam.configure(cfg)
@@ -106,6 +110,9 @@ parser.add_argument("--udpsrc", type=int, default=None, metavar="PORT",
                          "Overrides positional source.")
 parser.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
                     metavar="CODEC", help="Codec for --udpsrc: h264 (default) or mjpeg")
+parser.add_argument("--outres", type=int, nargs=2, default=None, metavar=("W", "H"),
+                    help="Scale each frame to this size (e.g. --outres 640 360); "
+                         "overrides --width/--height for the output frame.")
 parser.add_argument("--flip", action="store_true", default=False,
                     help="Flip frames 180 degrees. Uses libcamera Transform for Picamera2 sources.")
 args = parser.parse_args()
@@ -119,9 +126,9 @@ cap = open_capture(source, args.width, args.height, flip=args.flip)
 # sources do the 180-degree flip in software here.
 sw_flip = args.flip and not isinstance(cap, Picamera2Capture)
 
-newh = args.height
-neww = args.width
-print(f"display size: {neww}x{newh}")
+newh = args.outres[1] if args.outres else args.height
+neww = args.outres[0] if args.outres else args.width
+print(f"display size: {neww}x{newh}" + ("  (--outres scale)" if args.outres else ""))
 
 prev_time = time.time()
 frame_times = collections.deque(maxlen=30)

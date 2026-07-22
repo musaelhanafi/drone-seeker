@@ -23,7 +23,11 @@ class Picamera2Capture:
         self._h = height
         self._cam = Picamera2()
         cfg = self._cam.create_video_configuration(
-            main={"size": (self._w, self._h), "format": "BGR888"},
+            # Picamera2 format names are byte-order reversed vs the numpy array:
+            # "RGB888" yields a B,G,R array (OpenCV BGR), "BGR888" yields R,G,B.
+            # We feed capture_array() straight to OpenCV, so request "RGB888" to
+            # get true BGR — otherwise R/B are swapped and everything looks red.
+            main={"size": (self._w, self._h), "format": "RGB888"},
             transform=Transform(hflip=1, vflip=1) if flip else Transform(),
         )
         self._cam.configure(cfg)
@@ -70,7 +74,7 @@ _PINK_RANGES = [
 ]
 
 # Minimum contour area to accept as a valid blob (pixels²)
-_MIN_BLOB_AREA = 9
+_MIN_BLOB_AREA = 7
 
 # Normalised error threshold (±) within which the target is considered centred
 _CENTER_THRESHOLD = 0.1
@@ -88,7 +92,7 @@ def _pink_mask(hsv: np.ndarray) -> np.ndarray:
     return mask
 
 
-_MIN_EXTENT   = 0.30   # minimum contour/bbox fill ratio
+_MIN_EXTENT   = 0.15   # minimum contour/bbox fill ratio
 _MIN_SOLIDITY = 0.45   # minimum contour/convex-hull fill ratio (rejects L-shapes, noise)
 _MIN_DIM      = 3      # minimum blob width AND height in pixels
 _MAX_ASPECT   = 6.0    # maximum long/short side ratio (rejects thin slivers)
@@ -158,12 +162,31 @@ def _nearest_blob_rect(mask: np.ndarray, frame_shape=None,
 
 
 _CAL_HISTOGRAM_FILE = "color_histogram.txt"
-_GAUSS_SIGMA        = 2.0   # confidence window: ±2.0σ
+_GAUSS_SIGMA        = 2.0   # inrange/adaptive "outer" band: ±2.0σ
+_GAUSS_CONF_SIGMA   = 2.0   # gaussian back-projection (Method 1) hue window: ±2.0σ
 
 # ── Kalman filter tuning (position tracking) ──────────────────────────────────
 _KF_Q_POS    = 2.0    # process noise — position  (px^2/s)
 _KF_Q_VEL    = 80.0   # process noise — velocity  (px^2/s^3)
 _KF_R        = 30.0   # measurement noise         (px^2)
+# ── MIL scale maintenance ────────────────────────────────────────────────────
+# cv2.TrackerMIL is a FIXED-SCALE appearance classifier: the box it returns never
+# changes size from the one passed to init(). On an approach run the target grows
+# by an order of magnitude, so a box seeded at long range ends up mostly
+# background — the colour-validation gate then trips on frames where the target
+# is plainly visible. Periodically re-detect the blob nearby and re-seed MIL at
+# the correct size, which is what CamShift gets for free by re-fitting its window
+# to the colour distribution every frame.
+_MIL_RESCALE_EVERY = 10    # frames between scale checks while locked
+_MIL_RESCALE_TOL   = 0.35  # re-seed when blob-derived area differs by >35%
+
+# TrackerMIL.init() asserts !iposSamples.empty(): it samples positive patches
+# from a ring around the box, and that ring clips to nothing when the box is a
+# few pixels across or flush against the frame border. Keep every init() call
+# above this size and inside this margin.
+_MIL_MIN_WIN     = 12   # px, minimum box side handed to TrackerMIL.init()
+_MIL_EDGE_MARGIN = 4    # px, keep the box this far off the frame border
+
 _KF_MISS_MAX = 10     # predict this many frames after lock loss, then give up
                       # (~0.5-0.7 s of Kalman coast at 15-20 FPS; was 5 ≈ 0.3 s,
                       # too short to ride out brief CamShift dropouts / re-scales)
@@ -279,18 +302,34 @@ def _fit_gaussian(hist: np.ndarray) -> tuple[float, float]:
 
 
 def _confidence_hist(hist: np.ndarray, mean: float, std: float) -> np.ndarray:
-    """Return a copy of *hist* with bins outside mean ± 2.5σ zeroed.
+    """Return a copy of *hist* with bins outside mean ± _GAUSS_CONF_SIGMA·σ zeroed.
 
-    The resulting histogram carries the original hue weights for the confident
-    bins only.  Back-projecting it onto an HSV frame produces non-zero values
-    only for pixels whose hue falls within the 2.5σ confidence window.
+    Drives the gaussian back-projection method (Method 1): back-projecting it onto
+    an HSV frame produces non-zero values only for pixels whose hue falls within
+    the ±_GAUSS_CONF_SIGMA·σ (2σ) confidence window.
     """
     bins = np.arange(180, dtype=np.float32)
     diff = np.abs(bins - mean)
     diff = np.minimum(diff, 180.0 - diff)          # circular wrap
     conf = hist.flatten().copy().astype(np.float32)
-    conf[diff >= _GAUSS_SIGMA * std] = 0.0
+    conf[diff >= _GAUSS_CONF_SIGMA * std] = 0.0
     return conf.reshape(hist.shape)
+
+
+def _apply_outres(frame: np.ndarray, outres) -> np.ndarray:
+    """Scale *frame* to (w, h) from --outres.
+
+    Applied BEFORE any crop, so --crop coordinates refer to the SCALED frame.
+    Downscaling here is the cheapest way to cut detection/tracking CPU (and heat)
+    on the Pi. INTER_AREA is the right filter shrinking; INTER_LINEAR growing."""
+    if outres is None:
+        return frame
+    ow, oh = outres
+    fh, fw = frame.shape[:2]
+    if (fw, fh) == (ow, oh):
+        return frame
+    interp = cv2.INTER_AREA if (ow * oh) < (fw * fh) else cv2.INTER_LINEAR
+    return cv2.resize(frame, (ow, oh), interpolation=interp)
 
 
 class Seeker:
@@ -301,6 +340,7 @@ class Seeker:
         capture_width: int | None = None,
         capture_height: int | None = None,
         crop: tuple[int | None, int | None, int | None, int | None] | None = None,
+        outres: tuple[int, int] | None = None,
         histogram_file: str = _CAL_HISTOGRAM_FILE,
         show_histogram: bool = False,
         show_mask: bool = False,
@@ -341,6 +381,7 @@ class Seeker:
         self.capture_width   = capture_width
         self.capture_height  = capture_height
         self.crop            = crop   # (x, y, w, h) or None
+        self.outres          = outres # (w, h) to scale each frame to, or None
         self._flip           = flip
         self.display         = display
         self._show_histogram = show_histogram and display
@@ -374,6 +415,7 @@ class Seeker:
             self._roi_hist   = None
         self.cap              = None
         self._track_win       = None   # current CamShift window (x, y, w, h)
+        self._mil_frames      = 0      # frames tracked by MIL (scale-check cadence)
         self._detect_count    = 0      # consecutive successful detections
         self._res_logged      = False
         # Stage profiling (set by SeekerCtrl when --profile / --debug). track()
@@ -470,9 +512,14 @@ class Seeker:
         is_pipeline = isinstance(self.source, str) and ' ! ' in self.source
         if isinstance(self.source, str) and not is_pipeline and os.path.isfile(self.source):
             src_fps = self.cap.get(cv2.CAP_PROP_FPS)
-            if src_fps and src_fps > 0:
-                self._cap_interval = 1.0 / src_fps
-                print(f"[Seeker] Video file source — pacing playback to {src_fps:.2f} fps")
+            # Some recordings carry a bogus FPS tag (0, NaN, or thousands — e.g. a
+            # clip written before the encoder's rate stabilised). Trusting it makes
+            # the clip play flat-out. Clamp to a plausible range; fall back to 30.
+            if not (1.0 <= src_fps <= 120.0):
+                print(f"[Seeker] Video FPS tag implausible ({src_fps:.1f}) — pacing to 30 fps")
+                src_fps = 30.0
+            self._cap_interval = 1.0 / src_fps
+            print(f"[Seeker] Video file source — pacing playback to {src_fps:.2f} fps")
         # Start background capture thread so read_frame() never blocks on I/O.
         self._cap_lock  = threading.Lock()
         self._cap_stop  = False
@@ -664,6 +711,92 @@ class Seeker:
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, self._kern5)
         return mask, 1
 
+    def _search_blob_near(self, hsv, win, w_frame, h_frame):
+        """Detect the target in a padded region around *win*.
+
+        Returns a padded window (x, y, w, h) sized to the blob found there, or
+        None. Mirrors the re-acquisition search used during lock-on, so the
+        window it returns is directly comparable to an acquisition window.
+        """
+        twx, twy, tww, twh = win
+        pad = max(tww, twh, 40)
+        sx1 = max(0, twx - pad)
+        sy1 = max(0, twy - pad)
+        sx2 = min(w_frame, twx + tww + pad)
+        sy2 = min(h_frame, twy + twh + pad)
+        if sx2 - sx1 < 4 or sy2 - sy1 < 4:
+            return None
+        mask_crop, _ = self._detection_mask(hsv[sy1:sy2, sx1:sx2])
+        blob = _nearest_blob_rect(mask_crop, None, self._box_filter)
+        if blob is None:
+            return None
+        bx, by, bw, bh = blob
+        bx += sx1
+        by += sy1
+        pad2 = max(8, int(max(bw, bh) * 0.3))
+        ix = max(0, bx - pad2)
+        iy = max(0, by - pad2)
+        iw = min(w_frame - ix, bw + 2 * pad2)
+        ih = min(h_frame - iy, bh + 2 * pad2)
+        if iw < 4 or ih < 4:
+            return None
+        return (ix, iy, iw, ih)
+
+    def _roi_has_target(self, hsv_roi) -> bool:
+        """Soft colour-presence test for the MIL window.
+
+        Tests the same hue back-projection CamShift tracks on, not the strict
+        3-method detection mask. The detector is a hard binary vote that comes up
+        empty on most frames at long range, so using it to validate MIL kept
+        tearing down a perfectly good lock while CamShift sailed through on the
+        graded signal.
+        """
+        if hsv_roi.size == 0:
+            return False
+        if self._roi_hist is None:
+            mask, _ = self._detection_mask(hsv_roi)
+            return cv2.countNonZero(mask) >= _MIN_BLOB_AREA
+        bp = cv2.calcBackProject([hsv_roi], [0], self._roi_hist, [0, 180], 1)
+        return cv2.countNonZero(bp) >= _MIN_BLOB_AREA
+
+    def _mil_safe_win(self, win, w_frame: int, h_frame: int):
+        """Clamp *win* to something TrackerMIL.init() can actually sample.
+
+        cv2.TrackerMIL.init() asserts `!iposSamples.empty()`: it draws positive
+        patches from a ring around the box, and that set comes out empty when the
+        box is a few pixels across or sits flush against the frame border — the
+        sampling rectangle is then clipped to nothing. The assertion surfaces as
+        cv2.error, which is NOT a RuntimeError/ValueError, so it escapes the
+        usual tracker guards and takes the process down.
+
+        Returns a usable (x, y, w, h), or None when the frame is too small.
+        """
+        m = _MIL_EDGE_MARGIN
+        if (w_frame - 2 * m) < _MIL_MIN_WIN or (h_frame - 2 * m) < _MIL_MIN_WIN:
+            return None
+        x, y, w, h = (int(v) for v in win)
+        w = min(max(w, _MIL_MIN_WIN), w_frame - 2 * m)
+        h = min(max(h, _MIL_MIN_WIN), h_frame - 2 * m)
+        x = max(m, min(x, w_frame - m - w))
+        y = max(m, min(y, h_frame - m - h))
+        return (x, y, w, h)
+
+    def _reinit_mil(self, frame, win) -> bool:
+        """Re-seed the MIL tracker at *win*. Returns True on success."""
+        h_frame, w_frame = frame.shape[:2]
+        safe = self._mil_safe_win(win, w_frame, h_frame)
+        if safe is None:
+            return False
+        try:
+            obj = _make_tracker(self._tracker_name)
+            obj.init(frame, safe)
+        except (RuntimeError, ValueError, cv2.error) as exc:
+            print(f"[Seeker] MIL re-init failed on {safe}: {exc}")
+            return False
+        self._tracker_obj = obj
+        self._track_win   = safe
+        return True
+
     def _timed(self, attr, fn, *args):
         """Call fn(*args), adding its elapsed ms to self.<attr> when profiling.
         Returns fn's result. No timing overhead when self.profile is False."""
@@ -698,8 +831,13 @@ class Seeker:
         np.copyto(self._out_buf, frame)
         out = self._out_buf
 
-        if not self._use_camshift:
-            # ── Detection-only path (no CamShift) ─────────────────────────────
+        if not self._use_camshift and not self._tracker_name:
+            # ── Detection-only path (no tracker at all) ───────────────────────
+            # NOTE: this must NOT swallow the MIL case. '--tracker mil' parses to
+            # use_camshift=False (mil and camshift are mutually exclusive), so
+            # testing _use_camshift alone returned here every frame and the MIL
+            # step further down was unreachable — no tracker, no Kalman, no
+            # coasting, just independent per-frame detection.
             mask, _ = self._detection_mask(hsv)
             if getattr(self, "_mask_window", None):
                 cv2.imshow(self._mask_window, mask)
@@ -764,14 +902,12 @@ class Seeker:
                     self._win_w_ema = float(iw)
                     self._win_h_ema = float(ih)
                 if self._tracker_name and self._detect_count == 3:
-                    try:
-                        self._tracker_obj = _make_tracker(self._tracker_name)
-                        self._tracker_obj.init(frame, (ix, iy, iw, ih))
-                    except (RuntimeError, ValueError) as exc:
-                        print(f"[Seeker] {exc}")
-                        print("[Seeker] Falling back to CamShift.")
-                        self._tracker_name = ""
-                        self._tracker_obj  = None
+                    # Route through _reinit_mil so this path gets the same size /
+                    # border clamping and the same cv2.error guard; a tiny or
+                    # edge-hugging acquisition box would otherwise trip the
+                    # !iposSamples.empty() assertion and kill the process.
+                    if not self._reinit_mil(frame, (ix, iy, iw, ih)):
+                        self._detect_count = 2   # not locked yet — try again next frame
             else:
                 self._detect_count = 0
                 self._track_win    = None
@@ -794,10 +930,31 @@ class Seeker:
                     y  = max(0, min(y, h_frame - 1))
                     w  = min(w, w_frame - x)
                     h  = min(h, h_frame - y)
-                    roi_mask, _ = self._detection_mask(hsv[y:y + h, x:x + w])
-                    if cv2.countNonZero(roi_mask) < _MIN_BLOB_AREA:
-                        self._miss_count += 1
-                        if self._miss_count >= _KF_MISS_MAX:
+                    if not self._roi_has_target(hsv[y:y + h, x:x + w]):
+                        # MIL's window no longer holds target colour. Because MIL
+                        # is fixed-scale, the usual cause is a target that changed
+                        # size and slid out of a stale box while still plainly
+                        # visible — so try a local re-detect and re-seed MIL at the
+                        # right size before falling back to blind coasting.
+                        rewin = self._search_blob_near(
+                            hsv, self._track_win or (x, y, w, h), w_frame, h_frame)
+                        if rewin is not None and self._reinit_mil(frame, rewin):
+                            x, y, w, h = rewin
+                        else:
+                            # Genuinely nothing nearby: coast on the last good window
+                            # for up to _KF_MISS_MAX frames instead of blinking the
+                            # box off; give up only past the grace window.
+                            self._miss_count += 1
+                            if self._miss_count < _KF_MISS_MAX and self._track_win is not None:
+                                lx, ly, lw, lh = self._track_win
+                                cx = max(0, min(lx + lw // 2, w_frame - 1))
+                                cy = max(0, min(ly + lh // 2, h_frame - 1))
+                                cv2.rectangle(out, (lx, ly), (lx + lw, ly + lh), (0, 165, 255), 2)  # amber = coasting
+                                cv2.line(out, (0, cy), (w_frame, cy), (0, 165, 255), 1)
+                                cv2.line(out, (cx, 0), (cx, h_frame), (0, 165, 255), 1)
+                                cv2.circle(out, (cx, cy), 3, (0, 165, 255), -1)
+                                self._update_histogram_window()
+                                return out, cx, cy
                             self._track_win      = None
                             self._detect_count   = 0
                             self._win_w_ema      = 0.0
@@ -805,9 +962,21 @@ class Seeker:
                             self._kf_initialized = False
                             self._miss_count     = 0
                             self._tracker_obj    = None
-                        self._update_histogram_window()
-                        return out, None, None
+                            self._update_histogram_window()
+                            return out, None, None
                     self._miss_count = 0
+                    # ── Scale maintenance ───────────────────────────────────────
+                    # MIL never resizes its own box, so periodically compare it to
+                    # the blob actually present and re-seed when they diverge.
+                    self._mil_frames += 1
+                    if self._mil_frames % _MIL_RESCALE_EVERY == 0:
+                        rewin = self._search_blob_near(hsv, (x, y, w, h), w_frame, h_frame)
+                        if rewin is not None:
+                            new_area = rewin[2] * rewin[3]
+                            cur_area = max(w * h, 1)
+                            if abs(new_area - cur_area) > _MIL_RESCALE_TOL * cur_area:
+                                if self._reinit_mil(frame, rewin):
+                                    x, y, w, h = rewin
                     self._track_win = (x, y, w, h)
                     self._win_w_ema = self._EMA_ALPHA * w + (1 - self._EMA_ALPHA) * self._win_w_ema
                     self._win_h_ema = self._EMA_ALPHA * h + (1 - self._EMA_ALPHA) * self._win_h_ema
@@ -846,7 +1015,24 @@ class Seeker:
                     cv2.circle(out, (cx, cy), 3, (0, 233, 233), -1)
                     self._update_histogram_window()
                     return out, cx, cy
-            # Tracker update failed or bbox too small — hard reset
+            # Tracker update failed or bbox too small. Rather than hard-resetting on
+            # a single MIL hiccup — which forces a 3-frame color re-acquire and blinks
+            # the box — coast: hold the last known window for up to _KF_MISS_MAX frames,
+            # retrying MIL each frame (it usually re-locks within a frame or two). Only
+            # after _KF_MISS_MAX consecutive misses do we give up. Shares _miss_count
+            # with the colour-validation gate, so any good frame clears it.
+            self._miss_count += 1
+            if self._miss_count < _KF_MISS_MAX and self._track_win is not None:
+                x, y, w, h = self._track_win
+                cx = max(0, min(x + w // 2, w_frame - 1))
+                cy = max(0, min(y + h // 2, h_frame - 1))
+                cv2.rectangle(out, (x, y), (x + w, y + h), (0, 165, 255), 2)  # amber = coasting
+                cv2.line(out, (0, cy), (w_frame, cy), (0, 165, 255), 1)
+                cv2.line(out, (cx, 0), (cx, h_frame), (0, 165, 255), 1)
+                cv2.circle(out, (cx, cy), 3, (0, 165, 255), -1)
+                self._update_histogram_window()
+                return out, cx, cy
+            # Exceeded the grace window (or no last window) — give up and hard reset.
             self._track_win      = None
             self._detect_count   = 0
             self._win_w_ema      = 0.0
@@ -1101,6 +1287,8 @@ class Seeker:
             seq, ok, frame = self._cap_seq, self._cap_ok, self._cap_frame
         if frame is None:
             return 0, False, None
+        if ok:
+            frame = _apply_outres(frame, self.outres)   # scale BEFORE crop
         if ok and self.crop is not None:
             x, y, w, h = self.crop
             fh, fw = frame.shape[:2]
@@ -1112,6 +1300,7 @@ class Seeker:
         if ok and not self._res_logged:
             fh, fw = frame.shape[:2]
             print(f"[Seeker] Resolution: {fw}x{fh}"
+                  + (f"  (scaled to {self.outres[0]}x{self.outres[1]})" if self.outres else "")
                   + (f"  (cropped from raw, offset {self.crop[:2]})" if self.crop else ""))
             self._res_logged = True
         return seq, ok, frame

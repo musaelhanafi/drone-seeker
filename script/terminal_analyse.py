@@ -144,6 +144,44 @@ def find_nearest_dist(d: dict) -> tuple[int, float]:
     return _find_min_col(d, "dist_m")
 
 
+def find_pre_impact_idx(d: dict, nearest_idx: int,
+                        decel_thresh: float = 20.0,
+                        drop_frac: float = 0.35,
+                        min_drop: float = 2.0) -> int:
+    """Index of the last valid sample before the impact deceleration.
+
+    The nearest-distance row often falls *after* the impact: by that row the
+    simulator has already stopped the aircraft — groundspeed collapses from
+    ~28 m/s to nearly zero within one or two samples.  Reading speed there
+    under-reports the real approach speed.
+
+    Scans forward from the groundspeed peak over consecutive valid samples
+    (groundspeed 0.0 rows are telemetry dropouts and skipped).  Impact is the
+    first consecutive-pair drop of at least min_drop (m/s) that is either
+    steeper than decel_thresh (m/s²) or larger than drop_frac of the previous
+    speed — far beyond what aerodynamic braking can produce.  Two criteria are
+    needed because sample gaps stretch near the end of a run: a short gap makes
+    the rate huge but the fraction small, while a gap spanning the impact
+    dilutes the rate but not the fraction.  The sample before the drop is
+    returned.  If no such collapse exists the nearest row itself was sampled
+    pre-impact and is returned unchanged.
+    """
+    gs = d["groundspeed_ms"][:nearest_idx + 1]
+    ts = d["timestamp_s"]
+    valid = [i for i in range(len(gs)) if np.isfinite(gs[i]) and gs[i] > 0.0]
+    if not valid:
+        return nearest_idx
+    peak_pos = max(range(len(valid)), key=lambda p: gs[valid[p]])
+    for p in range(peak_pos, len(valid) - 1):
+        i_prev, i_cur = valid[p], valid[p + 1]
+        drop = gs[i_prev] - gs[i_cur]
+        dt = ts[i_cur] - ts[i_prev]
+        if drop >= min_drop and ((dt > 0 and drop / dt > decel_thresh)
+                                 or drop > drop_frac * gs[i_prev]):
+            return i_prev
+    return valid[-1]
+
+
 # ── Terminal output ───────────────────────────────────────────────────────────
 
 def print_summary(d: dict, first_lock_idx: int | None, nearest_idx: int | None = None):
@@ -156,8 +194,15 @@ def print_summary(d: dict, first_lock_idx: int | None, nearest_idx: int | None =
     pct_locked   = 100.0 * locked   / n if n else 0.0
     pct_unlocked = 100.0 * unlocked / n if n else 0.0
 
+    # Wall-clock FPS from frame timestamps — matches the rate shown on the
+    # HUD.  (The [PROF] blocks in the pipeline log report processing
+    # throughput only: the profiler resets its clock every loop iteration,
+    # discarding time spent waiting for the camera, so its FPS reads high.)
+    mean_fps = (n - 1) / dur if dur > 0 else 0.0
+
     print(f"\n{'─'*55}")
     print(f"  File duration   : {dur:.1f} s  ({n} rows)")
+    print(f"  Mean FPS        : {mean_fps:.1f}  (wall-clock, from timestamps)")
     print(f"  Target locked   : {locked} rows  ({pct_locked:.1f}%)")
     print(f"  Track lost      : {unlocked} rows  ({pct_unlocked:.1f}%)")
 
@@ -176,13 +221,17 @@ def print_summary(d: dict, first_lock_idx: int | None, nearest_idx: int | None =
     # ── Hit / nearest point ───────────────────────────────────────────────────
     if nearest_idx is not None:
         hit_dist  = float(d["dist_m"][nearest_idx])
-        hit_spd   = float(d["groundspeed_ms"][nearest_idx])
         hit_alt   = float(d["alt_rel_m"][nearest_idx])
         hit_t     = float(d["timestamp_s"][nearest_idx])
+        spd_idx   = find_pre_impact_idx(d, nearest_idx)
+        hit_spd   = float(d["groundspeed_ms"][spd_idx])
+        spd_t     = float(d["timestamp_s"][spd_idx])
         print(f"\n  ── Nearest point (hit) ──")
         print(f"  Time            : t+{hit_t - t0:.1f} s")
         print(f"  Distance        : {hit_dist:.1f} m")
-        print(f"  Speed at hit    : {hit_spd * 3.6:.1f} km/h  ({hit_spd:.1f} m/s)")
+        note = "" if spd_idx == nearest_idx else \
+               f"  [pre-impact sample t+{spd_t - t0:.1f} s]"
+        print(f"  Speed at hit    : {hit_spd * 3.6:.1f} km/h  ({hit_spd:.1f} m/s){note}")
         print(f"  Alt at hit      : {hit_alt:.1f} m")
 
     # ── Descent rate ──────────────────────────────────────────────────────────

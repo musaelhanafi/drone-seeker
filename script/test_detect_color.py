@@ -124,6 +124,9 @@ def parse_args():
                         help="Codec for --udpsrc: h264 (default) or mjpeg.")
     parser.add_argument("--res", type=int, nargs=2, default=None, metavar=("W", "H"),
                         help="Request this capture resolution (e.g. --res 1280 720)")
+    parser.add_argument("--outres", type=int, nargs=2, default=None, metavar=("W", "H"),
+                        help="Scale each frame to this size (e.g. --outres 640 360). "
+                             "Applied BEFORE --crop; downscaling cuts CPU/heat.")
     parser.add_argument("--histogram", action="store_true", default=False,
                         help="Show the calibration histogram in a separate window")
     parser.add_argument("--mask", action="store_true", default=False,
@@ -247,6 +250,7 @@ def main():
         capture_width=args.res[0] if args.res else None,
         capture_height=args.res[1] if args.res else None,
         crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,
+        outres=tuple(args.outres) if args.outres else None,
         show_histogram=args.histogram,
         show_mask=args.mask,
         mask_algo=args.mask_algo,

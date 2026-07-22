@@ -147,6 +147,19 @@ def _apply_crop(frame: np.ndarray, crop):
     return frame[cy:cy + ch, cx:cx + cw]
 
 
+def _apply_outres(frame, outres):
+    """Scale *frame* to (w, h) from --outres. Applied BEFORE crop, so --crop
+    coords refer to the SCALED frame. INTER_AREA shrinking, INTER_LINEAR growing."""
+    if outres is None:
+        return frame
+    ow, oh = outres
+    fh, fw = frame.shape[:2]
+    if (fw, fh) == (ow, oh):
+        return frame
+    interp = cv2.INTER_AREA if (ow * oh) < (fw * fh) else cv2.INTER_LINEAR
+    return cv2.resize(frame, (ow, oh), interpolation=interp)
+
+
 def _draw_hud(display: np.ndarray, paused: bool, rect, output: str):
     h = display.shape[0]
     if paused:
@@ -188,6 +201,9 @@ def main():
                     help="Request this capture resolution (e.g. --res 1280 720)")
     ap.add_argument("--output", default="color_histogram.txt",
                     help="Output histogram file (default: color_histogram.txt)")
+    ap.add_argument("--outres", type=int, nargs=2, default=None, metavar=("W", "H"),
+                    help="Scale each frame to this size (e.g. --outres 640 360). "
+                         "Applied BEFORE --crop; downscaling cuts CPU/heat.")
     ap.add_argument("--crop", type=str, nargs=4, default=None,
                     metavar=("X", "Y", "W", "H"),
                     help="Crop each frame to this ROI (e.g. --crop 320 180 640 360). "
@@ -198,6 +214,7 @@ def main():
 
     crop = (tuple(None if v == '-' else int(v) for v in args.crop)
             if args.crop else None)
+    outres = tuple(args.outres) if args.outres else None
 
     if args.udpsrc is not None:
         source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
@@ -211,8 +228,24 @@ def main():
     is_pipeline = isinstance(source, str) and " ! " in source
     is_file = isinstance(source, str) and not is_pipeline
 
-    cap = (cv2.VideoCapture(source, cv2.CAP_GSTREAMER) if is_pipeline
-           else cv2.VideoCapture(source))
+    if isinstance(source, int):
+        # Pi CSI cameras (IMX477 etc.) are libcamera devices, not V4L2 capture
+        # devices — cv2.VideoCapture(int) fails ("v4l2src: Failed to allocate
+        # required memory"). Use Picamera2 for integer sources like the other
+        # tools (seeker.py / test_camera.py / app_record.py); fall back to OpenCV
+        # for a plain USB/UVC webcam if Picamera2 isn't available.
+        rw, rh = (tuple(args.res) if args.res else (1280, 720))
+        try:
+            from seeker import Picamera2Capture
+            cap = Picamera2Capture(rw, rh, flip=False)   # --flip handled in the loop
+            print(f"[Cal] Using Picamera2 backend  {rw}x{rh}")
+        except Exception as e:
+            print(f"[Cal] Picamera2 unavailable ({e}); trying OpenCV V4L2")
+            cap = cv2.VideoCapture(source)
+    elif is_pipeline:
+        cap = cv2.VideoCapture(source, cv2.CAP_GSTREAMER)
+    else:
+        cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f"ERROR: cannot open source {source!r}", file=sys.stderr)
         if is_pipeline:
@@ -228,6 +261,11 @@ def main():
     # snappy 1 ms wait for them. waitKey doubles as both the frame delay and the
     # key reader, so playback speed is "real time" without a separate sleep.
     fps = cap.get(cv2.CAP_PROP_FPS) if is_file else 0.0
+    # Some recordings carry a bogus FPS tag (0, NaN, or thousands); clamp it to a
+    # plausible range so a file plays at a watchable pace, not flat-out (default 30).
+    if is_file and not (1.0 <= fps <= 120.0):
+        print(f"[Cal] Video FPS tag implausible ({fps:.1f}) — pacing to 30 fps")
+        fps = 30.0
     play_delay = max(1, int(round(1000.0 / fps))) if fps and fps > 0 else 1
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -265,6 +303,7 @@ def main():
                 break
             if args.flip:
                 frame = cv2.flip(frame, -1)
+            frame = _apply_outres(frame, outres)   # scale BEFORE crop
             frame = _apply_crop(frame, crop)
             current = frame
             rect = None   # selection only meaningful on a frozen frame

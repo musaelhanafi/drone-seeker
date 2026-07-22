@@ -94,6 +94,16 @@ def parse_args():
         metavar=("W", "H"),
         help="Request this capture resolution from the camera (e.g. --capture-res 1280 720)",
     )
+    parser.add_argument(
+        "--outres",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("W", "H"),
+        help="Scale each captured frame to this size (e.g. --outres 640 360). "
+             "Applied BEFORE --crop, so crop coords refer to the scaled frame. "
+             "Downscaling cuts detection/tracking CPU (and heat).",
+    )
 
     parser.add_argument(
         "--histogram",
@@ -254,6 +264,7 @@ def main():
         capture_width=args.res[0] if args.res else None,
         capture_height=args.res[1] if args.res else None,
         crop=tuple(None if v == '-' else int(v) for v in args.crop) if args.crop else None,
+        outres=tuple(args.outres) if args.outres else None,
         show_histogram=args.histogram,
         show_mask=args.mask,
         display=not args.no_display,

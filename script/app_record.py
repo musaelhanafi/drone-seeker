@@ -13,6 +13,7 @@ stops the recording; moving it back in starts a fresh file.
 Examples:
   python3 app_record.py --udpsrc 5600
   python3 app_record.py 0 --connection /dev/ttyAMA0 --baud 921600
+  python3 app_record.py --udpsrc 5600 --record   # always record, ignore ch6 (no MAVLink)
 """
 
 import argparse
@@ -20,6 +21,7 @@ import collections
 import datetime
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -32,6 +34,11 @@ from pymavlink import mavutil
 CH6_MID_LOW  = 1400
 CH6_MID_HIGH = 1700
 
+# Min frame-interval samples before trusting the measured fps for the recording
+# tag. The first interval includes camera/pipeline startup (~0.8 s); without a
+# warm-up the recorder gets tagged at a garbage rate (e.g. 1.3 fps → plays 23× slow).
+_FPS_WARMUP = 8
+
 
 class Picamera2Capture:
     """cv2.VideoCapture drop-in using picamera2/libcamera (RPi CSI camera)."""
@@ -42,7 +49,11 @@ class Picamera2Capture:
         self._h = height
         self._cam = Picamera2()
         cfg = self._cam.create_video_configuration(
-            main={"size": (self._w, self._h), "format": "BGR888"},
+            # Picamera2 format names are byte-order reversed: "RGB888" yields a
+            # B,G,R array (OpenCV BGR), "BGR888" yields R,G,B. capture_array() is
+            # fed straight to OpenCV, so use "RGB888" to get true BGR — else R/B
+            # swap and the image looks red.
+            main={"size": (self._w, self._h), "format": "RGB888"},
             transform=Transform(hflip=1, vflip=1) if flip else Transform(),
         )
         self._cam.configure(cfg)
@@ -111,6 +122,19 @@ def _apply_crop(frame, crop):
     fh, fw = frame.shape[:2]
     cx, cy, cw, ch = _resolve_crop(crop, fw, fh)
     return frame[cy:cy + ch, cx:cx + cw]
+
+
+def _apply_outres(frame, outres):
+    """Scale *frame* to (w, h) from --outres. Applied BEFORE crop, so --crop
+    coords refer to the SCALED frame. INTER_AREA shrinking, INTER_LINEAR growing."""
+    if outres is None:
+        return frame
+    ow, oh = outres
+    fh, fw = frame.shape[:2]
+    if (fw, fh) == (ow, oh):
+        return frame
+    interp = cv2.INTER_AREA if (ow * oh) < (fw * fh) else cv2.INTER_LINEAR
+    return cv2.resize(frame, (ow, oh), interpolation=interp)
 
 
 def open_capture(source, w, h, flip=False):
@@ -258,6 +282,9 @@ parser.add_argument("--udpsrc-codec", default="h264", choices=["h264", "mjpeg"],
                     metavar="CODEC", help="Codec for --udpsrc: h264 (default) or mjpeg")
 parser.add_argument("--flip", action="store_true", default=False,
                     help="Flip frames 180 degrees. Uses libcamera Transform for Picamera2 sources.")
+parser.add_argument("--outres", type=int, nargs=2, default=None, metavar=("W", "H"),
+                    help="Scale each frame to this size (e.g. --outres 640 360). "
+                         "Applied BEFORE --crop; downscaling cuts CPU/heat.")
 parser.add_argument("--crop", type=str, nargs=4, default=None,
                     metavar=("X", "Y", "W", "H"),
                     help="Crop each frame to this ROI before recording "
@@ -265,10 +292,14 @@ parser.add_argument("--crop", type=str, nargs=4, default=None,
                          "'rest of dimension after offset'.")
 parser.add_argument("--no-display", action="store_true", default=False,
                     help="Headless: do not open a preview window.")
+parser.add_argument("--record", action="store_true", default=False,
+                    help="Always record, ignoring the RC ch6 gating (recording starts "
+                         "immediately and never stops). Skips the MAVLink connection.")
 args = parser.parse_args()
 
 crop = (tuple(None if v == '-' else int(v) for v in args.crop)
         if args.crop else None)
+outres = tuple(args.outres) if args.outres else None
 
 if args.udpsrc is not None:
     source = _build_udpsrc_pipeline(args.udpsrc, args.udpsrc_codec)
@@ -282,7 +313,11 @@ sw_flip = args.flip and not isinstance(cap, Picamera2Capture)
 if crop is not None:
     print(f"[app_record] crop ROI (applied before recording): "
           f"X={args.crop[0]} Y={args.crop[1]} W={args.crop[2]} H={args.crop[3]}")
-master = connect_mavlink(args.connection, args.baud)
+if args.record:
+    print("[app_record] --record: always recording, ignoring RC ch6 (no MAVLink).")
+    master = None
+else:
+    master = connect_mavlink(args.connection, args.baud)
 recorder = Recorder()
 
 show = not args.no_display
@@ -303,20 +338,35 @@ try:
 
         if sw_flip:
             frame = cv2.flip(frame, -1)
+        frame = _apply_outres(frame, outres)   # scale BEFORE crop
         frame = _apply_crop(frame, crop)
 
         curr_time = time.time()
         frame_times.append(curr_time - prev_time)
         prev_time = curr_time
-        fps = 1.0 / (sum(frame_times) / len(frame_times))
+        # Median interval → robust to the startup/stall outliers that skew a mean.
+        _med = statistics.median(frame_times)
+        fps = 1.0 / _med if _med > 0 else 0.0
 
-        ch6_pwm = poll_ch6(master, ch6_pwm)
-        in_middle = CH6_MID_LOW <= ch6_pwm < CH6_MID_HIGH
+        if args.record:
+            in_middle = True          # --record: always on, ch6 ignored
+        else:
+            ch6_pwm = poll_ch6(master, ch6_pwm)
+            in_middle = CH6_MID_LOW <= ch6_pwm < CH6_MID_HIGH
 
-        # Edge-trigger the recorder on the ch6 middle band.
+        # Edge-trigger the recorder on the ch6 middle band (or force-on with --record).
         if in_middle and not recorder.active:
-            rec_fps = args.fps if args.fps else max(1.0, fps)
-            recorder.start(frame.shape, rec_fps)
+            # Robust rec_fps: explicit --fps wins; else the median-based fps once we
+            # have enough samples, clamped to a plausible range (default 30). Until
+            # warmed up, defer the start (drops a few frames) rather than tag garbage.
+            if args.fps:
+                rec_fps = float(args.fps)
+            elif len(frame_times) >= _FPS_WARMUP:
+                rec_fps = fps if 1.0 <= fps <= 120.0 else 30.0
+            else:
+                rec_fps = None
+            if rec_fps is not None:
+                recorder.start(frame.shape, rec_fps)
         elif not in_middle and recorder.active:
             recorder.stop()
 
@@ -327,7 +377,8 @@ try:
             disp = frame.copy()
             status = "REC" if recorder.active else "idle"
             color  = (0, 0, 255) if recorder.active else (0, 255, 0)
-            cv2.putText(disp, f"FPS:{fps:.1f}  ch6:{ch6_pwm}  {status}",
+            gate   = "ch6:off" if args.record else f"ch6:{ch6_pwm}"
+            cv2.putText(disp, f"FPS:{fps:.1f}  {gate}  {status}",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             if recorder.active:
                 cv2.circle(disp, (disp.shape[1] - 30, 30), 10, (0, 0, 255), -1)

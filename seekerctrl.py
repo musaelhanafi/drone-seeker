@@ -111,6 +111,7 @@ class SeekerCtrl:
         capture_width: int | None = None,
         capture_height: int | None = None,
         crop: tuple[int | None, int | None, int | None, int | None] | None = None,
+        outres: tuple[int, int] | None = None,
         show_histogram: bool = False,
         show_mask: bool = False,
         display: bool = True,
@@ -185,6 +186,8 @@ class SeekerCtrl:
         self._prev_ch6_on       = False   # previous ch6 armed state for edge detection
         self._prev_ch6_force_on = False   # previous ch6 force-active state for rising-edge detection
         self._commanded_mode = -1      # last custom_mode we sent a command for
+        self._mode_cmd_t     = 0.0     # monotonic time that command went out
+        self._mode_confirmed = False   # FC acknowledged/adopted the commanded mode
         self._wp_takeoff_sent = False  # WP-0 reset sent only once at startup
         self._armed           = False  # True when FC reports MAV_MODE_FLAG_SAFETY_ARMED
 
@@ -265,6 +268,7 @@ class SeekerCtrl:
                              capture_width=capture_width,
                              capture_height=capture_height,
                              crop=crop,
+                             outres=outres,
                              show_histogram=show_histogram,
                              show_mask=show_mask,
                              display=display,
@@ -299,11 +303,7 @@ class SeekerCtrl:
         self.master = mavutil.mavlink_connection(
             self.connection_string, baud=self.baud
         )
-        self.master.wait_heartbeat()
-        print(
-            f"Heartbeat received (system {self.master.target_system}, "
-            f"component {self.master.target_component})"
-        )
+        self._wait_autopilot_heartbeat()
         self.master.mav.rc_channels_override_send(
             self.master.target_system,
             self.master.target_component,
@@ -315,6 +315,49 @@ class SeekerCtrl:
         self._request_data_streams()
         self._fetch_tracking_params()
         self._fetch_mission_count()
+
+    _HB_WAIT_TIMEOUT = 30.0
+
+    def _wait_autopilot_heartbeat(self, timeout: float = _HB_WAIT_TIMEOUT):
+        """Wait for a heartbeat from the AUTOPILOT, ignoring other MAVLink talkers.
+
+        A shared telemetry link carries heartbeats from everything else on it —
+        Mission Planner, MAVProxy, a companion script. pymavlink's
+        wait_heartbeat() accepts whichever heartbeat arrives first and points
+        target_system/target_component at its sender, so latching onto a GCS
+        leaves every later param and mission request addressed to a peer that
+        never replies. The connect looks successful and then init dies on
+        timeouts. Observed on this airframe: the autopilot sends as (1, 1) while
+        a GCS sends as (255, 190) on the same serial link.
+
+        Accept only a sender that reports a real autopilot (not
+        MAV_AUTOPILOT_INVALID) and is not a GCS.
+        """
+        deadline = time.monotonic() + timeout
+        ignored: set = set()
+        while time.monotonic() < deadline:
+            hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
+            if hb is None:
+                continue
+            sysid, compid = hb.get_srcSystem(), hb.get_srcComponent()
+            if (sysid == 0
+                    or hb.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                    or hb.type == mavutil.mavlink.MAV_TYPE_GCS):
+                if (sysid, compid) not in ignored:
+                    ignored.add((sysid, compid))
+                    print(f"[MAV] Ignoring non-autopilot heartbeat from "
+                          f"system {sysid}, component {compid} "
+                          f"(type={hb.type}, autopilot={hb.autopilot})")
+                continue
+            self.master.target_system    = sysid
+            self.master.target_component = compid
+            print(f"Heartbeat received (system {sysid}, component {compid})")
+            return hb
+        raise RuntimeError(
+            f"No autopilot heartbeat on {self.connection_string} within "
+            f"{timeout:.0f}s. Heard from: "
+            f"{sorted(ignored) if ignored else 'nothing at all'}. "
+            f"Check the serial port, the baud rate, and that the FC is powered.")
 
     # ── Parameter fetch ───────────────────────────────────────────────────────
 
@@ -333,28 +376,46 @@ class SeekerCtrl:
         "SERVO4_MAX":       "_srv4_max",
     }
 
+    _PARAM_ROUNDS      = 4     # request attempts before giving up on a parameter
+    _PARAM_ROUND_WAIT  = 2.0   # seconds to listen after each round
+
     def _fetch_tracking_params(self):
-        """Request TRK_TGT_ALT/LAT/LON from ArduPlane and wait for replies."""
-        for name in self._TRACKED_PARAMS:
-            self.master.mav.param_request_read_send(
-                self.master.target_system,
-                self.master.target_component,
-                name.encode(),
-                -1,   # -1 = lookup by name
-            )
-        # Collect replies with a short timeout; fall back to defaults if absent.
+        """Request the tracking/servo parameters from ArduPlane and wait for replies.
+
+        Re-requests whatever is still missing after each listening round rather
+        than firing all twelve reads once and accepting whatever arrives inside a
+        single short window. On a 57600 telemetry link already carrying the
+        normal stream load, PARAM_VALUE replies queue behind that traffic and a
+        one-shot request loses a different, essentially random subset every run —
+        which then silently degrades to defaults for target lat/lon and servo
+        limits.
+        """
         remaining = set(self._TRACKED_PARAMS)
-        deadline  = time.monotonic() + 2.0
-        while remaining and time.monotonic() < deadline:
-            msg = self.master.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.2)
-            if msg is None:
-                continue
-            pname = msg.param_id.rstrip("\x00")
-            if pname in remaining:
-                setattr(self, self._TRACKED_PARAMS[pname], msg.param_value)
-                remaining.discard(pname)
-                print(f"[Param] {pname} = {msg.param_value}")
-        for pname in remaining:
+        for attempt in range(1, self._PARAM_ROUNDS + 1):
+            for name in sorted(remaining):
+                self.master.mav.param_request_read_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    name.encode(),
+                    -1,   # -1 = lookup by name
+                )
+            deadline = time.monotonic() + self._PARAM_ROUND_WAIT
+            while remaining and time.monotonic() < deadline:
+                msg = self.master.recv_match(type="PARAM_VALUE", blocking=True,
+                                             timeout=0.2)
+                if msg is None:
+                    continue
+                pname = msg.param_id.rstrip("\x00")
+                if pname in remaining:
+                    setattr(self, self._TRACKED_PARAMS[pname], msg.param_value)
+                    remaining.discard(pname)
+                    print(f"[Param] {pname} = {msg.param_value}")
+            if not remaining:
+                break
+            if attempt < self._PARAM_ROUNDS:
+                print(f"[Param] retry {attempt}/{self._PARAM_ROUNDS - 1} for "
+                      f"{len(remaining)} missing: {', '.join(sorted(remaining))}")
+        for pname in sorted(remaining):
             print(f"[Param] {pname} not received — using default")
         self.seeker.pitch_offset_norm = self._pitch_offset / _TRK_MAX_DEG
 
@@ -666,11 +727,66 @@ class SeekerCtrl:
 
     # ── Flight mode ───────────────────────────────────────────────────────────
 
-    def _set_mode(self, custom_mode: int, label: str):
+    _MODE_CMD_RETRIES = 3      # send attempts per mode change
+    _MODE_ACK_WAIT    = 0.3    # seconds to wait for COMMAND_ACK per attempt
+    _MODE_VERIFY_S    = 1.5    # re-send if the FC has not adopted the mode by then
+
+    def _set_mode(self, custom_mode: int, label: str) -> bool:
+        """Command a flight mode, retrying until the FC confirms it.
+
+        Returns True once the mode is acknowledged or observed on the FC.
+
+        DO_SET_MODE used to be fire-and-forget: it latched _commanded_mode before
+        knowing whether the command landed, so a dropped or rejected command was
+        never retried — the code believed it had already switched. That is how a
+        TRACKING request could silently do nothing. Now the command is retried,
+        the COMMAND_ACK is checked, and the FC's reported mode is verified; the
+        caller can act on the result instead of assuming success.
+        """
         if self._commanded_mode == custom_mode:
-            return
+            if self._mode_confirmed or self._flight_mode == label:
+                self._mode_confirmed = True
+                return True
+            # Commanded but not adopted — give the FC a moment, then re-send.
+            if time.monotonic() - self._mode_cmd_t < self._MODE_VERIFY_S:
+                return False
+            print(f"[MODE] {label} not applied (FC reports "
+                  f"{self._flight_mode or '?'}) — re-sending")
+
         self._commanded_mode = custom_mode
+        self._mode_confirmed = False
         print(f"[MODE] → {label} ({custom_mode})")
+
+        for attempt in range(1, self._MODE_CMD_RETRIES + 1):
+            self._send_set_mode(custom_mode)
+            self._mode_cmd_t = time.monotonic()
+            if self._await_mode_ack(label, attempt):
+                self._mode_confirmed = True
+                return True
+        print(f"[MODE] {label}: no acknowledgement after "
+              f"{self._MODE_CMD_RETRIES} attempts — will retry from the loop")
+        return False
+
+    def _await_mode_ack(self, label: str, attempt: int) -> bool:
+        """Wait briefly for COMMAND_ACK to DO_SET_MODE (or the mode itself)."""
+        deadline = time.monotonic() + self._MODE_ACK_WAIT
+        while time.monotonic() < deadline:
+            ack = self.master.recv_match(type="COMMAND_ACK", blocking=True,
+                                         timeout=self._MODE_ACK_WAIT)
+            if ack is None:
+                break
+            if ack.command != mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                continue
+            if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                return True
+            print(f"[MODE] {label}: FC rejected DO_SET_MODE "
+                  f"(result={ack.result}, attempt {attempt}/{self._MODE_CMD_RETRIES})")
+            return False
+        # No ACK — some setups do not ack DO_SET_MODE. Fall back to observing
+        # the heartbeat, which is the outcome we actually care about.
+        return self._flight_mode == label
+
+    def _send_set_mode(self, custom_mode: int):
 
         # PX4 and ArduPilot disagree on how MAV_CMD_DO_SET_MODE is encoded:
         #   - ArduPilot: param2 = the full custom_mode integer (e.g. 10 = AUTO,
@@ -706,11 +822,11 @@ class SeekerCtrl:
                 0, 0, 0, 0, 0,
             )
 
-    def set_mode_tracking(self):
+    def set_mode_tracking(self) -> bool:
         # AC TRACKING (custom_mode 27) → PX4 AUTO_EXTERNAL1 (main 4 sub 11)
         # under --px4. PX4's fw_tracking module activates on the corresponding
         # NAVIGATION_STATE_EXTERNAL1 nav_state.
-        self._set_mode(self._tracking_mode, self._tracking_label)
+        return self._set_mode(self._tracking_mode, self._tracking_label)
 
     def set_mode_loiter(self):
         self._set_mode(_LOITER_MODE, "LOITER")
@@ -728,7 +844,17 @@ class SeekerCtrl:
 
     def set_mode_auto(self):
         if not self._wp_takeoff_sent:
-            self._force_wp_takeoff()
+            # Rewinding to WP 0 is a PRE-FLIGHT action (makes ArduPlane run the
+            # takeoff waypoint). Only do it while DISARMED. If we are already
+            # armed — e.g. the seeker was power-cycled/restarted mid-flight, so
+            # _wp_takeoff_sent is False again — rewinding would abandon the
+            # mission and fly back to the takeoff WP. Airborne we must keep
+            # flying the waypoint the FC is already on.
+            if not self._armed:
+                self._force_wp_takeoff()
+            else:
+                print("[MODE] armed — skipping WP-0 rewind, continuing "
+                      f"current waypoint ({self._current_wp})")
             self._wp_takeoff_sent = True
         self._set_mode(self._auto_mode, self._auto_label)
 
@@ -897,8 +1023,9 @@ class SeekerCtrl:
                     # and within close-enough range.
                     if (in_auto and on_last_wp and close_enough and
                             target_locked and not self._in_tracking):
-                        self.set_mode_tracking()
-                        self._in_tracking = True
+                        # Only latch on success — a failed command must be retried
+                        # on the next pass, not silently treated as "tracking".
+                        self._in_tracking = self.set_mode_tracking()
                     elif ch6_fell and self._in_tracking:
                         self._in_tracking = False
                         self.set_mode_stabilize()
@@ -921,8 +1048,7 @@ class SeekerCtrl:
                         self._in_tracking = False
                         self.set_mode_auto()
                     elif ch6_on and target_locked and not self._in_tracking:
-                        self.set_mode_tracking()
-                        self._in_tracking = True
+                        self._in_tracking = self.set_mode_tracking()
 
                 self._prev_ch6_on       = ch6_on
                 self._prev_ch6_force_on = self._ch6_force_active()
