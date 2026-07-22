@@ -39,7 +39,7 @@ from seeker import Seeker           # noqa: E402
 from recorder import VideoRecorder  # noqa: E402
 
 _SHIFT_ALGOS         = {"camshift", "meanshift"}
-_APPEARANCE_TRACKERS = {"mil"}
+_APPEARANCE_TRACKERS = {"mil", "kcf"}
 
 
 def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
@@ -48,12 +48,15 @@ def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
     Tokens (comma-separated):
       camshift / meanshift  — shift-based tracker variant (mutually exclusive)
       kalman                — enable Kalman filter
-      mil                   — MIL appearance tracker (mutually exclusive with shift)
+      mil / kcf             — appearance tracker (mutually exclusive with each
+                              other AND with shift). KCF is ~5–10× faster than
+                              MIL on typical footage but weaker on scale change.
     Examples:
       camshift,kalman   → CamShift + Kalman  (default)
       meanshift,kalman  → MeanShift + Kalman
       mil               → MIL tracker, no Kalman
       mil,kalman        → MIL tracker + Kalman
+      kcf,kalman        → KCF tracker + Kalman  (fastest appearance path)
     """
     tokens = {t.strip().lower() for t in value.split(",") if t.strip()}
     _VALID = {"kalman"} | _SHIFT_ALGOS | _APPEARANCE_TRACKERS
@@ -61,20 +64,27 @@ def _parse_tracker_opt(value: str) -> tuple[bool, str, bool, str]:
     if unknown:
         raise argparse.ArgumentTypeError(
             f"Unknown tracker token(s): {', '.join(sorted(unknown))}. "
-            f"Valid: kalman, {', '.join(sorted(_SHIFT_ALGOS))}, mil"
+            f"Valid: kalman, {', '.join(sorted(_SHIFT_ALGOS))}, "
+            f"{', '.join(sorted(_APPEARANCE_TRACKERS))}"
         )
     shift = tokens & _SHIFT_ALGOS
     if len(shift) > 1:
         raise argparse.ArgumentTypeError(
             "Cannot combine 'camshift' and 'meanshift' — they are mutually exclusive."
         )
-    tracker_name = "mil" if "mil" in tokens else ""
+    appearance = tokens & _APPEARANCE_TRACKERS
+    if len(appearance) > 1:
+        raise argparse.ArgumentTypeError(
+            f"Cannot combine {' and '.join(repr(t) for t in sorted(appearance))} "
+            f"— appearance trackers are mutually exclusive."
+        )
+    tracker_name = next(iter(appearance), "")
     shift_algo   = next(iter(shift), "camshift")
     use_camshift = bool(shift) and not tracker_name
     use_kalman   = "kalman" in tokens
     if tracker_name and shift:
         raise argparse.ArgumentTypeError(
-            f"Cannot combine 'mil' with '{shift_algo}' — they are mutually exclusive."
+            f"Cannot combine '{tracker_name}' with '{shift_algo}' — they are mutually exclusive."
         )
     return use_camshift, shift_algo, use_kalman, tracker_name
 

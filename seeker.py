@@ -192,30 +192,45 @@ _KF_MISS_MAX = 10     # predict this many frames after lock loss, then give up
                       # too short to ride out brief CamShift dropouts / re-scales)
 
 
+_TRACKER_CV_NAME = {
+    "mil": "TrackerMIL",
+    "kcf": "TrackerKCF",
+}
+
+
 def _make_tracker(name: str):
-    """Create a cv2 MIL tracker.
+    """Create an OpenCV appearance tracker by name.
+
+    Supported names:
+      - "mil"  — TrackerMIL  (~10–20 ms per update, robust on colour targets)
+      - "kcf"  — TrackerKCF  (~1–3 ms per update, ~5–10× faster than MIL,
+                              weaker on scale change and non-rigid deformation)
 
     Handles three API variants across OpenCV versions:
-      - free function  cv2.TrackerMIL_create()  (OpenCV ≤ 4.4 / contrib)
-      - legacy ns      cv2.legacy.TrackerMIL_create()
-      - class method   cv2.TrackerMIL.create()  (OpenCV 4.5+)
+      - free function  cv2.Tracker<Name>_create()  (OpenCV ≤ 4.4 / contrib)
+      - legacy ns      cv2.legacy.Tracker<Name>_create()
+      - class method   cv2.Tracker<Name>.create()  (OpenCV 4.5+)
     """
-    if name.lower() != "mil":
-        raise ValueError(f"Unknown tracker '{name}'. Only 'mil' is supported.")
+    cv_name = _TRACKER_CV_NAME.get(name.lower())
+    if cv_name is None:
+        raise ValueError(
+            f"Unknown tracker '{name}'. Supported: {', '.join(_TRACKER_CV_NAME)}."
+        )
+    free_fn = f"{cv_name}_create"
     try:
-        if hasattr(cv2, "TrackerMIL_create"):
-            return cv2.TrackerMIL_create()
+        if hasattr(cv2, free_fn):
+            return getattr(cv2, free_fn)()
         legacy = getattr(cv2, "legacy", None)
-        if legacy and hasattr(legacy, "TrackerMIL_create"):
-            return legacy.TrackerMIL_create()
-        if hasattr(cv2, "TrackerMIL"):
-            return cv2.TrackerMIL.create()
+        if legacy and hasattr(legacy, free_fn):
+            return getattr(legacy, free_fn)()
+        if hasattr(cv2, cv_name):
+            return getattr(cv2, cv_name).create()
         raise RuntimeError(
-            f"TrackerMIL not available in this OpenCV build (cv2 {cv2.__version__}). "
+            f"{cv_name} not available in this OpenCV build (cv2 {cv2.__version__}). "
             f"Try: pip install opencv-contrib-python"
         )
     except cv2.error as exc:
-        raise RuntimeError(f"TrackerMIL failed to create: {exc}") from exc
+        raise RuntimeError(f"{cv_name} failed to create: {exc}") from exc
 
 
 def _kf1d(x0, x1, P00, P01, P10, P11, meas, dt):
@@ -711,12 +726,19 @@ class Seeker:
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, self._kern5)
         return mask, 1
 
-    def _search_blob_near(self, hsv, win, w_frame, h_frame):
+    def _search_blob_near(self, hsv, win, w_frame, h_frame, locked=False):
         """Detect the target in a padded region around *win*.
 
         Returns a padded window (x, y, w, h) sized to the blob found there, or
         None. Mirrors the re-acquisition search used during lock-on, so the
         window it returns is directly comparable to an acquisition window.
+
+        When *locked* is True, uses the fast inrange-only detection path
+        (skips the acquisition 3-method vote). Callers that are already in a
+        locked/tracking context — MIL scale-check and MIL re-acquire — can
+        set this to cut the per-call cost 3–5×. The inrange mask is slightly
+        looser than the vote, but for "is there still a blob near here?" and
+        "what size is it?" that looseness is harmless and often preferable.
         """
         twx, twy, tww, twh = win
         pad = max(tww, twh, 40)
@@ -726,7 +748,7 @@ class Seeker:
         sy2 = min(h_frame, twy + twh + pad)
         if sx2 - sx1 < 4 or sy2 - sy1 < 4:
             return None
-        mask_crop, _ = self._detection_mask(hsv[sy1:sy2, sx1:sx2])
+        mask_crop, _ = self._detection_mask(hsv[sy1:sy2, sx1:sx2], locked=locked)
         blob = _nearest_blob_rect(mask_crop, None, self._box_filter)
         if blob is None:
             return None
@@ -937,7 +959,8 @@ class Seeker:
                         # visible — so try a local re-detect and re-seed MIL at the
                         # right size before falling back to blind coasting.
                         rewin = self._search_blob_near(
-                            hsv, self._track_win or (x, y, w, h), w_frame, h_frame)
+                            hsv, self._track_win or (x, y, w, h),
+                            w_frame, h_frame, locked=True)
                         if rewin is not None and self._reinit_mil(frame, rewin):
                             x, y, w, h = rewin
                         else:
@@ -970,7 +993,8 @@ class Seeker:
                     # the blob actually present and re-seed when they diverge.
                     self._mil_frames += 1
                     if self._mil_frames % _MIL_RESCALE_EVERY == 0:
-                        rewin = self._search_blob_near(hsv, (x, y, w, h), w_frame, h_frame)
+                        rewin = self._search_blob_near(hsv, (x, y, w, h),
+                                                       w_frame, h_frame, locked=True)
                         if rewin is not None:
                             new_area = rewin[2] * rewin[3]
                             cur_area = max(w * h, 1)
@@ -1050,25 +1074,7 @@ class Seeker:
             kf_dt = min(now_t - self._kf_last_t, 0.5) if self._kf_initialized else 0.0
             self._kf_last_t = now_t
 
-        back_proj = cv2.calcBackProject([hsv], [0], self._roi_hist, [0, 180], 1)
-        # ── S/V gate ──────────────────────────────────────────────────────────
-        # The back-projection above is hue-only, so it lights up *any* same-hue
-        # pixel regardless of saturation/value — including the shadowed,
-        # washed-out ground/runway below the target. That mass pulls the CamShift
-        # centroid downward (the vertical |ey| bias) and lets lock collapse when
-        # same-hue clutter dominates. AND-gate the back-projection with the
-        # acquisition 'outer' band (hue±2σ with S,V ≥ 40 floors) so only pixels
-        # that are also saturated/bright enough survive — the same gate detection
-        # already uses, now applied during tracking too.
-        # Keep an UN-gated copy for the loss/density check below. The gate
-        # removes dark/washed same-hue pixels to sharpen the centroid, but those
-        # removals must NOT be read as "target gone" — otherwise the gate trips
-        # the density check and *increases* track loss instead of helping.
-        presence = None
-        if self._precomp_bands is not None:
-            presence = back_proj.copy()
-            sv_mask = self._apply_inrange_band(hsv, "outer")
-            cv2.bitwise_and(back_proj, sv_mask, dst=back_proj)
+        # ── Search-window crop, computed BEFORE back-projection ──────────────
         # Pre-translate the search window by Kalman-predicted velocity so CamShift
         # starts near where the target is expected to be this frame.
         twx, twy, tww, twh = self._track_win
@@ -1078,15 +1084,35 @@ class Seeker:
             twx = max(0, min(twx + dx, w_frame - tww))
             twy = max(0, min(twy + dy, h_frame - twh))
             self._track_win = (twx, twy, tww, twh)
-        # Gate to padded search window instead of full-frame mask.
+        # Padded search window — same rule as before, but now used to crop the
+        # HSV input to calcBackProject instead of zeroing pixels afterwards.
+        # Only cropped-region pixels are actually computed by calcBackProject /
+        # S-V mask / blur / dilate, so the per-frame track cost scales with
+        # (search-window area), not (frame area). Typical win: 5–20× fewer
+        # per-pixel ops when the target window is small relative to the frame.
         pad_x = max(tww // 2, 20);  pad_y = max(twh // 2, 20)
         bx1 = max(0, twx - pad_x);  by1 = max(0, twy - pad_y)
         bx2 = min(w_frame, twx + tww + pad_x)
         by2 = min(h_frame, twy + twh + pad_y)
-        if by1 > 0:        back_proj[:by1, :]       = 0
-        if by2 < h_frame:  back_proj[by2:, :]       = 0
-        if bx1 > 0:        back_proj[by1:by2, :bx1] = 0
-        if bx2 < w_frame:  back_proj[by1:by2, bx2:] = 0
+        hsv_crop = hsv[by1:by2, bx1:bx2]
+
+        # ── Back-projection on the CROP ──────────────────────────────────────
+        back_proj = cv2.calcBackProject([hsv_crop], [0], self._roi_hist, [0, 180], 1)
+
+        # ── S/V gate ─────────────────────────────────────────────────────────
+        # The back-projection is hue-only, so it lights up *any* same-hue pixel
+        # regardless of saturation/value — including shadowed/washed-out ground
+        # that pulls the CamShift centroid off-target. AND-gate with the same
+        # acquisition 'outer' band (hue±2σ with S,V ≥ 40 floors) that detection
+        # uses, so only saturated/bright same-hue pixels survive.
+        # Keep an UN-gated copy for the loss/density check below — the gate
+        # removes dark/washed pixels to sharpen the centroid, but those must
+        # NOT be read as "target gone" or the gate would *increase* track loss.
+        presence = None
+        if self._precomp_bands is not None:
+            presence = back_proj.copy()
+            sv_mask = self._apply_inrange_band(hsv_crop, "outer")
+            cv2.bitwise_and(back_proj, sv_mask, dst=back_proj)
         cv2.GaussianBlur(back_proj, (3, 3), 0, dst=back_proj)
         cv2.dilate(back_proj, back_proj, self._kern5)
         # Process the un-gated presence map identically so the density threshold
@@ -1095,15 +1121,25 @@ class Seeker:
             cv2.GaussianBlur(presence, (3, 3), 0, dst=presence)
             cv2.dilate(presence, presence, self._kern5)
 
+        # ── CamShift / MeanShift in CROP coordinates ─────────────────────────
+        # Translate the search window from frame-absolute to crop-local, run
+        # the tracker on the cropped probability image, then translate back.
+        # CamShift only needs the probability array to cover its search
+        # window — it doesn't care whether that array is full-frame or a crop.
+        crop_win = (twx - bx1, twy - by1, tww, twh)
         if self._shift_algo == "meanshift":
-            _, self._track_win = cv2.meanShift(
-                back_proj, self._track_win, self._term_crit
-            )
+            _, crop_win = cv2.meanShift(back_proj, crop_win, self._term_crit)
             ret = None
         else:
-            ret, self._track_win = cv2.CamShift(
-                back_proj, self._track_win, self._term_crit
-            )
+            ret, crop_win = cv2.CamShift(back_proj, crop_win, self._term_crit)
+        # CamShift returns the fitted ellipse `ret` in crop-local coords; shift
+        # its centre back to frame coords so downstream code (line snap /
+        # rectangle draw) doesn't need to know about the crop.
+        if ret is not None:
+            ((cs_cx_local, cs_cy_local), size, angle) = ret
+            ret = ((cs_cx_local + bx1, cs_cy_local + by1), size, angle)
+        self._track_win = (crop_win[0] + bx1, crop_win[1] + by1,
+                           crop_win[2],       crop_win[3])
 
         # ── Clamp window to frame bounds ──────────────────────────────────────
         twx, twy, tww, twh = self._track_win
@@ -1121,11 +1157,25 @@ class Seeker:
             # ── Signal density check — drop lock if back-proj is mostly empty ─
             # Use the UN-gated presence map (falls back to back_proj when the
             # gate is inactive) so the S/V gate can't cause false losses.
+            # dens_src is now crop-sized; translate the (frame-absolute) window
+            # into crop-local coords, then clip to the crop bounds so a window
+            # that partially escaped the padded search region doesn't read out
+            # of bounds and return a spurious zero-density (which would trip a
+            # false loss).
             wx, wy, ww, wh = self._track_win
             dens_src = presence if presence is not None else back_proj
-            roi_bp  = dens_src[wy:wy + wh, wx:wx + ww]
-            density = float(roi_bp.mean()) / 255.0
-            if density < 0.05:
+            cx1 = max(0, wx - bx1);       cy1 = max(0, wy - by1)
+            cx2 = min(bx2 - bx1, wx + ww - bx1)
+            cy2 = min(by2 - by1, wy + wh - by1)
+            if cx2 > cx1 and cy2 > cy1:
+                roi_bp  = dens_src[cy1:cy2, cx1:cx2]
+                density = float(roi_bp.mean()) / 255.0
+                if density < 0.05:
+                    camshift_bad = True
+            else:
+                # window is entirely outside the crop we computed — nothing to
+                # measure. Fail closed so we drop lock rather than hold on to
+                # a stale one.
                 camshift_bad = True
 
         if camshift_bad:
